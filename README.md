@@ -26,7 +26,8 @@ desktop window's own controls:
 - A strip along the top with the call state and the modem's lights, always in
   view, and a **Sound** toggle (lit while on, like V.8 and Listen). On, you
   hear the call -- the caller, and on a SIP call the modem's own side mixed
-  in too -- and it turns Listen on by itself. Off is silence: the monitor,
+  in at about the caller's level -- and it turns Listen on by itself. Off
+  is silence: it closes the monitor,
   and on a sound-card line the modem's own tones, so there the far end hears
   nothing from this side while it is off. A SIP call carries on as normal
   either way. Remembered between runs.

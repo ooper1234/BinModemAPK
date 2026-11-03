@@ -58,7 +58,7 @@ fn main() {
                 ),
                 (
                     "sink.push(&from_line);",
-                    "crate::app::mobile::monitor(&sink, &from_line, &to_line, audio.sip().is_some());",
+                    "crate::app::mobile::monitor(&sink, &from_line, &to_line, if modem.exact_levels() { 1.0 } else { drive }, audio.sip().is_some());",
                 ),
             ] {
                 assert_eq!(patched.matches(from).count(), 1, "live.rs: `{from}` has changed upstream");

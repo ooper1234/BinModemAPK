@@ -143,9 +143,15 @@ impl ScopeApp {
     /// it opens the monitor if Listen is not already on. Off is silence: the
     /// monitor, and the modem's tones on a sound-card line.
     fn toggle_sound(&mut self) {
-        let on = !muted();
-        set_muted(on);
-        if !on && self.monitor.is_none() {
+        let was_on = !muted();
+        set_muted(was_on);
+        if was_on {
+            // Off: close the monitor outright, so nothing it had queued
+            // plays on after the press.
+            if self.monitor.is_some() {
+                self.set_listening(false);
+            }
+        } else if self.monitor.is_none() {
             self.set_listening(true);
         }
     }
@@ -403,16 +409,25 @@ pub fn load_muted() {
     MUTED.store(std::path::Path::new(MUTE_FILE).exists(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// How loud our own modem plays in the monitor, as a fraction of its full
+/// output: about -16 dB, a little above where a far end usually arrives.
+const OWN_SIDE: f32 = 0.16;
+
 /// What the monitor plays: the caller, and on a SIP call our own modem too.
 ///
 /// build.rs routes live.rs's monitor through here. Upstream plays only what
 /// arrived, which on a sound-card line is all that is missing -- the modem's
 /// own tones are already coming out of the phone, as the line. Over SIP they
 /// go to the network and nothing on the phone plays them, so they are mixed
-/// in at half level to hear both sides of the call, as a modem's speaker
-/// does. The block keeps the length of what arrived, so the monitor keeps the
+/// in to hear both sides of the call, as a modem's speaker does.
+///
+/// What was sent has the drive in it (-20 dB by default, a tenth), which is
+/// the level for the line and nothing to do with how loud it should be here;
+/// mixed as it was, our side sat well under the caller and could not be
+/// heard. It is taken back out, and our side played at [`OWN_SIDE`].
+/// The block keeps the length of what arrived, so the monitor keeps the
 /// line's timing.
-pub fn monitor(sink: &line::AudioSink, heard: &[f32], sent: &[f32], sip: bool) {
+pub fn monitor(sink: &line::AudioSink, heard: &[f32], sent: &[f32], drive: f32, sip: bool) {
     if muted() {
         return;
     }
@@ -420,10 +435,11 @@ pub fn monitor(sink: &line::AudioSink, heard: &[f32], sent: &[f32], sip: bool) {
         sink.push(heard);
         return;
     }
+    let gain = OWN_SIDE / drive.abs().max(0.001);
     let mixed: Vec<f32> = heard
         .iter()
         .enumerate()
-        .map(|(i, h)| (h + 0.5 * sent.get(i).copied().unwrap_or(0.0)).clamp(-1.0, 1.0))
+        .map(|(i, h)| (h + gain * sent.get(i).copied().unwrap_or(0.0)).clamp(-1.0, 1.0))
         .collect();
     sink.push(&mixed);
 }
