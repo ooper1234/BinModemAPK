@@ -4,7 +4,8 @@
 //! code inside the `app` module (or below it) can reach. Rather than edit the
 //! submodule, the sources are copied into OUT_DIR with three swaps -- combo
 //! boxes and sliders that wrap, and windows that open as full-screen sheets
-//! (mobile::Combo, mobile::Slider, mobile::Window) -- and app.rs gets one
+//! (mobile::Combo, mobile::Slider, mobile::Window) -- live.rs's two ways out
+//! to a speaker go through the sound switch (mobile::muted), and app.rs gets one
 //! line added: `mod mobile;`, pointing at src/mobile.rs here. Upstream stays
 //! byte-for-byte as checked out.
 
@@ -43,6 +44,29 @@ fn main() {
             .replace("egui::ComboBox::from_id_salt(", "crate::app::mobile::Combo::from_id_salt(")
             .replace("egui::Slider::new(", "crate::app::mobile::Slider::new(")
             .replace("egui::Window::new(", "crate::app::mobile::Window::new(");
+        // The sound switch (mobile::muted): the modem's tones to a sound card,
+        // and the monitor that plays the caller. Checked to apply exactly
+        // once, so a change upstream fails the build instead of leaving the
+        // switch quietly doing nothing.
+        let patched = if name == "live" {
+            let mut patched = patched;
+            for (from, to) in [
+                (
+                    "Self::Audio(line) => line.transmit(samples),",
+                    "Self::Audio(line) => crate::app::mobile::to_speaker(line, samples),",
+                ),
+                (
+                    "sink.push(&from_line);",
+                    "if !crate::app::mobile::muted() { sink.push(&from_line); }",
+                ),
+            ] {
+                assert_eq!(patched.matches(from).count(), 1, "live.rs: `{from}` has changed upstream");
+                patched = patched.replace(from, to);
+            }
+            patched
+        } else {
+            patched
+        };
         let source = if name == "app" || patched != text {
             assert!(
                 !text.contains("include_bytes!") && !text.contains("include_str!"),

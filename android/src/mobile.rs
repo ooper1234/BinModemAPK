@@ -37,6 +37,8 @@ impl Default for Mobile {
 pub struct Requests {
     /// Raise (`Some(true)`) or drop (`Some(false)`) the soft keyboard.
     pub keyboard: Option<bool>,
+    /// Paste the system clipboard into whatever has the keyboard focus.
+    pub paste: bool,
 }
 
 const DIM: Color32 = Color32::from_rgb(140, 150, 165);
@@ -98,6 +100,7 @@ impl ScopeApp {
             _ => AMBER,
         };
         ui.horizontal_wrapped(|ui| {
+            sound_button(ui);
             dot(ui, colour);
             ui.label(RichText::new(f.state.label()).strong().color(colour));
             if !f.modulation.is_empty() && f.modulation != "-" {
@@ -242,17 +245,15 @@ impl ScopeApp {
             });
         }
         ui.horizontal(|ui| {
-            let half = ((width - gap) / 2.0).floor();
-            if ui
-                .add(egui::Button::new(RichText::new("Keyboard").size(16.0)).min_size(egui::vec2(half, 38.0)))
-                .clicked()
-            {
+            let third = ((width - gap * 2.0) / 3.0).floor();
+            let size = egui::vec2(third, 38.0);
+            if ui.add(egui::Button::new(RichText::new("Keyboard").size(16.0)).min_size(size)).clicked() {
                 requests.keyboard = Some(true);
             }
-            if ui
-                .add(egui::Button::new(RichText::new("Hide keyboard").size(16.0)).min_size(egui::vec2(half, 38.0)))
-                .clicked()
-            {
+            if ui.add(egui::Button::new(RichText::new("Paste").size(16.0)).min_size(size)).clicked() {
+                requests.paste = true;
+            }
+            if ui.add(egui::Button::new(RichText::new("Hide").size(16.0)).min_size(size)).clicked() {
                 requests.keyboard = Some(false);
             }
         });
@@ -347,6 +348,63 @@ impl ScopeApp {
                 self.distant(ui);
                 ui.add_space(24.0);
             });
+    }
+}
+
+/// Whether everything the phone would play out loud is silenced: the modem's
+/// own tones on a sound-card line, and the monitor that plays the caller.
+static MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where the choice is kept between runs: a file that exists while muted, in
+/// the app's private directory (the working directory on Android).
+const MUTE_FILE: &str = "muted";
+
+pub fn muted() -> bool {
+    MUTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_muted(on: bool) {
+    MUTED.store(on, std::sync::atomic::Ordering::Relaxed);
+    let _ = if on {
+        std::fs::write(MUTE_FILE, b"")
+    } else {
+        std::fs::remove_file(MUTE_FILE)
+    };
+}
+
+/// Put back what the last run chose.
+pub fn load_muted() {
+    MUTED.store(std::path::Path::new(MUTE_FILE).exists(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The modem's transmit to a sound card, silenced while muted.
+///
+/// build.rs routes live.rs's sound-card transmit through here. Silence is
+/// sent rather than nothing, so the output keeps its timing and the modem
+/// carries on exactly as it would; the speaker just has nothing to play.
+/// A SIP line does not come through here: what it sends goes to the network,
+/// not out of the phone.
+pub fn to_speaker(line: &line::Duplex, samples: &[f32]) {
+    if muted() {
+        line.transmit(&vec![0.0; samples.len()]);
+    } else {
+        line.transmit(samples);
+    }
+}
+
+/// One button for every sound the app makes.
+fn sound_button(ui: &mut egui::Ui) {
+    let off = muted();
+    let (text, fill) = if off {
+        ("Sound OFF", Color32::from_rgb(150, 50, 45))
+    } else {
+        ("Sound ON", Color32::from_rgb(30, 110, 60))
+    };
+    let button = egui::Button::new(RichText::new(text).strong().size(15.0).color(Color32::WHITE))
+        .fill(fill)
+        .min_size(egui::vec2(104.0, 34.0));
+    if ui.add(button).clicked() {
+        set_muted(!off);
     }
 }
 
