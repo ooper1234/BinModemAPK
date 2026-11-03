@@ -32,8 +32,9 @@ cp "$here/android/target/aarch64-linux-android/release/libbinmodem.so" "$out/sta
 
 "$bt/aapt2" link -o "$out/unaligned.apk" -I "$platform/android.jar" \
     --manifest "$here/android/AndroidManifest.xml"
-# Native libraries go in stored (uncompressed), so they can be mapped in place.
-(cd "$out/staging" && zip -q -0 -r "$out/unaligned.apk" lib)
+# Native libraries are compressed to keep the download small; Android extracts
+# them at install (extractNativeLibs="true" in the manifest).
+(cd "$out/staging" && zip -q -9 -r "$out/unaligned.apk" lib)
 "$bt/zipalign" -f -p 4 "$out/unaligned.apk" "$out/aligned.apk"
 
 keystore="${KEYSTORE:-$here/android/debug.keystore}"
