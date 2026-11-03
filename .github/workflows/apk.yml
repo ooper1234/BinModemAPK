@@ -1,0 +1,41 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: SDK packages
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android
+
+      - name: Build
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: ./build-apk.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BinModem-apk
+          path: BinModem.apk

@@ -1,0 +1,46 @@
+[package]
+name    = "binmodem-android"
+version = "2.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Kept out of the upstream workspace: BinModem/ is an untouched submodule and
+# this crate only borrows its GUI sources (see src/lib.rs).
+[workspace]
+
+[lib]
+name       = "binmodem"
+crate-type = ["cdylib"]
+path       = "src/lib.rs"
+
+[dependencies]
+dsp       = { path = "../BinModem/crates/dsp" }
+fax       = { path = "../BinModem/crates/fax" }
+datapump  = { path = "../BinModem/crates/datapump" }
+ec        = { path = "../BinModem/crates/ec" }
+line      = { path = "../BinModem/crates/line" }
+login     = { path = "../BinModem/crates/login" }
+modem     = { path = "../BinModem/crates/modem" }
+telemetry = { path = "../BinModem/crates/telemetry" }
+at        = { path = "../BinModem/crates/at" }
+terminal  = { path = "../BinModem/crates/terminal" }
+telnet    = { path = "../BinModem/crates/telnet" }
+transfer  = { path = "../BinModem/crates/transfer" }
+ppp       = { path = "../BinModem/crates/ppp" }
+proxy     = { path = "../BinModem/crates/proxy" }
+sip       = { path = "../BinModem/crates/sip" }
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+image  = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+# The desktop file dialogs have no Android backend; this answers "cancelled".
+rfd    = { path = "rfd-stub", package = "rfd-stub" }
+jni         = "0.21.1"
+ndk-context = "0.1.1"
+android_logger = "0.15.1"
+log = "0.4"
+winit = { version = "0.30.13", default-features = false, features = ["android-native-activity"] }
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+strip     = true

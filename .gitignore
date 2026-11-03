@@ -1,0 +1,4 @@
+android/target/
+android/debug.keystore
+*.apk
+*.idsig
