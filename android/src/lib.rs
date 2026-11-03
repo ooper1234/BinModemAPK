@@ -147,11 +147,11 @@ impl Phone {
     /// Choose a zoom that fits the desktop layout across the screen, never
     /// larger than the screen's own density would give.
     fn fit(&mut self, ctx: &egui::Context) {
-        let (rect, native) = ctx.input(|i| {
-            (i.viewport().inner_rect, i.viewport().native_pixels_per_point)
-        });
-        let Some(rect) = rect else { return };
-        let physical = rect.width() * ctx.pixels_per_point();
+        // Not the viewport's inner_rect: winit cannot give a window position
+        // on Android, so egui-winit leaves that None there. The screen rect
+        // comes from the surface size and is always known.
+        let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+        let physical = ctx.viewport_rect().width() * ctx.pixels_per_point();
         if physical <= 0.0 || (physical - self.fitted_for).abs() < 1.0 {
             return;
         }
