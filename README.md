@@ -8,12 +8,41 @@ Android entry point.
 
 ## What the Android build adds
 
-- A `NativeActivity` entry point (`android/src/lib.rs`) that opens the same
-  window the desktop program opens with: a live modem, line chosen in the window.
-- Settings and SIP accounts are kept in the app's private storage.
-- The microphone permission is asked for on first launch.
-- A **Keyboard** button (bottom right) raises the on-screen keyboard for the terminal.
-- The desktop layout is zoomed to fit the screen; the app runs in portrait.
+![The four tabs: Line, Terminal, Scopes, Status](docs/phone.png)
+
+A layout for a phone held upright (`android/src/mobile.rs`), built from the
+desktop window's own controls:
+
+- **Line**: the line, the call and every setting, wrapped into one column.
+  Dial, Network, Advanced, Files, Fax and Error control open as full-screen
+  sheets with a close button.
+- **Terminal**: the terminal sized to fit 80 columns across (untick *fit
+  width* for a font slider), with Esc, Tab, Ctrl-C, the arrows, Del, `+++`
+  and Enter as buttons, since a phone keyboard has none of them. Tapping the
+  terminal raises the keyboard.
+- **Scopes**: waterfall, spectrum and constellation, stacked.
+- **Status**: the call's state and rates, the V.90 rate menu, Retrain, and
+  what the far end said about itself.
+- A strip along the top with the call state and the modem's lights, always in view.
+
+Also: settings and SIP accounts kept in the app's private storage, and the
+microphone permission asked for on first launch.
+
+### How it is put together
+
+Upstream is not edited. `android/build.rs` copies the GUI files that need it
+into the build directory and swaps three things in the copy: combo boxes and
+sliders for versions that move to a new row when they do not fit
+(egui cannot wrap them otherwise), and windows for full-screen sheets. It
+also adds `mod mobile;` inside `app`, which is how the phone layout reaches
+the window's private state.
+
+To look at the layout without a phone (Linux, needs ALSA and X11):
+
+    cd android && BINMODEM_PAGE=terminal cargo run --example preview
+
+`BINMODEM_PAGE` is `line`, `terminal`, `scopes` or `status`;
+`BINMODEM_OPEN=dial|network|advanced|files|fax|error` opens a window too.
 
 ## Limits
 
