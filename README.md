@@ -13,7 +13,7 @@ Android entry point.
 - Settings and SIP accounts are kept in the app's private storage.
 - The microphone permission is asked for on first launch.
 - A **Keyboard** button (bottom right) raises the on-screen keyboard for the terminal.
-- The desktop layout is zoomed to fit the screen; the app runs in landscape.
+- The desktop layout is zoomed to fit the screen; the app runs in portrait.
 
 ## Limits
 

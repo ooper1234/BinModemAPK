@@ -11,7 +11,7 @@
 //! * the microphone permission, which Android asks for at run time;
 //! * a button to raise the on-screen keyboard, since the terminal reads keys
 //!   and a phone has none until asked;
-//! * a zoom that fits the desktop layout (about 1180 points wide) onto the
+//! * a zoom that fits the desktop layout (900 points, its desktop minimum width) onto the
 //!   screen.
 
 #![allow(dead_code, clippy::all)]
@@ -53,8 +53,9 @@ use line::AudioSink;
 /// The rate a live modem runs at, as in the desktop `main.rs`.
 const LIVE_FS: f64 = 16_000.0;
 
-/// How many points wide the desktop layout wants to be.
-const LAYOUT_W: f32 = 1180.0;
+/// The narrowest the desktop layout goes (its minimum window width), which
+/// is what a phone held upright has to fit.
+const LAYOUT_W: f32 = 900.0;
 
 #[unsafe(no_mangle)]
 fn android_main(android_app: AndroidApp) {
