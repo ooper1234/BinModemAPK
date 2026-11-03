@@ -2,9 +2,9 @@
 //!
 //! The phone layout needs the window's private state and helpers, which only
 //! code inside the `app` module (or below it) can reach. Rather than edit the
-//! submodule, the sources are copied into OUT_DIR with three swaps -- combo
-//! boxes and sliders that wrap, and windows that open as full-screen sheets
-//! (mobile::Combo, mobile::Slider, mobile::Window) -- live.rs's two ways out
+//! submodule, the sources are copied into OUT_DIR with four swaps -- rows
+//! held to the screen, combo boxes and sliders that wrap, and windows that open as full-screen sheets
+//! (mobile::wrapped, Combo, Slider, Window) -- live.rs's two ways out
 //! to a speaker go through the sound switch (mobile::muted), and app.rs gets one
 //! line added: `mod mobile;`, pointing at src/mobile.rs here. Upstream stays
 //! byte-for-byte as checked out.
@@ -43,7 +43,8 @@ fn main() {
         let patched = text
             .replace("egui::ComboBox::from_id_salt(", "crate::app::mobile::Combo::from_id_salt(")
             .replace("egui::Slider::new(", "crate::app::mobile::Slider::new(")
-            .replace("egui::Window::new(", "crate::app::mobile::Window::new(");
+            .replace("egui::Window::new(", "crate::app::mobile::Window::new(")
+            .replace("ui.horizontal_wrapped(", "crate::app::mobile::wrapped(ui, ");
         // The sound switch (mobile::muted): the modem's tones to a sound card,
         // and the monitor that plays the caller. Checked to apply exactly
         // once, so a change upstream fails the build instead of leaving the

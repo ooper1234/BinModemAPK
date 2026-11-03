@@ -39,9 +39,11 @@ microphone permission asked for on first launch.
 ### How it is put together
 
 Upstream is not edited. `android/build.rs` copies the GUI files that need it
-into the build directory and swaps three things in the copy: combo boxes and
-sliders for versions that move to a new row when they do not fit
-(egui cannot wrap them otherwise), and windows for full-screen sheets.
+into the build directory and swaps four things in the copy: wrapping rows for ones held to the screen
+(in egui, one overflowing row -- a SIP address, say -- widens every row
+after it), combo boxes and sliders for versions that move to a new row when
+they do not fit (egui cannot wrap them otherwise), and windows for
+full-screen sheets.
 In `live.rs` it sends the sound-card output and the monitor through the
 sound switch, and fails the build if those lines change upstream. It
 also adds `mod mobile;` inside `app`, which is how the phone layout reaches
@@ -52,7 +54,8 @@ To look at the layout without a phone (Linux, needs ALSA and X11):
     cd android && BINMODEM_PAGE=terminal cargo run --example preview
 
 `BINMODEM_PAGE` is `line`, `terminal`, `scopes` or `status`;
-`BINMODEM_OPEN=dial|network|advanced|files|fax|error` opens a window too.
+`BINMODEM_OPEN=dial|network|advanced|files|fax|error` opens a window too
+(and `v90`, `sip` pick those; several can be given, comma-separated).
 
 ## Limits
 

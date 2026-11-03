@@ -418,8 +418,10 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
             cc.egui_ctx.set_pixels_per_point(ppp);
             touch_style(&cc.egui_ctx);
             let mut inner = app::ScopeApp::new(rx, ui_control, sink, LIVE_FS, source);
-            if let Ok(name) = std::env::var("BINMODEM_OPEN") {
-                inner.open_window(&name);
+            if let Ok(names) = std::env::var("BINMODEM_OPEN") {
+                for name in names.split(',') {
+                    inner.open_window(name);
+                }
             }
             Ok(Box::new(Preview(inner, mobile)))
         }),

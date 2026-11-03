@@ -131,16 +131,9 @@ impl ScopeApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // The desktop rows are wrapping rows, but egui's default is to
-                // wrap a button's *text* into what is left of the row rather
-                // than move the button down. Keep every widget whole, so the
-                // row breaks between them instead.
-                let width = ui.available_width();
-                ui.set_max_width(width);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.spacing_mut().interact_size.y = 34.0;
-                self.controls(ui);
+                within_screen(ui, |ui| self.controls(ui));
                 ui.add_space(12.0);
                 ui.label(RichText::new("receive level").strong());
                 scopes::level_meter(ui, self.frame.rx_level_db);
@@ -589,7 +582,7 @@ impl<'open> Window<'open> {
         }
         window.show(ctx, |ui| {
             ui.set_max_width(size.x);
-            contents(ui)
+            within_screen(ui, contents)
         })
     }
 }
@@ -604,7 +597,53 @@ impl ScopeApp {
             "files" => self.transfer_open = true,
             "fax" => self.fax.open = true,
             "error" => self.protection_open = true,
+            // Not windows: the long V.90 name in the call box, and SIP chosen.
+            "v90" => self.carrier = 5,
+            "sip" => self.chosen_line = 1,
             _ => {}
         }
     }
+}
+
+thread_local! {
+    /// The right-hand edge rows have to stay inside, while one is being laid
+    /// out by [`within_screen`].
+    static RIGHT_EDGE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lay out `add` with every wrapping row held to the width `ui` has now.
+pub fn within_screen<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let before = RIGHT_EDGE.replace(Some(ui.max_rect().right()));
+    let result = add(ui);
+    RIGHT_EDGE.set(before);
+    result
+}
+
+/// `Ui::horizontal_wrapped`, held to the screen; build.rs puts it in place of
+/// every one in the copied sources.
+///
+/// In egui a row that something overflows -- a SIP address, a long
+/// modulation name -- makes its parent wider, and every row after it then
+/// wraps against that wider edge and runs off the screen too. Here the row is
+/// laid out against the real edge, and only as much of it as fits is
+/// reported back to the parent, so one long line cannot widen the rest.
+pub fn wrapped<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+    let Some(right) = RIGHT_EDGE.get() else {
+        return ui.horizontal_wrapped(add);
+    };
+    let top_left = ui.cursor().min;
+    let width = (right - top_left.x).max(60.0);
+    // One row's height, as egui's own horizontal_wrapped starts with: rows
+    // are centred across it, and further rows grow the child downwards.
+    let room = egui::Rect::from_min_size(top_left, egui::vec2(width, ui.spacing().interact_size.y));
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(room)
+            .layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)),
+    );
+    let inner = add(&mut row);
+    let used = row.min_rect();
+    let kept = egui::Rect::from_min_max(used.min, egui::pos2(used.max.x.min(right), used.max.y));
+    let response = ui.allocate_rect(kept, egui::Sense::hover());
+    egui::InnerResponse::new(inner, response)
 }
