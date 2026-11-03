@@ -24,14 +24,12 @@ desktop window's own controls:
 - **Status**: the call's state and rates, the V.90 rate menu, Retrain, and
   what the far end said about itself.
 - A strip along the top with the call state and the modem's lights, always in
-  view, and a **Sound ON/OFF** button. Off silences everything the phone plays:
-  the monitor (the caller and the far modem) and, on a sound-card line, the
-  modem's own tones -- so on a sound-card line the far end hears nothing from
-  this side while it is off. A SIP call carries on as normal; only what plays
-  out of the phone is silenced. The choice is remembered between runs.
-- A **Paste** button whenever a text box is in use (and in the terminal's key
-  row): egui has no clipboard on Android, so this reads the system clipboard
-  through `ClipboardManager` -- for SIP addresses, passwords, phone numbers.
+  view, and a **Mute** toggle (lit while muting, like V.8 and Listen). Mute
+  silences everything the phone plays: the monitor (the caller and the far
+  modem) and, on a sound-card line, the modem's own tones -- so on a
+  sound-card line the far end hears nothing from this side while it is on.
+  A SIP call carries on as normal; only what plays out of the phone is
+  silenced. Remembered between runs.
 
 Also: settings and SIP accounts kept in the app's private storage, and the
 microphone permission asked for on first launch.

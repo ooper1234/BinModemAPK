@@ -37,8 +37,6 @@ impl Default for Mobile {
 pub struct Requests {
     /// Raise (`Some(true)`) or drop (`Some(false)`) the soft keyboard.
     pub keyboard: Option<bool>,
-    /// Paste the system clipboard into whatever has the keyboard focus.
-    pub paste: bool,
 }
 
 const DIM: Color32 = Color32::from_rgb(140, 150, 165);
@@ -238,15 +236,12 @@ impl ScopeApp {
             });
         }
         ui.horizontal(|ui| {
-            let third = ((width - gap * 2.0) / 3.0).floor();
-            let size = egui::vec2(third, 38.0);
+            let half = ((width - gap) / 2.0).floor();
+            let size = egui::vec2(half, 38.0);
             if ui.add(egui::Button::new(RichText::new("Keyboard").size(16.0)).min_size(size)).clicked() {
                 requests.keyboard = Some(true);
             }
-            if ui.add(egui::Button::new(RichText::new("Paste").size(16.0)).min_size(size)).clicked() {
-                requests.paste = true;
-            }
-            if ui.add(egui::Button::new(RichText::new("Hide").size(16.0)).min_size(size)).clicked() {
+            if ui.add(egui::Button::new(RichText::new("Hide keyboard").size(16.0)).min_size(size)).clicked() {
                 requests.keyboard = Some(false);
             }
         });
@@ -385,19 +380,16 @@ pub fn to_speaker(line: &line::Duplex, samples: &[f32]) {
     }
 }
 
-/// One button for every sound the app makes.
+/// One switch for every sound the app makes, lit while it is muting them --
+/// the same kind of toggle as V.8 and Listen beside the other controls.
 fn sound_button(ui: &mut egui::Ui) {
-    let off = muted();
-    let (text, fill) = if off {
-        ("Sound OFF", Color32::from_rgb(150, 50, 45))
-    } else {
-        ("Sound ON", Color32::from_rgb(30, 110, 60))
-    };
-    let button = egui::Button::new(RichText::new(text).strong().size(15.0).color(Color32::WHITE))
-        .fill(fill)
-        .min_size(egui::vec2(104.0, 34.0));
-    if ui.add(button).clicked() {
-        set_muted(!off);
+    let on = muted();
+    if ui
+        .selectable_label(on, "Mute")
+        .on_hover_text("Silence the monitor and the modem's tones on the speaker")
+        .clicked()
+    {
+        set_muted(!on);
     }
 }
 

@@ -99,8 +99,6 @@ fn run(android_app: AndroidApp) -> Result<(), Box<dyn std::error::Error>> {
                 keyboard: false,
                 fitted_for: 0.0,
                 last_page: app::mobile::Page::default(),
-                pending_paste: None,
-                text_focus: None,
             }))
         }),
     )?;
@@ -134,37 +132,15 @@ struct Phone {
     /// The physical width the zoom was last chosen for.
     fitted_for: f32,
     last_page: app::mobile::Page,
-    /// Clipboard text to hand egui as a paste at the start of the next frame.
-    pending_paste: Option<String>,
-    /// The widget that last had the keyboard, and when it lost it: the Paste
-    /// button stays up a moment after, because pressing it takes the focus
-    /// away from the box it is meant to paste into.
-    text_focus: Option<(egui::Id, Option<f64>)>,
 }
 
 #[cfg(target_os = "android")]
 impl eframe::App for Phone {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if let Some(text) = self.pending_paste.take() {
-            raw_input.events.push(egui::Event::Paste(text));
-        }
-    }
-
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.fit(&ctx);
-        self.track_focus(&ctx);
         let requests = self.inner.mobile_ui(ui, &mut self.mobile);
 
-        if requests.paste {
-            self.paste(&ctx, None);
-        }
-        if self.mobile.page != self.last_page {
-            self.text_focus = None;
-        }
-        if self.mobile.page != app::mobile::Page::Terminal {
-            self.paste_button(&ctx);
-        }
 
         // The terminal asks for the keyboard itself; anywhere else it follows
         // whether a text box has the focus. Leaving the terminal puts it away.
@@ -202,55 +178,6 @@ impl Phone {
         ctx.set_pixels_per_point(zoom);
     }
 
-    /// Remember which widget has the keyboard, and when it let go of it.
-    fn track_focus(&mut self, ctx: &egui::Context) {
-        let now = ctx.input(|i| i.time);
-        match ctx.memory(|m| m.focused()) {
-            Some(id) => self.text_focus = Some((id, None)),
-            None => {
-                if let Some((_, lost @ None)) = &mut self.text_focus {
-                    *lost = Some(now);
-                }
-                if let Some((_, Some(at))) = self.text_focus
-                    && now - at > 3.0
-                {
-                    self.text_focus = None;
-                }
-            }
-        }
-    }
-
-    /// A Paste button over the bottom right while a text box is in use.
-    fn paste_button(&mut self, ctx: &egui::Context) {
-        let Some((id, _)) = self.text_focus else { return };
-        egui::Area::new(egui::Id::new("android-paste"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -72.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let button = egui::Button::new(egui::RichText::new("Paste").strong().size(17.0))
-                    .min_size(egui::vec2(96.0, 42.0));
-                if ui.add(button).clicked() {
-                    self.paste(ctx, Some(id));
-                }
-            });
-    }
-
-    /// Read the system clipboard and paste it into `into` (or whatever has
-    /// the focus) on the next frame.
-    fn paste(&mut self, ctx: &egui::Context, into: Option<egui::Id>) {
-        match read_clipboard() {
-            Ok(Some(text)) if !text.is_empty() => {
-                if let Some(id) = into {
-                    ctx.memory_mut(|m| m.request_focus(id));
-                }
-                self.pending_paste = Some(text);
-                ctx.request_repaint();
-            }
-            Ok(_) => log::info!("nothing to paste"),
-            Err(e) => log::warn!("could not read the clipboard: {e}"),
-        }
-    }
-
     fn set_keyboard(&mut self, want: bool) {
         if want == self.keyboard {
             return;
@@ -273,66 +200,6 @@ fn log_panics() {
         log::error!("{info}");
         previous(info);
     }));
-}
-
-/// The system clipboard's text, through `ClipboardManager`: egui-winit has
-/// no clipboard on Android, so without this nothing copied in another app can
-/// be pasted here.
-#[cfg(target_os = "android")]
-fn read_clipboard() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    use jni::objects::{JObject, JString, JValue};
-    let ctx = ndk_context::android_context();
-    // SAFETY: both pointers come from the running activity via ndk-context.
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let mut env = vm.attach_current_thread()?;
-
-    let result = (|| -> jni::errors::Result<Option<String>> {
-        let name = env.new_string("clipboard")?;
-        let manager = env
-            .call_method(
-                &activity,
-                "getSystemService",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-                &[JValue::Object(&name)],
-            )?
-            .l()?;
-        if manager.is_null() {
-            return Ok(None);
-        }
-        let clip = env
-            .call_method(&manager, "getPrimaryClip", "()Landroid/content/ClipData;", &[])?
-            .l()?;
-        if clip.is_null() {
-            return Ok(None);
-        }
-        let count = env.call_method(&clip, "getItemCount", "()I", &[])?.i()?;
-        if count < 1 {
-            return Ok(None);
-        }
-        let item = env
-            .call_method(&clip, "getItemAt", "(I)Landroid/content/ClipData$Item;", &[JValue::Int(0)])?
-            .l()?;
-        let text = env
-            .call_method(
-                &item,
-                "coerceToText",
-                "(Landroid/content/Context;)Ljava/lang/CharSequence;",
-                &[JValue::Object(&activity)],
-            )?
-            .l()?;
-        if text.is_null() {
-            return Ok(None);
-        }
-        let string = env.call_method(&text, "toString", "()Ljava/lang/String;", &[])?.l()?;
-        let string: String = env.get_string(&JString::from(string))?.into();
-        Ok(Some(string))
-    })();
-    if result.is_err() {
-        let _ = env.exception_describe();
-        let _ = env.exception_clear();
-    }
-    Ok(result?)
 }
 
 /// Ask for RECORD_AUDIO, which a sound-card modem cannot hear without.
