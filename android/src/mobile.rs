@@ -142,6 +142,35 @@ impl ScopeApp {
     /// toggle as V.8 and Listen. On is hearing the call, both sides of it:
     /// it opens the monitor if Listen is not already on. Off is silence: the
     /// monitor, and the modem's tones on a sound-card line.
+    /// Caller and Answerer, in place of the desktop's Listen: each side of
+    /// the call on or off, for what is heard and what the spectrum and
+    /// waterfall draw. "you" marks our own modem's side once a call is placed.
+    pub fn side_buttons(&mut self, ui: &mut egui::Ui) {
+        let answering = self.frame.leds.aa;
+        let placed = self.frame.state != telemetry::CallState::Idle;
+        for caller in [true, false] {
+            let on = side_on(caller);
+            let name = if caller { "Caller" } else { "Answerer" };
+            let ours = placed && caller != answering;
+            let label = if ours { format!("{name} (you)") } else { name.to_owned() };
+            if ui
+                .selectable_label(on, label)
+                .on_hover_text(if caller {
+                    "Hear and see the side that dialled"
+                } else {
+                    "Hear and see the side that answered"
+                })
+                .clicked()
+            {
+                set_side(caller, !on);
+                // Turning a side on is asking to hear it.
+                if !on && !muted() && self.monitor.is_none() {
+                    self.set_listening(true);
+                }
+            }
+        }
+    }
+
     fn toggle_sound(&mut self) {
         let was_on = !muted();
         set_muted(was_on);
@@ -295,6 +324,11 @@ impl ScopeApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("showing").monospace().color(DIM));
+                    self.side_buttons(ui);
+                });
+                ui.add_space(4.0);
                 ui.label(RichText::new("waterfall  (0 - 4000 Hz)").strong());
                 self.waterfall.paint(ui, 220.0, self.frame.modulation);
                 ui.add_space(8.0);
@@ -406,40 +440,94 @@ pub fn set_muted(on: bool) {
 
 /// Put back what the last run chose.
 pub fn load_muted() {
-    MUTED.store(std::path::Path::new(MUTE_FILE).exists(), std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::path::Path;
+    MUTED.store(Path::new(MUTE_FILE).exists(), Relaxed);
+    HEAR_CALLER.store(!Path::new(CALLER_OFF_FILE).exists(), Relaxed);
+    HEAR_ANSWERER.store(!Path::new(ANSWERER_OFF_FILE).exists(), Relaxed);
 }
 
 /// How loud our own modem plays in the monitor, as a fraction of its full
 /// output: about -16 dB, a little above where a far end usually arrives.
 const OWN_SIDE: f32 = 0.16;
 
-/// What the monitor plays: the caller, and on a SIP call our own modem too.
+/// Which sides of the call are on: heard (the monitor) and drawn (the
+/// spectrum and waterfall). Both start on.
+static HEAR_CALLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static HEAR_ANSWERER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Files that exist while a side is off, beside the Sound one.
+const CALLER_OFF_FILE: &str = "caller-off";
+const ANSWERER_OFF_FILE: &str = "answerer-off";
+
+fn side(caller: bool) -> (&'static std::sync::atomic::AtomicBool, &'static str) {
+    if caller {
+        (&HEAR_CALLER, CALLER_OFF_FILE)
+    } else {
+        (&HEAR_ANSWERER, ANSWERER_OFF_FILE)
+    }
+}
+
+pub fn side_on(caller: bool) -> bool {
+    side(caller).0.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_side(caller: bool, on: bool) {
+    let (flag, file) = side(caller);
+    flag.store(on, std::sync::atomic::Ordering::Relaxed);
+    let _ = if on { std::fs::remove_file(file) } else { std::fs::write(file, b"") };
+}
+
+/// Whether our own modem's side, and the far end's, are on -- which of the
+/// two is the caller depends on which end dialled.
+fn own_and_far(answering: bool) -> (bool, bool) {
+    let caller = side_on(true);
+    let answerer = side_on(false);
+    if answering { (answerer, caller) } else { (caller, answerer) }
+}
+
+/// What the spectrum and waterfall are given for one sample: the sides that
+/// are on, at the level each is on the line. build.rs puts this in place of
+/// live.rs's `spectrum.push(heard)`, which drew only the far end.
+pub fn seen(heard: f64, sent: f64, answering: bool) -> f64 {
+    let (own, far) = own_and_far(answering);
+    (if far { heard } else { 0.0 }) + (if own { sent } else { 0.0 })
+}
+
+/// What the monitor plays: the sides of the call that are on.
 ///
 /// build.rs routes live.rs's monitor through here. Upstream plays only what
-/// arrived, which on a sound-card line is all that is missing -- the modem's
-/// own tones are already coming out of the phone, as the line. Over SIP they
-/// go to the network and nothing on the phone plays them, so they are mixed
-/// in to hear both sides of the call, as a modem's speaker does.
+/// arrived. Over SIP our own modem's tones go to the network and nothing on
+/// the phone plays them, so they are mixed in here when our side is on. On a
+/// sound-card line they are already coming out of the phone, as the line, so
+/// they are not played twice.
 ///
 /// What was sent has the drive in it (-20 dB by default, a tenth), which is
-/// the level for the line and nothing to do with how loud it should be here;
-/// mixed as it was, our side sat well under the caller and could not be
-/// heard. It is taken back out, and our side played at [`OWN_SIDE`].
-/// The block keeps the length of what arrived, so the monitor keeps the
-/// line's timing.
-pub fn monitor(sink: &line::AudioSink, heard: &[f32], sent: &[f32], drive: f32, sip: bool) {
+/// the level for the line and nothing to do with how loud it should be here,
+/// so it is taken back out and our side played at [`OWN_SIDE`]. The block
+/// keeps the length of what arrived, so the monitor keeps the line's timing.
+pub fn monitor(
+    sink: &line::AudioSink,
+    heard: &[f32],
+    sent: &[f32],
+    drive: f32,
+    sip: bool,
+    answering: bool,
+) {
     if muted() {
         return;
     }
-    if !sip || sent.is_empty() {
-        sink.push(heard);
-        return;
-    }
+    let (own, far) = own_and_far(answering);
+    let own = own && sip && !sent.is_empty();
     let gain = OWN_SIDE / drive.abs().max(0.001);
     let mixed: Vec<f32> = heard
         .iter()
         .enumerate()
-        .map(|(i, h)| (h + gain * sent.get(i).copied().unwrap_or(0.0)).clamp(-1.0, 1.0))
+        .map(|(i, h)| {
+            let theirs = if far { *h } else { 0.0 };
+            let ours = if own { gain * sent.get(i).copied().unwrap_or(0.0) } else { 0.0 };
+            (theirs + ours).clamp(-1.0, 1.0)
+        })
         .collect();
     sink.push(&mixed);
 }

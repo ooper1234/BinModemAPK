@@ -49,6 +49,23 @@ fn main() {
         // and the monitor that plays the caller. Checked to apply exactly
         // once, so a change upstream fails the build instead of leaving the
         // switch quietly doing nothing.
+        // Listen gives way to the Caller and Answerer switches, which keep
+        // the monitor open themselves (with Sound).
+        let patched = if name == "app" {
+            let from = "        let listening = self.monitor.is_some();
+        if ui
+            .selectable_label(listening, if listening { \"Listening\" } else { \"Listen\" })
+            .on_hover_text(\"Play the line audio through an output device\")
+            .clicked()
+        {
+            self.set_listening(!listening);
+        }
+";
+            assert_eq!(patched.matches(from).count(), 1, "app.rs: the Listen button has changed upstream");
+            patched.replace(from, "        self.side_buttons(ui);\n")
+        } else {
+            patched
+        };
         let patched = if name == "live" {
             let mut patched = patched;
             for (from, to) in [
@@ -58,7 +75,12 @@ fn main() {
                 ),
                 (
                     "sink.push(&from_line);",
-                    "crate::app::mobile::monitor(&sink, &from_line, &to_line, if modem.exact_levels() { 1.0 } else { drive }, audio.sip().is_some());",
+                    "crate::app::mobile::monitor(&sink, &from_line, &to_line, if modem.exact_levels() { 1.0 } else { drive }, audio.sip().is_some(), modem.role() == Role::Answering);",
+                ),
+                // The spectrum and waterfall show the sides that are on.
+                (
+                    "spectrum.push(heard);",
+                    "spectrum.push(crate::app::mobile::seen(heard, f64::from(*to_line.last().unwrap_or(&0.0)), modem.role() == Role::Answering));",
                 ),
             ] {
                 assert_eq!(patched.matches(from).count(), 1, "live.rs: `{from}` has changed upstream");

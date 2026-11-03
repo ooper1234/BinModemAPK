@@ -24,13 +24,18 @@ desktop window's own controls:
 - **Status**: the call's state and rates, the V.90 rate menu, Retrain, and
   what the far end said about itself.
 - A strip along the top with the call state and the modem's lights, always in
-  view, and a **Sound** toggle (lit while on, like V.8 and Listen). On, you
-  hear the call -- the caller, and on a SIP call the modem's own side mixed
-  in at about the caller's level -- and it turns Listen on by itself. Off
-  is silence: it closes the monitor,
-  and on a sound-card line the modem's own tones, so there the far end hears
-  nothing from this side while it is off. A SIP call carries on as normal
-  either way. Remembered between runs.
+  view, and a **Sound** toggle (lit while on, like V.8). On, you hear the
+  call and the monitor opens by itself; off is silence: it closes the
+  monitor, and on a sound-card line silences the modem's own tones too, so
+  there the far end hears nothing from this side while it is off. A SIP call
+  carries on as normal either way.
+- **Caller** and **Answerer** toggles in place of Listen (on the Line tab, and
+  above the waterfall on Scopes): each side of the call on or off, both for
+  what you hear and for what the spectrum and waterfall draw. Which one is
+  your modem follows who dialled, and is marked "(you)" during a call. Over
+  SIP your own side is mixed into what you hear at about the far end's level;
+  on a sound-card line it is already coming out of the phone, so only the
+  spectrum follows that switch. All three switches are remembered between runs.
 
 Also: settings and SIP accounts kept in the app's private storage, and the
 microphone permission asked for on first launch.
@@ -44,8 +49,9 @@ row -- a SIP address, which has nowhere to break -- shifts or widens every
 row after it), combo boxes and sliders for versions that move to a new row when
 they do not fit (egui cannot wrap them otherwise), and windows for
 full-screen sheets.
-In `live.rs` it sends the sound-card output and the monitor through the
-Sound switch (mixing our own side into the monitor on a SIP call), and fails the build if those lines change upstream. It
+In `app.rs` the Listen button becomes the Caller/Answerer switches; in
+`live.rs` the sound-card output, the monitor and the spectrum go through the
+switches (mixing our own side in where it is on), and fails the build if those lines change upstream. It
 also adds `mod mobile;` inside `app`, which is how the phone layout reaches
 the window's private state.
 
