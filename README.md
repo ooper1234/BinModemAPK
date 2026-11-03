@@ -24,12 +24,12 @@ desktop window's own controls:
 - **Status**: the call's state and rates, the V.90 rate menu, Retrain, and
   what the far end said about itself.
 - A strip along the top with the call state and the modem's lights, always in
-  view, and a **Mute** toggle (lit while muting, like V.8 and Listen). Mute
-  silences everything the phone plays: the monitor (the caller and the far
-  modem) and, on a sound-card line, the modem's own tones -- so on a
-  sound-card line the far end hears nothing from this side while it is on.
-  A SIP call carries on as normal; only what plays out of the phone is
-  silenced. Remembered between runs.
+  view, and a **Sound** toggle (lit while on, like V.8 and Listen). On, you
+  hear the call -- the caller, and on a SIP call the modem's own side mixed
+  in too -- and it turns Listen on by itself. Off is silence: the monitor,
+  and on a sound-card line the modem's own tones, so there the far end hears
+  nothing from this side while it is off. A SIP call carries on as normal
+  either way. Remembered between runs.
 
 Also: settings and SIP accounts kept in the app's private storage, and the
 microphone permission asked for on first launch.
@@ -37,13 +37,14 @@ microphone permission asked for on first launch.
 ### How it is put together
 
 Upstream is not edited. `android/build.rs` copies the GUI files that need it
-into the build directory and swaps four things in the copy: wrapping rows for ones held to the screen
-(in egui, one overflowing row -- a SIP address, say -- widens every row
-after it), combo boxes and sliders for versions that move to a new row when
+into the build directory and swaps four things in the copy: wrapping rows for ones held to the screen,
+with text that does not fit shortened with "..." (in egui, one overflowing
+row -- a SIP address, which has nowhere to break -- shifts or widens every
+row after it), combo boxes and sliders for versions that move to a new row when
 they do not fit (egui cannot wrap them otherwise), and windows for
 full-screen sheets.
 In `live.rs` it sends the sound-card output and the monitor through the
-sound switch, and fails the build if those lines change upstream. It
+Sound switch (mixing our own side into the monitor on a SIP call), and fails the build if those lines change upstream. It
 also adds `mod mobile;` inside `app`, which is how the phone layout reaches
 the window's private state.
 
@@ -53,7 +54,7 @@ To look at the layout without a phone (Linux, needs ALSA and X11):
 
 `BINMODEM_PAGE` is `line`, `terminal`, `scopes` or `status`;
 `BINMODEM_OPEN=dial|network|advanced|files|fax|error` opens a window too
-(and `v90`, `sip` pick those; several can be given, comma-separated).
+(and `v90`, `sip` pick those, `long` draws a SIP call's long status row; several can be given, comma-separated).
 
 ## Limits
 

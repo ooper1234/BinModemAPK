@@ -24,11 +24,13 @@ pub struct Mobile {
     pub page: Page,
     /// Size the terminal's font to fit its columns across the screen.
     pub fit_font: bool,
+    /// Whether the monitor has been opened for the Sound switch yet.
+    pub sound_started: bool,
 }
 
 impl Default for Mobile {
     fn default() -> Self {
-        Self { page: Page::Line, fit_font: true }
+        Self { page: Page::Line, fit_font: true, sound_started: false }
     }
 }
 
@@ -54,6 +56,15 @@ impl ScopeApp {
         self.poll();
         self.remember();
         scopes::request_animation(ui.ctx());
+
+        // Sound starts on, which means hearing the call: the monitor opened
+        // the first time round, as if Listen had been pressed.
+        if !m.sound_started {
+            m.sound_started = true;
+            if !muted() && self.monitor.is_none() {
+                self.set_listening(true);
+            }
+        }
 
         egui::Panel::top("m-status").show(ui, |ui| {
             ui.add_space(4.0);
@@ -90,15 +101,16 @@ impl ScopeApp {
     }
 
     /// One line of what the call is doing, always in view.
-    fn status_strip(&self, ui: &mut egui::Ui) {
+    fn status_strip(&mut self, ui: &mut egui::Ui) {
         let f = &self.frame;
         let colour = match f.state {
             telemetry::CallState::Connected => GREEN,
             telemetry::CallState::Idle => DIM,
             _ => AMBER,
         };
+        let mut sound_clicked = false;
         ui.horizontal_wrapped(|ui| {
-            sound_button(ui);
+            sound_clicked = sound_label(ui);
             dot(ui, colour);
             ui.label(RichText::new(f.state.label()).strong().color(colour));
             if !f.modulation.is_empty() && f.modulation != "-" {
@@ -119,8 +131,23 @@ impl ScopeApp {
             };
             ui.label(RichText::new(mode.0).monospace().color(mode.1));
         });
+        if sound_clicked {
+            self.toggle_sound();
+        }
         ui.add_space(2.0);
         scopes::faceplate(ui, &self.frame.leds);
+    }
+
+    /// One switch for every sound, lit while it is on -- the same kind of
+    /// toggle as V.8 and Listen. On is hearing the call, both sides of it:
+    /// it opens the monitor if Listen is not already on. Off is silence: the
+    /// monitor, and the modem's tones on a sound-card line.
+    fn toggle_sound(&mut self) {
+        let on = !muted();
+        set_muted(on);
+        if !on && self.monitor.is_none() {
+            self.set_listening(true);
+        }
     }
 
     /// The line, the call and every setting: the desktop's top bar, which
@@ -131,7 +158,18 @@ impl ScopeApp {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.spacing_mut().interact_size.y = 34.0;
-                within_screen(ui, |ui| self.controls(ui));
+                within_screen(ui, |ui| {
+                    if LONG_ROW.load(std::sync::atomic::Ordering::Relaxed) {
+                        // What a registered SIP line shows, for the preview.
+                        wrapped(ui, |ui| {
+                            let _ = ui.button("Record");
+                            ui.label(RichText::new("registered").monospace().color(GREEN));
+                            ui.label(RichText::new("up with sip:16169882103@coopervoip-6745.sip.signalwire.com in PCMU").monospace().color(DIM));
+                            ui.label(RichText::new("1 gaps").monospace().color(AMBER));
+                        });
+                    }
+                    self.controls(ui)
+                });
                 ui.add_space(12.0);
                 ui.label(RichText::new("receive level").strong());
                 scopes::level_meter(ui, self.frame.rx_level_db);
@@ -365,6 +403,31 @@ pub fn load_muted() {
     MUTED.store(std::path::Path::new(MUTE_FILE).exists(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// What the monitor plays: the caller, and on a SIP call our own modem too.
+///
+/// build.rs routes live.rs's monitor through here. Upstream plays only what
+/// arrived, which on a sound-card line is all that is missing -- the modem's
+/// own tones are already coming out of the phone, as the line. Over SIP they
+/// go to the network and nothing on the phone plays them, so they are mixed
+/// in at half level to hear both sides of the call, as a modem's speaker
+/// does. The block keeps the length of what arrived, so the monitor keeps the
+/// line's timing.
+pub fn monitor(sink: &line::AudioSink, heard: &[f32], sent: &[f32], sip: bool) {
+    if muted() {
+        return;
+    }
+    if !sip || sent.is_empty() {
+        sink.push(heard);
+        return;
+    }
+    let mixed: Vec<f32> = heard
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h + 0.5 * sent.get(i).copied().unwrap_or(0.0)).clamp(-1.0, 1.0))
+        .collect();
+    sink.push(&mixed);
+}
+
 /// The modem's transmit to a sound card, silenced while muted.
 ///
 /// build.rs routes live.rs's sound-card transmit through here. Silence is
@@ -380,17 +443,11 @@ pub fn to_speaker(line: &line::Duplex, samples: &[f32]) {
     }
 }
 
-/// One switch for every sound the app makes, lit while it is muting them --
-/// the same kind of toggle as V.8 and Listen beside the other controls.
-fn sound_button(ui: &mut egui::Ui) {
-    let on = muted();
-    if ui
-        .selectable_label(on, "Mute")
-        .on_hover_text("Silence the monitor and the modem's tones on the speaker")
+/// The Sound switch itself; whether it was pressed.
+fn sound_label(ui: &mut egui::Ui) -> bool {
+    ui.selectable_label(!muted(), "Sound")
+        .on_hover_text("Hear the call -- the caller and the modem -- or nothing at all")
         .clicked()
-    {
-        set_muted(!on);
-    }
 }
 
 /// Four tabs across the bottom, each a quarter of the width.
@@ -592,10 +649,14 @@ impl ScopeApp {
             // Not windows: the long V.90 name in the call box, and SIP chosen.
             "v90" => self.carrier = 5,
             "sip" => self.chosen_line = 1,
+            "long" => LONG_ROW.store(true, std::sync::atomic::Ordering::Relaxed),
             _ => {}
         }
     }
 }
+
+/// Preview only: draw a registered SIP line's long status row.
+static LONG_ROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// The right-hand edge rows have to stay inside, while one is being laid
@@ -633,9 +694,16 @@ pub fn wrapped<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> eg
             .max_rect(room)
             .layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)),
     );
+    // One line per widget, shortened with "..." when it is wider than the
+    // screen: a SIP address has nowhere to break, and wrapped it was drawn
+    // from left of the screen's edge, taking the page with it.
+    row.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
     let inner = add(&mut row);
     let used = row.min_rect();
-    let kept = egui::Rect::from_min_max(used.min, egui::pos2(used.max.x.min(right), used.max.y));
+    let kept = egui::Rect::from_min_max(
+        egui::pos2(used.min.x.max(top_left.x), used.min.y),
+        egui::pos2(used.max.x.min(right), used.max.y),
+    );
     let response = ui.allocate_rect(kept, egui::Sense::hover());
     egui::InnerResponse::new(inner, response)
 }
