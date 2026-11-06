@@ -18,6 +18,19 @@ tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
 [ -f "$here/BinModem/Cargo.toml" ] || git -C "$here" submodule update --init --recursive
 
+# Android-build changes to the modem itself (android/patches), applied to the
+# submodule's working tree; the submodule stays at its upstream commit.
+for patch in "$here"/android/patches/*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C "$here/BinModem" apply --check "$patch" 2>/dev/null; then
+        git -C "$here/BinModem" apply "$patch"
+        echo "applied $(basename "$patch")"
+    elif ! git -C "$here/BinModem" apply -R --check "$patch" 2>/dev/null; then
+        echo "$(basename "$patch") no longer applies to BinModem" >&2
+        exit 1
+    fi
+done
+
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android$api-clang"
 export CC_aarch64_linux_android="$tc/aarch64-linux-android$api-clang"
 export AR_aarch64_linux_android="$tc/llvm-ar"

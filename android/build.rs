@@ -19,6 +19,17 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gui");
     fs::create_dir_all(&out).unwrap();
 
+    // The long DIL (android/patches/long-dil.patch) is a change to the modem
+    // crate, which build-apk.sh applies to the submodule. Refuse to build the
+    // app with the short one by accident.
+    let dil = here.join("../BinModem/crates/datapump/src/v90/dil.rs");
+    println!("cargo:rerun-if-changed={}", dil.display());
+    assert!(
+        fs::read_to_string(&dil).unwrap().contains("const PASSES"),
+        "BinModem is missing android/patches/long-dil.patch: run ./build-apk.sh, or \
+         git -C BinModem apply ../android/patches/long-dil.patch"
+    );
+
     println!("cargo:rerun-if-changed={}", upstream.display());
     println!("cargo:rerun-if-changed={}", mobile.display());
 

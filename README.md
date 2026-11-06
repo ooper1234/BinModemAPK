@@ -40,6 +40,16 @@ desktop window's own controls:
 Also: settings and SIP accounts kept in the app's private storage, and the
 microphone permission asked for on first launch.
 
+### The long DIL
+
+Upstream's V.90 asks the server for a short DIL (digital impairment
+learning, the end of phase 3): one pass over the codewords, about 0.44 s.
+This build asks for the long DIL, two passes (about 0.88 s), so each codeword
+is read twice as often and the noise estimate the rate is chosen from is
+firmer. It is the one change to the modem itself, kept as
+`android/patches/long-dil.patch` and applied to the submodule by
+`build-apk.sh` (the build stops if it is missing).
+
 ### How it is put together
 
 Upstream is not edited. `android/build.rs` copies the GUI files that need it
