@@ -42,12 +42,14 @@ microphone permission asked for on first launch.
 
 ### The long DIL
 
-Upstream's V.90 asks the server for a short DIL (digital impairment
-learning, the end of phase 3): one pass over the codewords, about 0.44 s.
-This build asks for the long DIL, two passes (about 0.88 s), so each codeword
-is read twice as often and the noise estimate the rate is chosen from is
-firmer. It is the one change to the modem itself, kept as
-`android/patches/long-dil.patch` and applied to the submodule by
+Upstream's V.90 reads a short DIL (digital impairment learning, the end of
+phase 3): one pass of the pattern it asks for, about 0.44 s. The server
+repeats the DIL until the modem answers, so this build simply listens for
+two passes (about 0.88 s) before choosing the rate: each codeword is read
+twice as often and the noise estimate the rate is chosen from is firmer. The
+pattern asked for is upstream's, so finding the DIL again after a jitter
+buffer slip works as before. It is the one change to the modem itself, kept
+as `android/patches/long-dil.patch` and applied to the submodule by
 `build-apk.sh` (the build stops if it is missing).
 
 ### How it is put together

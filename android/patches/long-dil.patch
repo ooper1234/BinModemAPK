@@ -1,50 +1,78 @@
-diff --git a/crates/datapump/src/v90/dil.rs b/crates/datapump/src/v90/dil.rs
-index 74495e2..9df03ab 100644
---- a/crates/datapump/src/v90/dil.rs
-+++ b/crates/datapump/src/v90/dil.rs
-@@ -30,6 +30,13 @@ const PATTERN: usize = (H as usize + 1) * INTERVALS;
- /// Codewords between one DIL segment and the next.
- const ORDER_STEP: usize = 3;
- 
-+/// Passes over the codewords the DIL asks for: two, a long DIL of about
-+/// 0.88 s under mu-law, so every codeword is read ten times an interval and
-+/// the noise each is read with is known half again as well (sqrt 2) as one
-+/// pass gives -- the rate chosen at its end then rests on firmer ground.
-+/// Android build: upstream asks for one pass, 0.44 s.
-+const PASSES: usize = 2;
+diff --git a/crates/datapump/src/v90/analogue.rs b/crates/datapump/src/v90/analogue.rs
+index 84d602f..63912b7 100644
+--- a/crates/datapump/src/v90/analogue.rs
++++ b/crates/datapump/src/v90/analogue.rs
+@@ -79,6 +79,16 @@ const R_MOVED: usize = 6;
+ /// before a loss was noticed is held with what comes after it; symbols a
+ /// search for where the DIL went looks at; and how far a slip can move it.
+ const DIL_DELAY: usize = 96;
 +
- /// The loudest codeword the DIL asks for, and so the loudest any
- /// constellation uses, as a fraction of full scale.
- ///
-@@ -115,11 +122,15 @@ pub fn design(law: Law, uinfo: u8) -> Descriptor {
-     let mut scrambler = crate::v32::Scrambler::new(crate::v32::Mode::Answer);
-     let signs: Vec<bool> = (0..PATTERN).map(|_| scrambler.scramble(true)).collect();
-     let training: Vec<bool> = (0..PATTERN).map(|n| n >= INTERVALS).collect();
--    let ucodes = (0..ORDER_STEP)
-+    let pass: Vec<u8> = (0..ORDER_STEP)
-         .flat_map(|first| (first..UCODES).step_by(ORDER_STEP))
-         .map(|u| u as u8)
-         .filter(|&u| u != uinfo && ucode::level(law, u) <= LOUDEST)
-         .collect();
-+    // The long DIL: the pass asked for PASSES times over, as many whole
-+    // passes as the descriptor's 255 segments hold.
-+    let passes = PASSES.min(255 / pass.len().max(1)).max(1);
-+    let ucodes = pass.iter().copied().cycle().take(pass.len() * passes).collect();
-     Descriptor { signs, training, h: [H; 8], refs: [uinfo; 8], ucodes }
- }
++/// How many times over the DIL is read before the rate is chosen: two, the
++/// long DIL. The digital modem repeats the DIL until this end answers it
++/// (9.3.1.6), so this end decides how long it lasts by how long it listens:
++/// two passes of the pattern it asked for, about 0.88 s under mu-law, every
++/// codeword read twice as often as one pass gives and its noise known that
++/// much better. The pattern itself is unchanged, so finding the DIL again
++/// after a slip works on the same short repeat as before.
++/// Android build: upstream reads one pass, 0.44 s.
++const DIL_PASSES: usize = 2;
+ const DIL_SEARCH: usize = 128;
+ const DIL_MOST_MOVED: i64 = 400;
  
-@@ -545,9 +556,13 @@ mod tests {
-         // the references read.
-         let mut ucodes = d.ucodes.clone();
-         ucodes.sort_unstable();
-+        ucodes.dedup();
-         assert_eq!(ucodes, (0..99u8).filter(|&u| u != 79).collect::<Vec<_>>());
-         assert!(ucode::level(Law::Mu, 98) <= LOUDEST && ucode::level(Law::Mu, 99) > LOUDEST);
--        assert_eq!(d.len(), 98 * 36);
-+        // Two passes, each codeword once in each.
-+        assert_eq!(d.ucodes.len(), 98 * PASSES);
-+        assert_eq!(d.ucodes[..98], d.ucodes[98..]);
-+        assert_eq!(d.len(), 98 * PASSES * 36);
-         let bits = d.to_bits();
-         assert_eq!(Descriptor::from_bits(&bits), Some(d.clone()));
-         // A frame of references and five of the codeword, in every segment.
+@@ -1495,10 +1505,11 @@ pub struct Modem {
+     dil_trusted: Vec<Trust>,
+     /// The DIL as it is read (9.3.2.9): the receiver's count at its first
+     /// symbol, moved by any slip since; the frame interval that symbol was
+-    /// in; which symbols have been read, and how many are left.
++    /// in; how many times each symbol has been read, and how many readings
++    /// are left.
+     dil_base: i64,
+     dil_interval: usize,
+-    dil_read: Vec<bool>,
++    dil_read: Vec<u8>,
+     dil_left: usize,
+     /// Symbols not yet counted, and since a slip was noticed, how many have
+     /// been gathered to find where the DIL went.
+@@ -1654,7 +1665,7 @@ impl Modem {
+         };
+         // 9.4.2: B1d "within 15 s plus 5 round-trip delays after sending
+         // INFO1a".
+-        modem.dil_left = modem.dil.len();
++        modem.dil_left = modem.dil.len() * DIL_PASSES;
+         modem.start_deadline = (modem.samples(15.0 + 5.0 * settings.round_trip), "no B1d from the digital modem");
+         modem.deadline = Some(modem.start_deadline);
+         modem
+@@ -2324,8 +2335,8 @@ impl Modem {
+         // the frames on the way.
+         self.dil_interval = 0;
+         self.rx.set_frame_offset((INTERVALS as u64 - first % INTERVALS as u64) % INTERVALS as u64);
+-        self.dil_read = vec![false; self.dil.len()];
+-        self.dil_left = self.dil.len();
++        self.dil_read = vec![0; self.dil.len()];
++        self.dil_left = self.dil.len() * DIL_PASSES;
+         self.dil_recent.clear();
+         self.dil_lost = None;
+         self.before_dil.clear();
+@@ -2431,7 +2442,8 @@ impl Modem {
+     /// How much of the DIL has been read, of how much there is, and whether
+     /// the reading is waiting to find where it went.
+     pub fn dil_progress(&self) -> (usize, usize, bool) {
+-        (self.dil.len() - self.dil_left, self.dil.len(), self.dil_lost.is_some())
++        let all = self.dil.len() * DIL_PASSES;
++        (all - self.dil_left, all, self.dil_lost.is_some())
+     }
+ 
+     fn dil_symbol(&mut self, raw: u64, value: f64) {
+@@ -2460,10 +2472,10 @@ impl Modem {
+     fn count_dil(&mut self, raw: u64, value: f64) {
+         let len = self.dil.len() as i64;
+         let at = (raw as i64 - self.dil_base).rem_euclid(len) as usize;
+-        if self.dil_read[at] {
++        if usize::from(self.dil_read[at]) >= DIL_PASSES {
+             return;
+         }
+-        self.dil_read[at] = true;
++        self.dil_read[at] += 1;
+         self.dil_left -= 1;
+         let (u, positive) = self.dil[at];
+         if self.dil_trusted[at] != Trust::Spoiled {
