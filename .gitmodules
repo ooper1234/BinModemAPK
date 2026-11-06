@@ -1,3 +1,4 @@
 [submodule "BinModem"]
 	path = BinModem
 	url = https://github.com/CasualArclamp/BinModem.git
+	ignore = dirty
