@@ -47,8 +47,20 @@ index 4407d70..06dbacf 100644
      pub fn next_sample(&mut self) -> f64 {
          if !self.transmitting {
              return 0.0;
+diff --git a/crates/datapump/src/lib.rs b/crates/datapump/src/lib.rs
+index 6534bb9..37b842d 100644
+--- a/crates/datapump/src/lib.rs
++++ b/crates/datapump/src/lib.rs
+@@ -15,6 +15,7 @@ pub mod v32;
+ pub mod v34;
+ pub mod v8;
+ pub mod v90;
++pub mod v92;
+ 
+ pub use bell103::{Bell103Rx, Role};
+ pub use framing::{AsyncBits, AsyncFramer};
 diff --git a/crates/datapump/src/v34/info.rs b/crates/datapump/src/v34/info.rs
-index 58aa483..5a1962f 100644
+index 58aa483..b30bd8d 100644
 --- a/crates/datapump/src/v34/info.rs
 +++ b/crates/datapump/src/v34/info.rs
 @@ -473,6 +473,12 @@ pub struct Info0d {
@@ -85,7 +97,7 @@ index 58aa483..5a1962f 100644
          })
      }
  }
-@@ -552,6 +561,10 @@ pub struct Info1aPcm {
+@@ -552,17 +561,65 @@ pub struct Info1aPcm {
      pub upstream: SymbolRate,
      /// Bits 40:49: the 1050 Hz probing tone's offset as received, or none.
      pub frequency_offset: Option<f64>,
@@ -93,10 +105,55 @@ index 58aa483..5a1962f 100644
 +    /// said which carrier; V.92's short Phase 2 has no INFO1d, so the
 +    /// analogue modem says it here (Table 19/V.92).
 +    pub high_carrier: bool,
++    /// V.92's PCM upstream (Table 18/V.92): what the analogue modem's
++    /// precoder and prefilter can hold. Then `upstream` means nothing, since
++    /// bits 34:36 say 8000, and `md_length` counts 276-symbol steps.
++    pub pcm_up: Option<PcmUp>,
++}
++
++/// INFO1a's bits 12:17 when PCM upstream is selected (Table 18/V.92).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct PcmUp {
++    /// Bits 12:13: 0 = p1 and z2; 1 = z1, p1 and z2; 2 = p1, p2 and z2;
++    /// 3 = all four sections.
++    pub sections: u8,
++    /// Bits 14:15: the most coefficients in all, 192 + 64 times this.
++    pub total: u8,
++    /// Bits 16:17: the most in any one section, 128 + 64 times this.
++    pub each: u8,
++}
++
++impl PcmUp {
++    /// Everything: all four sections, 384 coefficients, 320 in any one.
++    pub const ALL: Self = Self { sections: 3, total: 3, each: 3 };
++
++    pub fn max_total(&self) -> usize {
++        192 + 64 * usize::from(self.total)
++    }
++
++    pub fn max_each(&self) -> usize {
++        128 + 64 * usize::from(self.each)
++    }
  }
  
  impl Info1aPcm {
-@@ -561,8 +574,9 @@ impl Info1aPcm {
+     pub fn to_bits(&self) -> Vec<bool> {
+         let mut info = Vec::with_capacity(38);
++        if let Some(up) = self.pcm_up {
++            // Table 18/V.92.
++            put(&mut info, u32::from(up.sections), 2);
++            put(&mut info, u32::from(up.total), 2);
++            put(&mut info, u32::from(up.each), 2);
++            put(&mut info, u32::from(self.md_length), 7);
++            put(&mut info, u32::from(self.uinfo), 7);
++            put(&mut info, 0, 2);
++            put(&mut info, PCM_SYMBOL_RATE, 3);
++            put(&mut info, PCM_SYMBOL_RATE, 3);
++            // Bits 40:49: "set to 1 ... to avoid generating a tone".
++            put(&mut info, 0x3ff, 10);
++            return frame(&info);
++        }
+         // Bits 12:17: "Reserved for the ITU".
          put(&mut info, 0, 6);
          put(&mut info, u32::from(self.md_length), 7);
          put(&mut info, u32::from(self.uinfo), 7);
@@ -108,15 +165,38 @@ index 58aa483..5a1962f 100644
          put(&mut info, self.upstream.index(), 3);
          put(&mut info, PCM_SYMBOL_RATE, 3);
          put(&mut info, offset_to(self.frequency_offset), 10);
-@@ -584,6 +598,7 @@ impl Info1aPcm {
+@@ -574,6 +631,21 @@ impl Info1aPcm {
+         if get(info, 25, 3) != PCM_SYMBOL_RATE {
+             return None;
+         }
++        // Table 18/V.92: 8000 upstream as well.
++        if get(info, 22, 3) == PCM_SYMBOL_RATE {
++            return Some(Self {
++                md_length: get(info, 6, 7) as u8,
++                uinfo: get(info, 13, 7) as u8,
++                upstream: SymbolRate::S3200,
++                frequency_offset: None,
++                high_carrier: false,
++                pcm_up: Some(PcmUp {
++                    sections: get(info, 0, 2) as u8,
++                    total: get(info, 2, 2) as u8,
++                    each: get(info, 4, 2) as u8,
++                }),
++            });
++        }
+         // 3000, 3200 and 3429 are the only upstream rates V.90 allows (6.2).
+         let upstream = match get(info, 22, 3) {
+             3..=5 => SymbolRate::from_index(get(info, 22, 3))?,
+@@ -584,6 +656,8 @@ impl Info1aPcm {
              uinfo: get(info, 13, 7) as u8,
              upstream,
              frequency_offset: offset_from(get(info, 28, 10)),
 +            high_carrier: info[21],
++            pcm_up: None,
          })
      }
  }
-@@ -744,6 +759,8 @@ mod tests {
+@@ -744,6 +818,8 @@ mod tests {
              power_at_codec: false,
              a_law: true,
              upstream_3429: true,
@@ -125,17 +205,42 @@ index 58aa483..5a1962f 100644
          };
          let bits = info0d.to_bits();
          assert_eq!(bits.len(), INFO0D_BITS);
-@@ -767,7 +784,7 @@ mod tests {
+@@ -763,11 +839,32 @@ mod tests {
+         assert_eq!(Info0d::from_bits(&Info0::default().to_bits()), None);
+     }
+ 
++    /// Table 18/V.92: PCM upstream, eight thousand both ways and the
++    /// precoder's sizes in bits 12:17.
++    #[test]
++    fn a_pcm_upstream_info1a_says_8000_both_ways() {
++        let asked = Info1aPcm {
++            md_length: 0,
++            uinfo: 79,
++            upstream: SymbolRate::S3200,
++            frequency_offset: None,
++            high_carrier: false,
++            pcm_up: Some(PcmUp::ALL),
++        };
++        let bits = asked.to_bits();
++        assert_eq!(bits.len(), INFO1A_BITS);
++        assert_eq!(Info1aPcm::from_bits(&bits), Some(asked));
++        assert_eq!(get(&bits, 12, 2), 3);
++        assert_eq!(get(&bits, 34, 3), 6);
++        assert_eq!(get(&bits, 37, 3), 6);
++        assert_eq!(get(&bits, 40, 10), 0x3ff);
++    }
++
+     /// Table 10/V.90: V.34's length, UINFO in bits 25:31, and six in 37:39 --
      /// which V.34's own INFO1a refuses, so the two cannot be mistaken.
      #[test]
      fn a_v90_info1a_carries_uinfo_and_names_8000() {
 -        let asked = Info1aPcm { md_length: 0, uinfo: 73, upstream: SymbolRate::S3200, frequency_offset: Some(-0.5) };
-+        let asked = Info1aPcm { md_length: 0, uinfo: 73, upstream: SymbolRate::S3200, frequency_offset: Some(-0.5), high_carrier: false };
++        let asked = Info1aPcm { md_length: 0, uinfo: 73, upstream: SymbolRate::S3200, frequency_offset: Some(-0.5), high_carrier: false, pcm_up: None };
          let bits = asked.to_bits();
          assert_eq!(bits.len(), INFO1A_BITS);
          assert_eq!(Info1aPcm::from_bits(&bits), Some(asked));
 diff --git a/crates/datapump/src/v34/phase2.rs b/crates/datapump/src/v34/phase2.rs
-index 2a1b22d..ef35c77 100644
+index 2a1b22d..5eeb5ad 100644
 --- a/crates/datapump/src/v34/phase2.rs
 +++ b/crates/datapump/src/v34/phase2.rs
 @@ -80,6 +80,52 @@ impl Pcm {
@@ -527,7 +632,7 @@ index 2a1b22d..ef35c77 100644
                  }
              }
              Stage::AnswerAwaitTone => {
-@@ -1047,6 +1324,26 @@ impl Modem {
+@@ -1047,6 +1324,27 @@ impl Modem {
          }
      }
  
@@ -542,6 +647,7 @@ index 2a1b22d..ef35c77 100644
 +            upstream: recall.upstream,
 +            frequency_offset: None,
 +            high_carrier: recall.high_carrier,
++            pcm_up: None,
 +        };
 +        let bits = asked.to_bits();
 +        self.info1a_pcm = Info1aPcm::from_bits(&bits);
@@ -554,11 +660,12 @@ index 2a1b22d..ef35c77 100644
      /// V.90's INFO1a (Table 10/V.90): the upstream symbol rate, and the
      /// codeword the digital modem is to train with.
      fn settle_pcm(&self, info1d: &Info1c, far: &Info0d) -> Info1aPcm {
-@@ -1073,6 +1370,7 @@ impl Modem {
+@@ -1073,6 +1371,8 @@ impl Modem {
              uinfo: v90::training_codeword(far),
              upstream,
              frequency_offset: self.reading.as_ref().and_then(|r| r.frequency_offset),
 +            high_carrier: false,
++            pcm_up: None,
          }
      }
  
@@ -1051,6 +1158,78 @@ index 52e648b..d5f8c0d 100644
      /// Run the two ends against each other, each saying whether it does LAPM.
      fn negotiate_protocol(ours: bool, theirs: bool, seconds: f64) -> (bool, bool) {
          let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS);
+diff --git a/crates/datapump/src/v90/sequences.rs b/crates/datapump/src/v90/sequences.rs
+index c944e9f..190e716 100644
+--- a/crates/datapump/src/v90/sequences.rs
++++ b/crates/datapump/src/v90/sequences.rs
+@@ -24,7 +24,7 @@ pub const BLOCK: usize = 16;
+ 
+ /// The sync, each block behind its start bit, and the CRC behind one: every
+ /// sequence here up to its fill.
+-fn frame(information: &[bool]) -> Vec<bool> {
++pub(crate) fn frame(information: &[bool]) -> Vec<bool> {
+     debug_assert_eq!(information.len() % BLOCK, 0, "information is whole blocks");
+     let mut bits = vec![true; SYNC_ONES];
+     for block in information.chunks(BLOCK) {
+@@ -39,7 +39,7 @@ fn frame(information: &[bool]) -> Vec<bool> {
+ /// The information of a sequence of `blocks` blocks, if the sync, every start
+ /// bit and the CRC are what they should be. `bits` starts at the frame sync
+ /// and runs at least to the end of the CRC.
+-fn unframe(bits: &[bool], blocks: usize) -> Option<Vec<bool>> {
++pub(crate) fn unframe(bits: &[bool], blocks: usize) -> Option<Vec<bool>> {
+     let crc_at = SYNC_ONES + blocks * (BLOCK + 1) + 1;
+     if bits.len() < crc_at + 16 || !bits[..SYNC_ONES].iter().all(|b| *b) {
+         return None;
+@@ -57,13 +57,13 @@ fn unframe(bits: &[bool], blocks: usize) -> Option<Vec<bool>> {
+     (crc(&information) == get(bits, crc_at, 16) as u16).then_some(information)
+ }
+ 
+-fn put(bits: &mut Vec<bool>, value: u32, width: usize) {
++pub(crate) fn put(bits: &mut Vec<bool>, value: u32, width: usize) {
+     for i in 0..width {
+         bits.push(value >> i & 1 == 1);
+     }
+ }
+ 
+-fn get(bits: &[bool], from: usize, width: usize) -> u32 {
++pub(crate) fn get(bits: &[bool], from: usize, width: usize) -> u32 {
+     (0..width).fold(0, |value, i| value | u32::from(bits[from + i]) << i)
+ }
+ 
+@@ -203,6 +203,18 @@ impl Descriptor {
+     }
+ 
+     pub fn to_bits(&self) -> Vec<bool> {
++        let mut bits = frame(&self.information());
++        // "Fill bit: 0", and another if it takes one to make the length even.
++        bits.push(false);
++        if bits.len() % 2 == 1 {
++            bits.push(false);
++        }
++        bits
++    }
++
++    /// The information bits, whole blocks, before the CRC: V.92's DIL
++    /// descriptor puts its rate mask after these (Table 20/V.92).
++    pub(crate) fn information(&self) -> Vec<bool> {
+         let n = self.ucodes.len().min(255);
+         let (signs, training) = if n == 0 {
+             // "LSP - 1 = LTP - 1 = 0 when N = 0."
+@@ -233,13 +245,7 @@ impl Descriptor {
+         }
+         let padded = information.len().div_ceil(BLOCK) * BLOCK;
+         information.resize(padded, false);
+-        let mut bits = frame(&information);
+-        // "Fill bit: 0", and another if it takes one to make the length even.
+-        bits.push(false);
+-        if bits.len() % 2 == 1 {
+-            bits.push(false);
+-        }
+-        bits
++        information
+     }
+ 
+     /// A descriptor out of `bits`, which start at its frame sync.
 diff --git a/crates/datapump/src/v90/server.rs b/crates/datapump/src/v90/server.rs
 index af7d8a0..1461480 100644
 --- a/crates/datapump/src/v90/server.rs
@@ -1210,8 +1389,1143 @@ index a31b259..474fc05 100644
          {
              let wide = p2.far_capabilities().is_some_and(|f| f.constellation_1664);
              let mut settings = digital::Settings::new(self.law, &info1d, &asked, p2.round_trip().unwrap_or(0.0), wide);
+diff --git a/crates/datapump/src/v92/mod.rs b/crates/datapump/src/v92/mod.rs
+new file mode 100644
+index 0000000..a5f47b2
+--- /dev/null
++++ b/crates/datapump/src/v92/mod.rs
+@@ -0,0 +1,5 @@
++//! V.92's PCM upstream: what the analogue modem sends when the digital
++//! modem receives PCM from it (6.4, 8.5 to 8.8 and 9.5 to 9.6/V.92).
++
++pub mod transmitter;
++pub mod sequences;
+diff --git a/crates/datapump/src/v92/sequences.rs b/crates/datapump/src/v92/sequences.rs
+new file mode 100644
+index 0000000..8a4e179
+--- /dev/null
++++ b/crates/datapump/src/v92/sequences.rs
+@@ -0,0 +1,609 @@
++//! V.92's information sequences for PCM upstream (8.5 to 8.8/V.92): CPd,
++//! CPt and CPu, CPus, SUVu and SUVd, Jp, and the DIL descriptor with its
++//! upstream rate mask.
++//!
++//! All are framed as V.90's are -- seventeen ones, sixteen-bit blocks each
++//! after a start bit of 0, a start bit and V.34's CRC -- and are built here
++//! on V.90's own framing.
++
++use crate::v34::trellis::Code;
++use crate::v90::sequences::{Cp, Descriptor, Mask, BLOCK, SYNC_ONES, frame, get, put, unframe};
++use crate::v90::sign::Redundancy;
++
++use super::transmitter::{Constellation, FRAME, Params};
++
++/// Where block `block`'s bit `bit` is, counting from the frame sync.
++fn at(block: usize, bit: usize) -> usize {
++    SYNC_ONES + block * (BLOCK + 1) + 1 + bit
++}
++
++/// Fill to a whole number of `multiple` bits with zeros, after the one
++/// fill bit every sequence ends with.
++fn fill(mut bits: Vec<bool>, multiple: usize) -> Vec<bool> {
++    bits.push(false);
++    while bits.len() % multiple != 0 {
++        bits.push(false);
++    }
++    bits
++}
++
++/// Signed fixed point with `fraction` bits after the point, as sixteen bits.
++fn to_fixed(value: f64, fraction: u32) -> u32 {
++    let scaled = (value * f64::from(1u32 << fraction)).round().clamp(-32768.0, 32767.0) as i32;
++    (scaled as i16 as u16).into()
++}
++
++fn from_fixed(bits: u32, fraction: u32) -> f64 {
++    f64::from(bits as u16 as i16) / f64::from(1u32 << fraction)
++}
++
++/// CPd (Table 30/V.92): what the digital modem tells the analogue modem to
++/// send with. The three optional parts are present when Some.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Cpd {
++    /// Bits 22:26: the upstream drn, 0 for cleardown; the rate is
++    /// (drn + 17) * 8000/6.
++    pub drn: u8,
++    /// Bits 27:28.
++    pub code: Code,
++    /// Bit 29: E2u one symbol longer.
++    pub extend_e2u: bool,
++    /// Bit 33.
++    pub acknowledge: bool,
++    /// Bits 35:50: 4G in unsigned Q0.16, kept as G.
++    pub gain: f64,
++    /// M0 to M11.
++    pub moduli: Option<[u8; FRAME]>,
++    /// z1(1..), p1(1..), z2(0..), p2(1..).
++    pub filters: Option<Filters>,
++    /// Which set each interval and the one six after it use, and the sets,
++    /// each its positive points smallest first.
++    pub constellations: Option<([u8; 6], Vec<Vec<u16>>)>,
++}
++
++#[derive(Debug, Clone, PartialEq, Default)]
++pub struct Filters {
++    pub z1: Vec<f64>,
++    pub p1: Vec<f64>,
++    pub z2: Vec<f64>,
++    pub p2: Vec<f64>,
++}
++
++impl Cpd {
++    /// The upstream rate in bit/s, or None for cleardown.
++    pub fn rate(&self) -> Option<u32> {
++        (self.drn > 0).then(|| (u32::from(self.drn) + 17) * 8000 / 6)
++    }
++
++    pub fn acknowledged(&self) -> Self {
++        Self { acknowledge: true, ..self.clone() }
++    }
++
++    /// The transmitter's parameters, when every part has been sent (this
++    /// one, or the last CPd that carried them).
++    pub fn params(&self) -> Option<Params> {
++        let moduli = self.moduli?;
++        let filters = self.filters.clone()?;
++        let (intervals, sets) = self.constellations.clone()?;
++        let set = |i: usize| -> Constellation {
++            let index = usize::from(intervals[i % 6]);
++            Constellation { positive: sets.get(index).map(|s| s.iter().map(|&p| f64::from(p)).collect()).unwrap_or_default() }
++        };
++        let params = Params {
++            bits: 2 * (usize::from(self.drn) + 17),
++            moduli: moduli.map(u32::from),
++            constellations: std::array::from_fn(set),
++            z1: filters.z1,
++            p1: filters.p1,
++            z2: filters.z2,
++            p2: filters.p2,
++            gain: self.gain,
++            code: self.code,
++        };
++        params.valid().then_some(params)
++    }
++
++    pub fn to_bits(&self) -> Vec<bool> {
++        let mut info = Vec::new();
++        info.push(false); // 18: CPd
++        info.push(self.moduli.is_some());
++        info.push(self.filters.is_some());
++        info.push(self.constellations.is_some());
++        put(&mut info, u32::from(self.drn), 5);
++        put(&mut info, match self.code {
++            Code::States16 => 0,
++            Code::States32 => 1,
++            Code::States64 => 2,
++        }, 2);
++        info.push(self.extend_e2u);
++        put(&mut info, 0, 3);
++        info.push(self.acknowledge);
++        put(&mut info, ((4.0 * self.gain * 65536.0).round() as u32).min(0xffff), 16);
++        if let Some(m) = self.moduli {
++            for v in m {
++                put(&mut info, u32::from(v), 8);
++            }
++        }
++        if let Some(f) = &self.filters {
++            for len in [f.z1.len(), f.p1.len(), f.z2.len(), f.p2.len()] {
++                put(&mut info, len as u32, 9);
++                put(&mut info, 0, 7);
++            }
++            for &z in &f.z1 {
++                put(&mut info, to_fixed(z, 15), 16);
++            }
++            for &p in &f.p1 {
++                put(&mut info, to_fixed(p, 14), 16);
++            }
++            for &z in &f.z2 {
++                put(&mut info, to_fixed(z, 15), 16);
++            }
++            for &p in &f.p2 {
++                put(&mut info, to_fixed(p, 14), 16);
++            }
++        }
++        if let Some((intervals, sets)) = &self.constellations {
++            for i in intervals {
++                put(&mut info, u32::from(*i), 4);
++            }
++            put(&mut info, 0, 8);
++            for k in 0..6 {
++                put(&mut info, sets.get(k).map_or(0, |s| s.len() as u32), 8);
++            }
++            for set in sets.iter().take(6) {
++                for &p in set {
++                    put(&mut info, u32::from(p), 16);
++                }
++            }
++        }
++        // "Fill bits: 0s to extend the CPd sequence length to the next
++        // multiple of 6 symbols": downstream, a bit a symbol.
++        fill(frame(&info), 6)
++    }
++
++    /// The blocks this CPd has, from its first and, when present, the
++    /// blocks giving the filter lengths and the constellation sizes.
++    fn blocks(bits: &[bool]) -> Option<usize> {
++        let need = |n: usize| bits.len() >= at(n, 0) + BLOCK;
++        if !need(1) {
++            return None;
++        }
++        let (moduli, filters, sets) = (bits[at(0, 1)], bits[at(0, 2)], bits[at(0, 3)]);
++        let mut blocks = 2 + if moduli { 6 } else { 0 };
++        if filters {
++            if !need(blocks + 3) {
++                return None;
++            }
++            let taps: usize = (0..4).map(|k| get(bits, at(blocks + k, 0), 9) as usize).sum();
++            blocks += 4 + taps;
++        }
++        if sets {
++            if !need(blocks + 4) {
++                return None;
++            }
++            let points: usize = (0..6)
++                .map(|k| {
++                    let (block, bit) = (blocks + 2 + k / 2, 8 * (k % 2));
++                    get(bits, at(block, bit), 8) as usize
++                })
++                .sum();
++            blocks += 5 + points;
++        }
++        Some(blocks)
++    }
++
++    /// The bits a whole CPd starting at `bits` takes, once its headers are
++    /// there to say; a guess that asks for more until then.
++    pub fn length(bits: &[bool]) -> usize {
++        match Self::blocks(bits) {
++            Some(blocks) => SYNC_ONES + (blocks + 1) * (BLOCK + 1),
++            None => bits.len() + BLOCK,
++        }
++    }
++
++    pub fn from_bits(bits: &[bool]) -> Option<Self> {
++        if bits.get(at(0, 0)) != Some(&false) {
++            return None;
++        }
++        let blocks = Self::blocks(bits)?;
++        let info = unframe(bits, blocks)?;
++        let code = match get(&info, 9, 2) {
++            0 => Code::States16,
++            1 => Code::States32,
++            2 => Code::States64,
++            _ => return None,
++        };
++        let mut from = 2 * BLOCK;
++        let moduli = info[1].then(|| {
++            let m = std::array::from_fn(|k| get(&info, from + 8 * k, 8) as u8);
++            from += 6 * BLOCK;
++            m
++        });
++        let filters = info[2].then(|| {
++            let lens: Vec<usize> = (0..4).map(|k| get(&info, from + BLOCK * k, 9) as usize).collect();
++            from += 4 * BLOCK;
++            let mut take = |n: usize, fraction: u32| -> Vec<f64> {
++                let v = (0..n).map(|k| from_fixed(get(&info, from + BLOCK * k, 16), fraction)).collect();
++                from += n * BLOCK;
++                v
++            };
++            let z1 = take(lens[0], 15);
++            let p1 = take(lens[1], 14);
++            let z2 = take(lens[2], 15);
++            let p2 = take(lens[3], 14);
++            Filters { z1, p1, z2, p2 }
++        });
++        let constellations = info[3].then(|| {
++            let intervals = std::array::from_fn(|k| get(&info, from + 4 * k, 4) as u8);
++            from += 2 * BLOCK;
++            let sizes: Vec<usize> = (0..6).map(|k| get(&info, from + 8 * k, 8) as usize).collect();
++            from += 3 * BLOCK;
++            let sets = sizes
++                .iter()
++                .filter(|&&n| n > 0)
++                .map(|&n| {
++                    let s = (0..n).map(|k| get(&info, from + BLOCK * k, 16) as u16).collect();
++                    from += n * BLOCK;
++                    s
++                })
++                .collect();
++            (intervals, sets)
++        });
++        Some(Self {
++            drn: get(&info, 4, 5) as u8,
++            code,
++            extend_e2u: info[11],
++            acknowledge: info[15],
++            gain: f64::from(get(&info, 16, 16)) / 65536.0 / 4.0,
++            moduli,
++            filters,
++            constellations,
++        })
++    }
++}
++
++/// Which of Table 23's CP sequences: CPt, CPu, or Table 24's short CPus.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum CpKind {
++    Training,
++    Data,
++    Short,
++}
++
++/// A V.92 CP: V.90's from bit 34 on, with V.92's first block -- the type in
++/// bits 19:20 and the rate in 21:25 (Table 23/V.92). V.90's upstream rates
++/// in 36:48 are reserved, since V.92's are in Ja.
++pub fn cp_bits(cp: &Cp, kind: CpKind) -> Vec<bool> {
++    let mut info = Vec::new();
++    info.push(false); // 18: CP
++    put(&mut info, match kind {
++        CpKind::Training => 0,
++        CpKind::Data => 1,
++        CpKind::Short => 2,
++    }, 2);
++    put(&mut info, u32::from(cp.drn), 5);
++    if kind == CpKind::Short {
++        put(&mut info, 0, 7); // 26:32 reserved
++        info.push(cp.acknowledge);
++        // "Fill bits: 0s ... to the next multiple of 12 symbols": at two
++        // bits a symbol on TRN2u's four points, 24 bits.
++        return fill(frame(&info), 24);
++    }
++    put(&mut info, 0, 5); // 26:30 reserved
++    put(&mut info, cp.redundancy.spent() as u32, 2);
++    info.push(cp.acknowledge);
++    info.push(cp.a_law);
++    put(&mut info, 0, 13); // 36:48 reserved
++    put(&mut info, u32::from(cp.lookahead), 2);
++    put(&mut info, u32::from(cp.trn1d_ratio), 16);
++    for coefficient in cp.shaping {
++        put(&mut info, u32::from(coefficient as u8), 8);
++    }
++    for index in cp.intervals {
++        put(&mut info, u32::from(index), 4);
++    }
++    info.push(cp.codec.is_some());
++    put(&mut info, 0, 7);
++    let count = usize::from(cp.intervals.iter().copied().max().unwrap_or(0)) + 1;
++    let wanted = if cp.codec.is_some() { 2 * count } else { count };
++    for mask in cp.constellations.iter().chain(cp.codec.iter().flatten()).take(wanted) {
++        for chord in 0..8 {
++            put(&mut info, (mask >> (16 * chord)) as u32 & 0xffff, 16);
++        }
++    }
++    fill(frame(&info), 24)
++}
++
++/// A V.92 CP back, for the digital modem: which kind, and its fields as
++/// V.90's [`Cp`] holds them (`data_mode` set for CPu).
++pub fn cp_from_bits(bits: &[bool]) -> Option<(CpKind, Cp)> {
++    if bits.len() < at(1, 0) || bits[at(0, 0)] {
++        return None;
++    }
++    let kind = match get(bits, at(0, 1), 2) {
++        0 => CpKind::Training,
++        1 => CpKind::Data,
++        2 => CpKind::Short,
++        _ => return None,
++    };
++    let drn = get(bits, at(0, 3), 5) as u8;
++    if kind == CpKind::Short {
++        let info = unframe(bits, 1)?;
++        return Some((kind, Cp { data_mode: true, drn, acknowledge: info[15], ..Cp::default() }));
++    }
++    if bits.len() < at(7, 0) {
++        return None;
++    }
++    let intervals: [u8; 6] = std::array::from_fn(|i| {
++        let (block, bit) = if i < 4 { (5, 4 * i) } else { (6, 4 * (i - 4)) };
++        get(bits, at(block, bit), 4) as u8
++    });
++    if intervals.iter().any(|&i| i > 5) {
++        return None;
++    }
++    let codec = bits[at(6, 8)];
++    let count = usize::from(*intervals.iter().max().unwrap_or(&0)) + 1;
++    let masks = if codec { 2 * count } else { count };
++    let info = unframe(bits, 7 + 8 * masks)?;
++    let mask = |k: usize| -> Mask {
++        let from = 7 * BLOCK + k * 8 * BLOCK;
++        (0..8).fold(0, |m, chord| m | Mask::from(get(&info, from + chord * BLOCK, 16)) << (16 * chord))
++    };
++    Some((
++        kind,
++        Cp {
++            data_mode: kind == CpKind::Data,
++            drn,
++            silence: false,
++            redundancy: match get(&info, 13, 2) {
++                0 => Redundancy::None,
++                1 => Redundancy::One,
++                2 => Redundancy::Two,
++                _ => Redundancy::Three,
++            },
++            acknowledge: info[15],
++            a_law: info[16],
++            upstream_rates: 0,
++            lookahead: get(&info, 30, 2) as u8,
++            trn1d_ratio: get(&info, 32, 16) as u16,
++            shaping: std::array::from_fn(|k| get(&info, 48 + 8 * k, 8) as u8 as i8),
++            intervals,
++            constellations: (0..count).map(mask).collect(),
++            codec: codec.then(|| (count..2 * count).map(mask).collect()),
++        },
++    ))
++}
++
++/// A V.92 CP's length from its first seven blocks, as V.90's.
++pub fn cp_length(bits: &[bool]) -> usize {
++    if bits.len() >= at(0, 3) && get(bits, at(0, 1), 2) == 2 {
++        return SYNC_ONES + 2 * (BLOCK + 1);
++    }
++    if bits.len() <= at(6, 8) {
++        return bits.len() + BLOCK;
++    }
++    let largest = (0..6)
++        .map(|i| {
++            let (block, bit) = if i < 4 { (5, 4 * i) } else { (6, 4 * (i - 4)) };
++            get(bits, at(block, bit), 4) as usize
++        })
++        .max()
++        .unwrap_or(0)
++        .min(5);
++    let masks = if bits[at(6, 8)] { 2 * (largest + 1) } else { largest + 1 };
++    SYNC_ONES + (7 + 8 * masks + 1) * (BLOCK + 1)
++}
++
++/// SUVu and SUVd (Tables 27 and 31/V.92).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub struct Suv {
++    /// SUVu bit 26: wait for a CPu before sending a CPd.
++    pub wait_for_cpu: bool,
++    /// SUVu bits 27:31: 20 log10 of the prefilter's RMS times G, signed
++    /// Q2.2; 16 (-4.00) is no measurement.
++    pub level: u8,
++    /// Bit 32: a silent period is asked for.
++    pub silence: bool,
++    /// Bit 33.
++    pub acknowledge: bool,
++}
++
++impl Suv {
++    /// "The value 16 (-4.00) indicates that no measurement has been taken".
++    pub const UNMEASURED: u8 = 16;
++
++    /// `upstream` for SUVu (fill to 12 symbols of two bits), else SUVd (to 6
++    /// symbols of one).
++    pub fn to_bits(&self, upstream: bool) -> Vec<bool> {
++        let mut info = vec![true]; // 18: SUV
++        put(&mut info, 0, 7); // 19:25
++        info.push(self.wait_for_cpu);
++        put(&mut info, u32::from(self.level), 5);
++        info.push(self.silence);
++        info.push(self.acknowledge);
++        fill(frame(&info), if upstream { 24 } else { 6 })
++    }
++
++    pub fn from_bits(bits: &[bool]) -> Option<Self> {
++        let info = unframe(bits, 1)?;
++        if !info[0] {
++            return None;
++        }
++        Some(Self { wait_for_cpu: info[8], level: get(&info, 9, 5) as u8, silence: info[14], acknowledge: info[15] })
++    }
++}
++
++/// The length of anything that begins with one block saying SUV or not.
++pub const SUV_BITS: usize = SYNC_ONES + 2 * (BLOCK + 1);
++
++/// Jp (Table 22/V.92): how far the digital modem wants Su extended, and the
++/// sizes of TRN2u.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Jp {
++    /// Bits 18:33: the fraction of a symbol, [0, 1).
++    pub fraction: f64,
++    /// Bits 48 and 49: eight points for CPu, E2u, SUVu and TRN2u in training,
++    /// and in rate renegotiation; four otherwise.
++    pub eight_in_training: bool,
++    pub eight_in_renegotiation: bool,
++}
++
++/// Jd and Jp are 72 bits each (Tables 21 and 22/V.92).
++pub const JP_BITS: usize = 72;
++
++impl Jp {
++    pub fn to_bits(&self) -> Vec<bool> {
++        let mut info = Vec::new();
++        put(&mut info, ((self.fraction * 65536.0) as u32).min(0xffff), 16);
++        put(&mut info, 0, 12); // 35:46
++        info.push(true); // 47: Jp
++        info.push(self.eight_in_training);
++        info.push(self.eight_in_renegotiation);
++        info.push(false);
++        let mut bits = frame(&info);
++        bits.resize(JP_BITS, false);
++        bits
++    }
++
++    /// A Jp, and only a Jp: bit 47 says Jd or Jp.
++    pub fn from_bits(bits: &[bool]) -> Option<Self> {
++        let info = unframe(bits, 2)?;
++        if !info[28] {
++            return None;
++        }
++        Some(Self {
++            fraction: f64::from(get(&info, 0, 16)) / 65536.0,
++            eight_in_training: info[29],
++            eight_in_renegotiation: info[30],
++        })
++    }
++}
++
++/// Upstream rates the analogue modem's transmitter has enabled, in Ja's DIL
++/// descriptor (Table 20/V.92): bit 0 for 24 000 up to bit 18 for 48 000.
++pub const ALL_UPSTREAM_RATES: u32 = (1 << 19) - 1;
++
++/// Ja's DIL descriptor for V.92: V.90's, the upstream rate mask in two
++/// blocks after it, then the CRC; filled to whole twelve-bit groups ("Ja
++/// shall be an integer multiple of 12 bits long").
++pub fn descriptor_bits(descriptor: &Descriptor, rates: u32) -> Vec<bool> {
++    let mut info = descriptor.information();
++    put(&mut info, rates & 0xffff, 16);
++    put(&mut info, rates >> 16 & 0x7, 3);
++    put(&mut info, 0, 13);
++    fill(frame(&info), 12)
++}
++
++/// The same back, for the digital modem: the descriptor and the mask.
++pub fn descriptor_from_bits(bits: &[bool]) -> Option<(Descriptor, u32)> {
++    if bits.len() < SYNC_ONES + 2 * (BLOCK + 1) {
++        return None;
++    }
++    let n = get(bits, at(0, 0), 8) as usize;
++    let lsp = get(bits, at(1, 0), 7) as usize + 1;
++    let ltp = get(bits, at(1, 8), 7) as usize + 1;
++    let blocks = 2 + lsp.div_ceil(BLOCK) + ltp.div_ceil(BLOCK) + 8 + n.div_ceil(2);
++    let info = unframe(bits, blocks + 2)?;
++    // V.90's own reader wants its own CRC after its blocks: give it one.
++    let mut v90 = frame(&info[..blocks * BLOCK]);
++    v90.push(false);
++    let descriptor = Descriptor::from_bits(&v90)?;
++    let rates = get(&info, blocks * BLOCK, 16) | get(&info, blocks * BLOCK + 16, 3) << 16;
++    Some((descriptor, rates))
++}
++
++/// Its length from its first two blocks.
++pub fn descriptor_length(bits: &[bool]) -> usize {
++    if bits.len() < SYNC_ONES + 2 * (BLOCK + 1) {
++        return bits.len() + BLOCK;
++    }
++    let n = get(bits, at(0, 0), 8) as usize;
++    let lsp = get(bits, at(1, 0), 7) as usize + 1;
++    let ltp = get(bits, at(1, 8), 7) as usize + 1;
++    let blocks = 2 + lsp.div_ceil(BLOCK) + ltp.div_ceil(BLOCK) + 8 + n.div_ceil(2) + 2;
++    SYNC_ONES + (blocks + 1) * (BLOCK + 1)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_cpd_with_every_part_reads_back() {
++        let cpd = Cpd {
++            drn: 19,
++            code: Code::States32,
++            extend_e2u: true,
++            acknowledge: false,
++            gain: 0.123,
++            moduli: Some([64, 64, 64, 64, 60, 60, 60, 60, 50, 50, 50, 50]),
++            filters: Some(Filters { z1: vec![0.25, -0.125], p1: vec![-0.5], z2: vec![1.0 - 1.0 / 32768.0, 0.0625], p2: vec![] }),
++            constellations: Some(([0, 1, 0, 1, 0, 1], vec![(1..=64).map(|p| p * 50).collect(), (1..=60).map(|p| p * 55).collect()])),
++        };
++        let bits = cpd.to_bits();
++        assert_eq!(bits.len() % 6, 0);
++        // Its length, once the headers are in, is everything up to its CRC.
++        assert!(Cpd::length(&bits) <= bits.len() && bits.len() - Cpd::length(&bits) < 7);
++        let back = Cpd::from_bits(&bits).expect("does not read back");
++        assert_eq!(back.drn, 19);
++        assert_eq!(back.code, Code::States32);
++        assert!((back.gain - 0.123).abs() < 1e-4);
++        assert_eq!(back.moduli, cpd.moduli);
++        assert_eq!(back.filters, cpd.filters);
++        assert_eq!(back.constellations, cpd.constellations);
++        assert_eq!(back.rate(), Some(48_000));
++        // A bit spoiled is no CPd.
++        let mut spoiled = bits.clone();
++        spoiled[200] = !spoiled[200];
++        assert_eq!(Cpd::from_bits(&spoiled), None);
++    }
++
++    #[test]
++    fn a_cpd_with_only_its_first_part_is_short() {
++        let cpd = Cpd { drn: 0, code: Code::States16, extend_e2u: false, acknowledge: true, gain: 0.125, moduli: None, filters: None, constellations: None };
++        let bits = cpd.to_bits();
++        assert_eq!(Cpd::from_bits(&bits), Some(cpd));
++        assert_eq!(Cpd::length(&bits), SYNC_ONES + 3 * (BLOCK + 1));
++    }
++
++    #[test]
++    fn a_v92_cp_has_its_type_and_rate_where_table_23_puts_them() {
++        let cp = Cp {
++            drn: 19,
++            acknowledge: true,
++            intervals: [0, 1, 0, 1, 0, 1],
++            constellations: vec![0xffff_0000, 0xff00],
++            ..Cp::default()
++        };
++        for kind in [CpKind::Training, CpKind::Data] {
++            let bits = cp_bits(&cp, kind);
++            assert_eq!(bits.len() % 24, 0);
++            assert_eq!(get(&bits, 19, 2), if kind == CpKind::Data { 1 } else { 0 });
++            assert_eq!(get(&bits, 21, 5), 19);
++            assert!(bits[33]);
++            assert_eq!(cp_length(&bits), cp_length(&bits[..SYNC_ONES + 7 * (BLOCK + 1)]));
++            let (k, back) = cp_from_bits(&bits).expect("does not read back");
++            assert_eq!(k, kind);
++            assert_eq!((back.drn, back.intervals, back.constellations), (19, cp.intervals, cp.constellations.clone()));
++        }
++        let short = cp_bits(&cp, CpKind::Short);
++        assert_eq!(cp_from_bits(&short).map(|(k, c)| (k, c.drn, c.acknowledge)), Some((CpKind::Short, 19, true)));
++    }
++
++    #[test]
++    fn suv_jp_and_the_descriptor_read_back() {
++        let suv = Suv { wait_for_cpu: true, level: Suv::UNMEASURED, silence: false, acknowledge: true };
++        assert_eq!(Suv::from_bits(&suv.to_bits(true)), Some(suv));
++        assert_eq!(suv.to_bits(true).len() % 24, 0);
++        let jp = Jp { fraction: 0.375, eight_in_training: true, eight_in_renegotiation: false };
++        let bits = jp.to_bits();
++        assert_eq!(bits.len(), JP_BITS);
++        assert_eq!(Jp::from_bits(&bits), Some(jp));
++        assert!(bits[47]);
++        let d = crate::v90::dil::design(crate::v90::ucode::Law::Mu, 79);
++        let bits = descriptor_bits(&d, ALL_UPSTREAM_RATES);
++        assert_eq!(bits.len() % 12, 0);
++        assert_eq!(descriptor_length(&bits[..80]), descriptor_length(&bits));
++        assert_eq!(descriptor_from_bits(&bits), Some((d, ALL_UPSTREAM_RATES)));
++    }
++}
+diff --git a/crates/datapump/src/v92/transmitter.rs b/crates/datapump/src/v92/transmitter.rs
+new file mode 100644
+index 0000000..437711a
+--- /dev/null
++++ b/crates/datapump/src/v92/transmitter.rs
+@@ -0,0 +1,503 @@
++//! V.92's PCM upstream transmitter (6.4/V.92), and its inverse.
++//!
++//! ```text
++//!   bits -> modulus encoder -> K0..K11 -> precoder -> x(n) -> prefilter -> G v(n)
++//!                                            ^  | y(n)
++//!                     convolutional encoder Y0  inverse map  <-+
++//! ```
++//!
++//! A data frame is twelve symbols at 8000 a second. Its K scrambled bits
++//! become twelve numbers, one per symbol, each less than that interval's
++//! modulus Mi (6.4.1). Each number names an equivalence class of points of
++//! that interval's constellation -- every point whose index is the number
++//! plus a multiple of Mi, or for the last symbol of each four, twice that
++//! with its parity set by the trellis code -- and the precoder picks from it
++//! the point that keeps its own output smallest (6.4.2, and the Note to
++//! 8.8.3: the digital modem designs "under the assumption that the analogue
++//! modem minimizes the power at the precoder output on a symbol-by-symbol
++//! basis"). The precoder's filters cancel what the line will do, so the
++//! codec at the far end sees the chosen point itself; the digital modem
++//! slices it, and the class it is in gives back the number.
++//!
++//! Everything the transmitter needs comes from the digital modem in CPd
++//! (Table 30/V.92): the moduli, the four filters, the gain, the
++//! constellations and the trellis code. [`Decoder`] is the digital modem's
++//! side of the same, for a server to be tested against.
++
++use crate::v34::trellis::{self, Code};
++
++/// Symbols in an upstream data frame (Figure 1/V.92).
++pub const FRAME: usize = 12;
++
++/// Symbols in a trellis frame.
++pub const TRELLIS: usize = 4;
++
++/// One constellation as CPd gives it (Table 30/V.92): its positive points,
++/// smallest first, in the codec's linear units. The negative points are
++/// their negatives; there is no zero point.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Constellation {
++    pub positive: Vec<f64>,
++}
++
++impl Constellation {
++    /// N, the number of points.
++    pub fn len(&self) -> i64 {
++        2 * self.positive.len() as i64
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.positive.is_empty()
++    }
++
++    /// a(eta), for -N/2 <= eta < N/2: "negative points have negative
++    /// indices, and positive points have non-negative indices".
++    pub fn point(&self, eta: i64) -> f64 {
++        if eta >= 0 {
++            self.positive[eta as usize]
++        } else {
++            -self.positive[(-eta - 1) as usize]
++        }
++    }
++
++    /// The index of the point nearest `value`.
++    pub fn nearest(&self, value: f64) -> i64 {
++        let magnitude = value.abs();
++        let i = self
++            .positive
++            .iter()
++            .enumerate()
++            .min_by(|a, b| (a.1 - magnitude).abs().total_cmp(&(b.1 - magnitude).abs()))
++            .map_or(0, |(i, _)| i as i64);
++        if value >= 0.0 { i } else { -i - 1 }
++    }
++}
++
++/// What CPd sets the transmitter up with.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Params {
++    /// K, bits per data frame: (drn + 17) * 8000/6 bit/s is 2 (drn + 17)
++    /// bits a frame of 12 symbols.
++    pub bits: usize,
++    /// M0 to M11.
++    pub moduli: [u32; FRAME],
++    /// The constellation each data frame interval uses (an interval and the
++    /// one six after it share one, Table 30).
++    pub constellations: [Constellation; FRAME],
++    /// z1(1..=LZ1), p1(1..=LP1), z2(0..LZ2), p2(1..=LP2).
++    pub z1: Vec<f64>,
++    pub p1: Vec<f64>,
++    pub z2: Vec<f64>,
++    pub p2: Vec<f64>,
++    /// G, the gain after the prefilter.
++    pub gain: f64,
++    pub code: Code,
++}
++
++impl Params {
++    /// The data signalling rate in bit/s.
++    pub fn rate(&self) -> u32 {
++        (self.bits as u32 * 8000) / FRAME as u32
++    }
++
++    /// The product of the moduli, which 6.4.1 requires to be at least 2^K.
++    pub fn product(&self) -> u128 {
++        self.moduli.iter().map(|&m| u128::from(m)).product()
++    }
++
++    /// Whether these can carry K bits at all.
++    pub fn valid(&self) -> bool {
++        self.bits <= 127
++            && self.moduli.iter().all(|&m| m >= 1)
++            && self.product() >= 1u128 << self.bits
++            && self.constellations.iter().enumerate().all(|(i, c)| {
++                let k = i % TRELLIS;
++                let needed = if k == 3 { 2 * self.moduli[i] } else { self.moduli[i] };
++                c.len() >= i64::from(needed)
++            })
++    }
++}
++
++/// 6.4.1: K bits to twelve numbers, with the sign of R differentially
++/// encoded from frame to frame.
++#[derive(Debug, Clone, Default)]
++pub struct ModulusEncoder {
++    /// d(f - 1).
++    previous: bool,
++}
++
++impl ModulusEncoder {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn reset(&mut self) {
++        self.previous = false;
++    }
++
++    /// `bits`, b0 first in time, as K0 to K11.
++    pub fn encode(&mut self, bits: &[bool], moduli: &[u32; FRAME]) -> [u32; FRAME] {
++        let m: u128 = moduli.iter().map(|&m| u128::from(m)).product();
++        // 1) R = b0 + b1 2 + ... + b(K-1) 2^(K-1).
++        let r = bits.iter().enumerate().fold(0u128, |r, (i, &b)| r | u128::from(b) << i);
++        // 2) and 3): the 'sign', differentially encoded.
++        let s = r > (m - 1) / 2;
++        let d = s ^ self.previous;
++        // 4) R0 = R, or its mirror, by d(f - 1).
++        let mut ri = if self.previous { m - 1 - r } else { r };
++        self.previous = d;
++        // 5) Mixed-radix digits, interval 0 first.
++        let mut k = [0u32; FRAME];
++        for (slot, &mi) in k.iter_mut().zip(moduli) {
++            let mi = u128::from(mi);
++            *slot = (ri % mi) as u32;
++            ri /= mi;
++        }
++        k
++    }
++}
++
++/// 6.4.1 backwards, at the digital modem.
++#[derive(Debug, Clone, Default)]
++pub struct ModulusDecoder {
++    previous: bool,
++}
++
++impl ModulusDecoder {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn reset(&mut self) {
++        self.previous = false;
++    }
++
++    /// K0 to K11 back to `bits` bits, b0 first.
++    pub fn decode(&mut self, k: &[u32; FRAME], moduli: &[u32; FRAME], bits: usize) -> Vec<bool> {
++        let m: u128 = moduli.iter().map(|&m| u128::from(m)).product();
++        let mut r0 = 0u128;
++        for (&ki, &mi) in k.iter().zip(moduli).rev() {
++            r0 = r0 * u128::from(mi) + u128::from(ki);
++        }
++        let r = if self.previous { (m - 1).saturating_sub(r0) } else { r0 };
++        let s = r > (m - 1) / 2;
++        self.previous = s ^ self.previous;
++        (0..bits).map(|i| r >> i & 1 == 1).collect()
++    }
++}
++
++/// The trellis code across a data frame: Y0 for the last symbol of each four,
++/// and the next state from the inverse map of all four (6.4.3, 6.4.4).
++#[derive(Debug, Clone, Default)]
++pub struct Trellis {
++    code: Code,
++    state: u8,
++}
++
++impl Trellis {
++    pub fn new(code: Code) -> Self {
++        Self { code, state: 0 }
++    }
++
++    pub fn reset(&mut self) {
++        self.state = 0;
++    }
++
++    /// Y0, from the state the trellis frame begins in.
++    pub fn y0(&self) -> bool {
++        self.code.output(self.state)
++    }
++
++    /// The trellis frame's four indices sent: the inverse map takes
++    /// (y(0), y(1)) and (y(2), y(3)) as two-dimensional points with odd
++    /// coordinates 2y + 1, and V.34's symbol-to-bit converter makes Y1 to Y4
++    /// of them; with "the 2T delays ... replaced by 4T delays" the encoder
++    /// steps once a trellis frame.
++    pub fn advance(&mut self, y: [i64; TRELLIS]) {
++        let odd = |v: i64| (2 * v + 1) as i32;
++        let first = trellis::label((odd(y[0]), odd(y[1])));
++        let second = trellis::label((odd(y[2]), odd(y[3])));
++        let bits = trellis::convert(first, second);
++        self.state = self.code.next(self.state, bits & self.code.inputs());
++    }
++}
++
++/// The parity the last point of a trellis frame has to make up: eta3 is
++/// "2Ki + 2 zk Mi + (eta0 + eta1 + eta2 + Y0) mod 2".
++fn parity(first_three: &[i64], y0: bool) -> i64 {
++    (first_three.iter().sum::<i64>() + i64::from(y0)).rem_euclid(2)
++}
++
++/// The precoder and prefilter (6.4.2): filter state, and the choice of point.
++#[derive(Debug, Clone)]
++pub struct Precoder {
++    /// u(n - 1), u(n - 2), ... and x(n - 1), ..., and v(n - 1), ...
++    u: Vec<f64>,
++    x: Vec<f64>,
++    v: Vec<f64>,
++}
++
++impl Precoder {
++    pub fn new(params: &Params) -> Self {
++        Self {
++            u: vec![0.0; params.z1.len()],
++            x: vec![0.0; params.p1.len().max(params.z2.len())],
++            v: vec![0.0; params.p2.len()],
++        }
++    }
++
++    /// The precoder filter's output for a point `u`, before it is kept.
++    fn x_for(&self, params: &Params, u: f64) -> f64 {
++        let ff: f64 = params.z1.iter().zip(&self.u).map(|(z, u)| z * u).sum();
++        let fb: f64 = params.p1.iter().zip(&self.x).map(|(p, x)| p * x).sum();
++        u + ff + fb
++    }
++
++    /// Choose from the class of points `candidate(z)`, z an integer, the
++    /// one whose precoder output is smallest; keep it; return its index and
++    /// G v(n).
++    fn send(&mut self, params: &Params, constellation: &Constellation, candidates: impl Iterator<Item = i64>) -> (i64, f64) {
++        let (eta, u, x) = candidates
++            .map(|eta| {
++                let u = constellation.point(eta);
++                (eta, u, self.x_for(params, u))
++            })
++            .min_by(|a, b| a.2.abs().total_cmp(&b.2.abs()))
++            .expect("a class is never empty in valid parameters");
++        if !self.u.is_empty() {
++            self.u.rotate_right(1);
++            self.u[0] = u;
++        }
++        if !self.x.is_empty() {
++            self.x.rotate_right(1);
++            self.x[0] = x;
++        }
++        // v(n) = sum z2(k) x(n - k), k from 0, + sum p2(k) v(n - k).
++        let ff: f64 = params.z2.iter().zip(&self.x).map(|(z, x)| z * x).sum();
++        let fb: f64 = params.p2.iter().zip(&self.v).map(|(p, v)| p * v).sum();
++        let v = ff + fb;
++        if !self.v.is_empty() {
++            self.v.rotate_right(1);
++            self.v[0] = v;
++        }
++        (eta, params.gain * v)
++    }
++}
++
++/// The whole transmitter, from scrambled bits to G v(n).
++#[derive(Debug, Clone)]
++pub struct Transmitter {
++    params: Params,
++    modulus: ModulusEncoder,
++    trellis: Trellis,
++    precoder: Precoder,
++}
++
++impl Transmitter {
++    /// "The scrambler, modulus encoder, convolutional encoder, precoder and
++    /// prefilter memories are initialized to zero prior to transmitting B1u"
++    /// (8.7.1/V.92).
++    pub fn new(params: Params) -> Self {
++        let precoder = Precoder::new(&params);
++        let trellis = Trellis::new(params.code);
++        Self { params, modulus: ModulusEncoder::new(), trellis, precoder }
++    }
++
++    pub fn params(&self) -> &Params {
++        &self.params
++    }
++
++    /// One data frame: K bits in, twelve line levels out.
++    pub fn frame(&mut self, bits: &[bool]) -> [f64; FRAME] {
++        let k = self.modulus.encode(bits, &self.params.moduli);
++        self.send_numbers(&k)
++    }
++
++    /// Twelve modulus numbers as they are (RM and RM', Tables 25 and 26).
++    pub fn send_numbers(&mut self, k: &[u32; FRAME]) -> [f64; FRAME] {
++        let mut out = [0.0; FRAME];
++        let mut etas = [0i64; TRELLIS];
++        for i in 0..FRAME {
++            let slot = i % TRELLIS;
++            let m = i64::from(self.params.moduli[i]);
++            let ki = i64::from(k[i]);
++            let constellation = self.params.constellations[i].clone();
++            let half = constellation.len() / 2;
++            let (eta, level) = if slot == 3 {
++                let p = parity(&etas[..3], self.trellis.y0());
++                let first = 2 * ki + p;
++                let candidates = class(first, 2 * m, half);
++                self.precoder.send(&self.params, &constellation, candidates)
++            } else {
++                self.precoder.send(&self.params, &constellation, class(ki, m, half))
++            };
++            etas[slot] = eta;
++            out[i] = level;
++            if slot == 3 {
++                self.trellis.advance(etas);
++            }
++        }
++        out
++    }
++}
++
++/// Every eta in -half..half that is `first` plus a multiple of `step`.
++fn class(first: i64, step: i64, half: i64) -> impl Iterator<Item = i64> {
++    let start = first - step * ((first + half).div_euclid(step));
++    (0..).map(move |z| start + z * step).take_while(move |&eta| eta < half).filter(move |&eta| eta >= -half)
++}
++
++/// The digital modem's side: the points that arrived, back to bits. Hard
++/// decisions, the trellis followed on what was decided.
++#[derive(Debug, Clone)]
++pub struct Decoder {
++    params: Params,
++    modulus: ModulusDecoder,
++    trellis: Trellis,
++}
++
++impl Decoder {
++    pub fn new(params: Params) -> Self {
++        let trellis = Trellis::new(params.code);
++        Self { params, modulus: ModulusDecoder::new(), trellis }
++    }
++
++    /// The indices of a data frame's twelve points, as the codec delivered
++    /// them and the slicer read them, back to the modulus numbers.
++    pub fn numbers(&mut self, etas: &[i64; FRAME]) -> [u32; FRAME] {
++        let mut k = [0u32; FRAME];
++        for t in 0..FRAME / TRELLIS {
++            let frame = &etas[t * TRELLIS..(t + 1) * TRELLIS];
++            for (slot, &eta) in frame.iter().enumerate() {
++                let i = t * TRELLIS + slot;
++                let m = i64::from(self.params.moduli[i]);
++                k[i] = if slot == 3 {
++                    let p = parity(&frame[..3], self.trellis.y0());
++                    ((eta - p).div_euclid(2)).rem_euclid(m) as u32
++                } else {
++                    eta.rem_euclid(m) as u32
++                };
++            }
++            self.trellis.advance([frame[0], frame[1], frame[2], frame[3]]);
++        }
++        k
++    }
++
++    /// The same, to bits.
++    pub fn frame(&mut self, etas: &[i64; FRAME]) -> Vec<bool> {
++        let k = self.numbers(etas);
++        self.modulus.decode(&k, &self.params.moduli, self.params.bits)
++    }
++
++    /// Slice line levels, already divided by the gain and freed of the
++    /// line's own filtering, to indices.
++    pub fn slice(&self, levels: &[f64; FRAME]) -> [i64; FRAME] {
++        std::array::from_fn(|i| self.params.constellations[i].nearest(levels[i]))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A plain constellation: `n` positive points evenly spaced.
++    fn ladder(n: usize, step: f64) -> Constellation {
++        Constellation { positive: (0..n).map(|i| step * (i as f64 + 0.5)).collect() }
++    }
++
++    fn params(bits: usize, moduli: [u32; FRAME], points: usize) -> Params {
++        Params {
++            bits,
++            moduli,
++            constellations: std::array::from_fn(|_| ladder(points, 100.0)),
++            z1: Vec::new(),
++            p1: Vec::new(),
++            z2: vec![1.0],
++            p2: Vec::new(),
++            gain: 1.0,
++            code: Code::States16,
++        }
++    }
++
++    fn bits(seed: u64, n: usize) -> Vec<bool> {
++        let mut x = seed | 1;
++        (0..n)
++            .map(|_| {
++                x ^= x << 13;
++                x ^= x >> 7;
++                x ^= x << 17;
++                x & 1 == 1
++            })
++            .collect()
++    }
++
++    #[test]
++    fn the_modulus_encoder_and_decoder_are_inverses_across_frames() {
++        let moduli = [9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8];
++        let k = 36;
++        let mut enc = ModulusEncoder::new();
++        let mut dec = ModulusDecoder::new();
++        for f in 0..200 {
++            let b = bits(f + 7, k);
++            let numbers = enc.encode(&b, &moduli);
++            assert!(numbers.iter().zip(&moduli).all(|(k, m)| k < m));
++            assert_eq!(dec.decode(&numbers, &moduli, k), b, "frame {f}");
++        }
++    }
++
++    #[test]
++    fn every_class_is_the_number_and_its_steps() {
++        let c: Vec<i64> = class(3, 8, 16).collect();
++        assert_eq!(c, vec![-13, -5, 3, 11]);
++        assert!(class(0, 1, 4).eq(-4..4));
++    }
++
++    /// Through a line that does nothing, with no precoding: every frame
++    /// comes back as it went, trellis and all, at 48 000 bit/s.
++    #[test]
++    fn a_clean_line_carries_every_frame_at_48000() {
++        // 72 bits a frame: twelve moduli whose product passes 2^72 -- 64 for
++        // the first three of each four, and 64 pairs for the fourth.
++        let p = params(72, [64; FRAME], 128);
++        assert!(p.valid());
++        assert_eq!(p.rate(), 48_000);
++        let mut tx = Transmitter::new(p.clone());
++        let mut rx = Decoder::new(p);
++        for f in 0..300 {
++            let b = bits(f + 1, 72);
++            let levels = tx.frame(&b);
++            let etas = rx.slice(&levels);
++            assert_eq!(rx.frame(&etas), b, "frame {f}");
++        }
++    }
++
++    /// With a precoder that cancels a line's echo of the last symbol, the
++    /// codec sees the points themselves, and the transmitter keeps its own
++    /// output small by choosing among each class.
++    #[test]
++    fn a_precoder_undoes_the_line_it_was_designed_for() {
++        let mut p = params(48, [16; FRAME], 64);
++        // The line: r(n) = s(n) + 0.5 s(n - 1). The precoder: x(n) = u(n) -
++        // 0.5 x(n - 1), so r(n) = u(n).
++        p.p1 = vec![-0.5];
++        assert!(p.valid());
++        let mut tx = Transmitter::new(p.clone());
++        let mut rx = Decoder::new(p);
++        let mut last = 0.0;
++        let mut peak: f64 = 0.0;
++        for f in 0..300 {
++            let b = bits(f + 11, 48);
++            let sent = tx.frame(&b);
++            let mut arrived = [0.0; FRAME];
++            for (a, &s) in arrived.iter_mut().zip(&sent) {
++                *a = s + 0.5 * last;
++                last = s;
++                peak = peak.max(s.abs());
++            }
++            let etas = rx.slice(&arrived);
++            assert_eq!(rx.frame(&etas), b, "frame {f}");
++        }
++        // The points reach 6400; the choice keeps what is sent within reach.
++        assert!(peak < 6400.0, "peak {peak}");
++    }
++}
 diff --git a/crates/datapump/tests/v90_call.rs b/crates/datapump/tests/v90_call.rs
-index 36d0d26..8797ed8 100644
+index 36d0d26..af609df 100644
 --- a/crates/datapump/tests/v90_call.rs
 +++ b/crates/datapump/tests/v90_call.rs
 @@ -15,6 +15,8 @@ fn server() -> Info0d {
@@ -1228,7 +2542,7 @@ index 36d0d26..8797ed8 100644
      let probed = [Probed { high_carrier: false, pre_emphasis: 0, max_rate: 12 }; 6];
      let info1d = Info1c { probed, ..Info1c::default() };
 -    let asked = Info1aPcm { md_length: 0, uinfo: 79, upstream: SymbolRate::S3200, frequency_offset: None };
-+    let asked = Info1aPcm { md_length: 0, uinfo: 79, upstream: SymbolRate::S3200, frequency_offset: None, high_carrier: false };
++    let asked = Info1aPcm { md_length: 0, uinfo: 79, upstream: SymbolRate::S3200, frequency_offset: None, high_carrier: false, pcm_up: None };
      (
          analogue::Settings::new(&server(), &info1d, &asked, 0.02, true),
          digital::Settings::new(Law::Mu, &info1d, &asked, 0.02, true),
