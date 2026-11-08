@@ -1389,17 +1389,309 @@ index a31b259..474fc05 100644
          {
              let wide = p2.far_capabilities().is_some_and(|f| f.constellation_1664);
              let mut settings = digital::Settings::new(self.law, &info1d, &asked, p2.round_trip().unwrap_or(0.0), wide);
+diff --git a/crates/datapump/src/v92/line.rs b/crates/datapump/src/v92/line.rs
+new file mode 100644
+index 0000000..174bdfe
+--- /dev/null
++++ b/crates/datapump/src/v92/line.rs
+@@ -0,0 +1,285 @@
++//! The PCM upstream on a line: symbols at the network's 8000 a second, put
++//! out at the sound card's rate where the far codec will sample them.
++//!
++//! The digital modem's codec samples the analogue modem's waveform once per
++//! network symbol, on the network's clock. So the upstream's symbol clock is
++//! the downstream's, as the receiver has recovered it, and every symbol is a
++//! band-limited pulse centred where the codec will take its sample -- the
++//! phase of which the digital modem measures from Su and corrects with Jp's
++//! fraction (8.6.3/V.92). Whatever the pulse does to the neighbours, the
++//! digital modem measures too, from TRN1u, and its precoder and prefilter
++//! take off.
++//!
++//! The rest is the sequences' modulation: signs of +-LU, scrambled with GPA
++//! and some differentially encoded (8.5/V.92), and TRN2u's four or eight
++//! levels (Tables 28 and 29/V.92).
++
++use std::collections::VecDeque;
++use std::f64::consts::PI;
++
++use crate::v32::{Mode, Scrambler};
++
++/// The network's symbol rate.
++pub const BAUD: f64 = 8000.0;
++
++/// Symbols either side of an instant that a pulse reaches.
++const HALF: i64 = 8;
++
++/// The pulse: a sinc cut to [`HALF`] symbols either side by a Hann window.
++fn pulse(x: f64) -> f64 {
++    if x.abs() >= HALF as f64 {
++        return 0.0;
++    }
++    let sinc = if x.abs() < 1e-9 { 1.0 } else { (PI * x).sin() / (PI * x) };
++    let window = 0.5 + 0.5 * (PI * x / HALF as f64).cos();
++    sinc * window
++}
++
++/// Symbols in, line samples out.
++#[derive(Debug, Clone)]
++pub struct UpLine {
++    fs: f64,
++    /// Symbols per line sample: 8000/fs, by the network's clock.
++    step: f64,
++    /// Where the next line sample falls, in symbols since the first.
++    t: f64,
++    /// The index of `symbols[0]`.
++    base: i64,
++    symbols: VecDeque<f64>,
++    /// Symbols pulled from the source so far.
++    pulled: i64,
++}
++
++impl UpLine {
++    pub fn new(fs: f64) -> Self {
++        Self { fs, step: BAUD / fs, t: 0.0, base: -HALF, symbols: VecDeque::from(vec![0.0; HALF as usize]), pulled: 0 }
++    }
++
++    /// Follow the network's clock: `ppm` is how far the sound card runs off
++    /// it, as [`crate::v90::network::Network::with_clock`] puts it. Measured
++    /// through that network, a card `ppm` fast wants `ppm` fewer symbols a
++    /// sample (see the test below).
++    pub fn set_drift(&mut self, ppm: f64) {
++        self.step = BAUD * (1.0 - ppm * 1e-6) / self.fs;
++    }
++
++    /// Put every symbol from now on later by `fraction` of a symbol: Su
++    /// "extended" by Jp's fraction (9.5.2.1.8/V.92).
++    pub fn extend(&mut self, fraction: f64) {
++        self.t -= fraction;
++    }
++
++    /// Symbols pulled from the source so far: the next is this one.
++    pub fn pulled(&self) -> i64 {
++        self.pulled
++    }
++
++    /// One line sample, pulling symbols from `source` as they are needed.
++    pub fn sample(&mut self, mut source: impl FnMut() -> f64) -> f64 {
++        let centre = self.t.floor() as i64;
++        while self.base + self.symbols.len() as i64 <= centre + HALF {
++            self.symbols.push_back(source());
++            self.pulled += 1;
++        }
++        let mut out = 0.0;
++        for n in (centre - HALF + 1)..=(centre + HALF) {
++            let i = n - self.base;
++            if i >= 0 && let Some(&s) = self.symbols.get(i as usize) {
++                out += s * pulse(self.t - n as f64);
++            }
++        }
++        self.t += self.step;
++        let keep_from = self.t.floor() as i64 - HALF;
++        while self.base < keep_from && !self.symbols.is_empty() {
++            self.symbols.pop_front();
++            self.base += 1;
++        }
++        out
++    }
++}
++
++/// Signs, one a symbol: TRN1u's from the scrambler with ones going in, and
++/// the sequences sent on TRN1u's modulation -- Ja, CPt, E1u -- scrambled
++/// and differentially encoded.
++#[derive(Debug, Clone)]
++pub struct Signs {
++    scrambler: Scrambler,
++    /// The last sign sent, as a bit: 0 is positive.
++    last: bool,
++}
++
++impl Default for Signs {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl Signs {
++    pub fn new() -> Self {
++        // GPA, the analogue modem's polynomial (6.3/V.92).
++        Self { scrambler: Scrambler::new(Mode::Answer), last: false }
++    }
++
++    /// "The scrambler shall be initialized to zero prior to the transmission
++    /// of TRN1u" (8.5.7).
++    pub fn restart(&mut self) {
++        self.scrambler = Scrambler::new(Mode::Answer);
++    }
++
++    /// One TRN1u symbol: "A scrambler output of 0 represents a positive
++    /// voltage", +-1. The differential encoder remembers it, being
++    /// "initialized with the final symbol of the preceding TRN1u".
++    pub fn trn1u(&mut self) -> f64 {
++        let bit = self.scrambler.scramble(true);
++        self.last = bit;
++        if bit { -1.0 } else { 1.0 }
++    }
++
++    /// One bit of a sequence: scrambled, then "differentially encoded by
++    /// modulo 2 addition of the present bit with the previously transmitted
++    /// bit".
++    pub fn differential(&mut self, bit: bool) -> f64 {
++        let scrambled = self.scrambler.scramble(bit);
++        self.last ^= scrambled;
++        if self.last { -1.0 } else { 1.0 }
++    }
++
++    /// The last sign bit sent, for TRN2u's differential encoder to start from.
++    pub fn last(&self) -> bool {
++        self.last
++    }
++}
++
++/// TRN2u's modulation, and that of what phase 4 sends on it (8.7/V.92): two
++/// bits a symbol on four levels, or three on eight. The first bit in time is
++/// taken as the least significant (clause 8's rule for integers; Tables 28
++/// and 29 do not say), and the most significant, the sign, is differentially
++/// encoded.
++#[derive(Debug, Clone)]
++pub struct Trn2 {
++    scrambler: Scrambler,
++    eight: bool,
++    last_sign: bool,
++}
++
++impl Trn2 {
++    /// After E1u, whose last sign `last_sign` was.
++    pub fn new(eight: bool, last_sign: bool) -> Self {
++        Self { scrambler: Scrambler::new(Mode::Answer), eight, last_sign }
++    }
++
++    /// "The scrambler shall be reset at the beginning of TRN2u".
++    pub fn restart(&mut self) {
++        self.scrambler = Scrambler::new(Mode::Answer);
++    }
++
++    pub fn bits_per_symbol(&self) -> usize {
++        if self.eight { 3 } else { 2 }
++    }
++
++    /// One symbol from bits, before scrambling, least significant first;
++    /// in units of LU.
++    pub fn symbol(&mut self, bits: &[bool]) -> f64 {
++        let n = self.bits_per_symbol();
++        let scrambled: Vec<bool> = (0..n).map(|i| self.scrambler.scramble(bits.get(i).copied().unwrap_or(true))).collect();
++        let magnitude = scrambled[..n - 1].iter().enumerate().fold(0u32, |m, (i, &b)| m | u32::from(b) << i);
++        self.last_sign ^= scrambled[n - 1];
++        // 00 -> 1/sqrt5, 01 -> 3/sqrt5; 000 -> 1/sqrt21 ... 011 -> 7/sqrt21.
++        let level = f64::from(2 * magnitude + 1) / if self.eight { 21f64.sqrt() } else { 5f64.sqrt() };
++        if self.last_sign { -level } else { level }
++    }
++}
++
++/// Ru: "+LU, +LU, +LU, -LU, -LU, -LU" (8.5.5), in units of LU; Ru-bar the
++/// same turned over.
++pub fn ru(n: usize, bar: bool) -> f64 {
++    let s = if n % 6 < 3 { 1.0 } else { -1.0 };
++    if bar { -s } else { s }
++}
++
++/// Su: "+sqrt(3/2) LU, 0, +sqrt(3/2) LU, -sqrt(3/2) LU, 0, -sqrt(3/2) LU"
++/// (8.5.6), in units of LU; Su-bar turned over.
++pub fn su(n: usize, bar: bool) -> f64 {
++    let a = 1.5f64.sqrt();
++    let s = [a, 0.0, a, -a, 0.0, -a][n % 6];
++    if bar { -s } else { s }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::v90::network::Network;
++    use crate::v90::ucode::Law;
++
++    const FS: f64 = 16_000.0;
++
++    /// Symbols through the network's upstream, as the codec samples them,
++    /// against what was sent: the correlation at the best of a few lags, at
++    /// the start and after `seconds`.
++    fn alignment(ppm: f64, followed: bool, seconds: f64) -> (f64, f64) {
++        let mut net = Network::new(Law::Mu, FS).with_delay(0.010, FS).with_clock(ppm).unquantised();
++        let mut line = UpLine::new(FS);
++        if followed {
++            line.set_drift(ppm);
++        }
++        let mut signs = Signs::new();
++        let mut sent = Vec::new();
++        let mut got = Vec::new();
++        let mut up = Vec::new();
++        for _ in 0..(seconds * BAUD) as usize {
++            got.push(net.up(&up));
++            up.clear();
++            for _ in net.down(0.0) {
++                up.push(0.1 * line.sample(|| {
++                    let s = signs.trn1u();
++                    sent.push(s);
++                    s
++                }));
++            }
++        }
++        // How well the codec's samples follow the symbols, a window at a
++        // time: the best normalised correlation over lags near the delay.
++        let window = |from: usize| -> f64 {
++            (0..400)
++                .map(|lag| {
++                    let n = 2000;
++                    let (mut sx, mut xx, mut yy) = (0.0, 0.0, 0.0);
++                    for k in 0..n {
++                        let (Some(&x), Some(&y)) = (sent.get(from + k), got.get(from + k + lag)) else { return 0.0 };
++                        sx += x * y;
++                        xx += x * x;
++                        yy += y * y;
++                    }
++                    sx / (xx * yy).sqrt().max(1e-12)
++                })
++                .fold(0.0, f64::max)
++        };
++        (window(4000), window(sent.len() - 2400 - 400))
++    }
++
++    /// On a sound card 120 ppm off the network, the symbols stay where the
++    /// codec samples them when the clock is followed -- and their phase
++    /// against its samples moves when it is not.
++    #[test]
++    fn the_symbols_stay_on_the_codec_s_clock() {
++        let (start, end) = alignment(120.0, true, 20.0);
++        println!("followed: {start:.3} then {end:.3}");
++        assert!(start > 0.95 && end > 0.95, "{start:.3} {end:.3}");
++        let (start, end) = alignment(120.0, false, 20.0);
++        println!("not followed: {start:.3} then {end:.3}");
++        assert!((end - start).abs() > 0.05, "{start:.3} {end:.3}: the phase should have moved");
++    }
++
++    #[test]
++    fn ru_and_su_are_their_patterns() {
++        assert_eq!((0..6).map(|n| ru(n, false)).collect::<Vec<_>>(), vec![1.0, 1.0, 1.0, -1.0, -1.0, -1.0]);
++        assert_eq!(su(1, false), 0.0);
++        assert_eq!(su(3, true), 1.5f64.sqrt());
++        let power: f64 = (0..6).map(|n| su(n, false).powi(2)).sum::<f64>() / 6.0;
++        assert!((power - 1.0).abs() < 1e-12, "Su has LU's power");
++        let mut trn2 = Trn2::new(false, false);
++        let levels: Vec<f64> = (0..1000).map(|_| trn2.symbol(&[true, true])).collect();
++        let power = levels.iter().map(|x| x * x).sum::<f64>() / levels.len() as f64;
++        assert!((power - 1.0).abs() < 0.1, "TRN2u has about LU's power: {power}");
++    }
++}
 diff --git a/crates/datapump/src/v92/mod.rs b/crates/datapump/src/v92/mod.rs
 new file mode 100644
-index 0000000..a5f47b2
+index 0000000..97a81e0
 --- /dev/null
 +++ b/crates/datapump/src/v92/mod.rs
-@@ -0,0 +1,5 @@
+@@ -0,0 +1,6 @@
 +//! V.92's PCM upstream: what the analogue modem sends when the digital
 +//! modem receives PCM from it (6.4, 8.5 to 8.8 and 9.5 to 9.6/V.92).
 +
 +pub mod transmitter;
 +pub mod sequences;
++pub mod line;
 diff --git a/crates/datapump/src/v92/sequences.rs b/crates/datapump/src/v92/sequences.rs
 new file mode 100644
 index 0000000..8a4e179
