@@ -55,9 +55,11 @@ as `android/patches/long-dil.patch` and applied to the submodule by
 ### V.92 Quick Connect
 
 Upstream BinModem has no V.92. This build adds V.92's Quick Connect for
-calls to a V.92 server, with V.34 upstream as in V.90:
+calls to a V.92 server, with V.34 upstream as in V.90. It is the **V.92**
+entry in the call box (`AT+MS=V92`); **V.90** stays V.90 as upstream has it,
+saying nothing of V.92 and never quick connecting.
 
-- Every V.90 call says V.92 in INFO0a (Table 16/V.92). When the server says
+- A V.92 call says V.92 in INFO0a (Table 16/V.92). When the server says
   it too, the call remembers what its full start-up settled for the
   upstream, under the number dialled (`BinModem/quick-connect` in the app's
   settings directory).

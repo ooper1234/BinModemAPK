@@ -1,3 +1,35 @@
+diff --git a/crates/at/src/lib.rs b/crates/at/src/lib.rs
+index f3332ad..5d51436 100644
+--- a/crates/at/src/lib.rs
++++ b/crates/at/src/lib.rs
+@@ -381,8 +381,9 @@ impl Interpreter {
+             // 9600 and V32B at 14 400. A far end that will not hold the faster
+             // rates is asked for the slower carrier and gets exactly it. V90 is
+             // the analogue half of V.90 only: this modem dials a server, and
+-            // is not one.
+-            modulations: ["V90", "V34", "V32B", "V32", "V22B", "B103"]
++            // is not one. V92 is V.90 with V.92's Quick Connect, likewise the
++            // analogue half only.
++            modulations: ["V92", "V90", "V34", "V32B", "V32", "V22B", "B103"]
+                 .iter()
+                 .map(|s| (*s).to_owned())
+                 .collect(),
+diff --git a/crates/at/tests/session.rs b/crates/at/tests/session.rs
+index 6d059b9..d9a2db5 100644
+--- a/crates/at/tests/session.rs
++++ b/crates/at/tests/session.rs
+@@ -385,9 +385,9 @@ fn a_modulation_that_is_not_offered_is_refused() {
+     // believing a connection is something it is not. V21 is the pointed case:
+     // the 300 bit/s tones implemented here are Bell 103's, and a modem that
+     // answered to V21 and then whistled at 1270 Hz would be lying to whoever
+-    // asked. V92 is simply not implemented at all.
++    // asked.
+     let mut it = quiet_dce();
+-    for refused in ["V92", "V21"] {
++    for refused in ["V21"] {
+         let (out, actions) = send(&mut it, &format!("AT+MS={refused}{CR}"));
+         assert!(out.contains("ERROR"), "+MS={refused} answered {out:?}");
+         assert!(actions.is_empty());
 diff --git a/crates/datapump/src/bell103.rs b/crates/datapump/src/bell103.rs
 index 4407d70..06dbacf 100644
 --- a/crates/datapump/src/bell103.rs
@@ -103,7 +135,7 @@ index 58aa483..5a1962f 100644
          assert_eq!(bits.len(), INFO1A_BITS);
          assert_eq!(Info1aPcm::from_bits(&bits), Some(asked));
 diff --git a/crates/datapump/src/v34/phase2.rs b/crates/datapump/src/v34/phase2.rs
-index 2a1b22d..15c4642 100644
+index 2a1b22d..ef35c77 100644
 --- a/crates/datapump/src/v34/phase2.rs
 +++ b/crates/datapump/src/v34/phase2.rs
 @@ -80,6 +80,52 @@ impl Pcm {
@@ -187,7 +219,7 @@ index 2a1b22d..15c4642 100644
              Self::Finished => "V.34 phase 2 done",
          }
      }
-@@ -357,6 +417,19 @@ pub struct Modem {
+@@ -357,6 +417,21 @@ pub struct Modem {
      /// call's first phase 2 to get that far. A retrain's phase 2 is given it,
      /// and takes nothing much quieter for tone B (see [`TONE_B_FLOOR`]).
      tone_b_level: Option<f64>,
@@ -198,6 +230,8 @@ index 2a1b22d..15c4642 100644
 +    short_offered: bool,
 +    /// Whether this phase 2 is the short one: both ends asked for it.
 +    short: bool,
++    /// V.92's analogue modem says V.92 in INFO0a; V.90's does not.
++    says_v92: bool,
 +    /// INFO0 goes out at this sample, after V.92's short Phase 1 handed over
 +    /// with its 75 ms of silence still to run (see [`Self::with_quiet_start`]).
 +    info0_at: Option<u64>,
@@ -207,19 +241,20 @@ index 2a1b22d..15c4642 100644
  }
  
  impl Modem {
-@@ -402,6 +475,11 @@ impl Modem {
+@@ -402,6 +477,12 @@ impl Modem {
              far_info0d: None,
              info1a_pcm: None,
              tone_b_level: None,
 +            recall: None,
 +            short_offered: false,
 +            short: false,
++            says_v92: true,
 +            info0_at: None,
 +            pcm_upstream: None,
          }
      }
  
-@@ -435,6 +513,65 @@ impl Modem {
+@@ -435,6 +516,77 @@ impl Modem {
          modem
      }
  
@@ -257,6 +292,18 @@ index 2a1b22d..15c4642 100644
 +        self
 +    }
 +
++    /// V.90's analogue modem rather than V.92's: INFO0a as V.34 has it,
++    /// saying nothing of V.92.
++    pub fn without_v92(mut self) -> Self {
++        self.says_v92 = false;
++        if self.info0_at.is_none() && self.pcm == Some(Pcm::Analogue) {
++            self.tx.stop();
++            let bits = self.info0_bits();
++            self.tx.send(&bits);
++        }
++        self
++    }
++
 +    /// Whether this was V.92's short Phase 2.
 +    pub fn was_short(&self) -> bool {
 +        self.short
@@ -270,7 +317,7 @@ index 2a1b22d..15c4642 100644
 +    /// Whether both ends said V.92 in their INFO0s.
 +    pub fn v92(&self) -> bool {
 +        match self.pcm {
-+            Some(Pcm::Analogue) => self.far_info0d.is_some_and(|d| d.v92),
++            Some(Pcm::Analogue) => self.says_v92 && self.far_info0d.is_some_and(|d| d.v92),
 +            Some(Pcm::Digital(d)) => d.v92 && self.far.is_some_and(|f| f.clock & INFO0A_V92 != 0),
 +            None => false,
 +        }
@@ -285,7 +332,7 @@ index 2a1b22d..15c4642 100644
      /// V.90's phase 2 as a retrain: "Any subsequent retrains shall use Phase
      /// 2 of V.90 regardless of the analogue modem's choice of operating mode"
      /// (9.2.1.1.8, 9.2.2.1.9).
-@@ -474,7 +611,28 @@ impl Modem {
+@@ -474,7 +626,29 @@ impl Modem {
      fn info0_bits(&self) -> Vec<bool> {
          match self.pcm {
              Some(Pcm::Digital(d)) => Info0d { v34: self.ours, ..d }.to_bits(),
@@ -294,11 +341,12 @@ index 2a1b22d..15c4642 100644
 +            // and asks for the short Phase 2 when it has something to ask
 +            // with: "only ... if it intends to connect in either PCM upstream
 +            // or V.90 data mode" (9.4).
-+            Some(Pcm::Analogue) => {
++            Some(Pcm::Analogue) if self.says_v92 => {
 +                let mut ours = self.ours;
 +                ours.clock = INFO0A_V92 | if self.recall.is_some() { INFO0A_SHORT } else { 0 };
 +                ours.to_bits()
 +            }
++            Some(Pcm::Analogue) => self.ours.to_bits(),
 +            None => self.ours.to_bits(),
 +        }
 +    }
@@ -315,7 +363,7 @@ index 2a1b22d..15c4642 100644
          }
      }
  
-@@ -682,6 +840,12 @@ impl Modem {
+@@ -682,6 +856,12 @@ impl Modem {
  
      /// Everything scheduled for this sample.
      fn timers(&mut self) {
@@ -328,7 +376,7 @@ index 2a1b22d..15c4642 100644
          if self.tone_at == Some(self.now) {
              self.tone_at = None;
              self.start_tone();
-@@ -695,6 +859,13 @@ impl Modem {
+@@ -695,6 +875,13 @@ impl Modem {
              self.reversed_at = Some(self.now);
              self.silence_at = Some(self.now + self.ms(AFTER_REVERSAL));
          }
@@ -342,7 +390,7 @@ index 2a1b22d..15c4642 100644
          if self.silence_at == Some(self.now) {
              self.silence_at = None;
              self.tx.stop();
-@@ -745,7 +916,17 @@ impl Modem {
+@@ -745,7 +932,17 @@ impl Modem {
                      self.tx.send(&bits);
                  }
              }
@@ -361,7 +409,7 @@ index 2a1b22d..15c4642 100644
                  self.info1c = Some(info1c);
                  // An analogue modem that heard an INFO0d asks for V.90
                  // (9.2.2.1.9); anything else is V.34's INFO1a.
-@@ -776,7 +957,9 @@ impl Modem {
+@@ -776,7 +973,9 @@ impl Modem {
              // 9.2.1.1.8: "the digital modem shall proceed to Phase 3 of the
              // start-up procedure if bits 37:39 of INFO1a indicate the integer
              // 6". A V.34 modem never gets one, since it never sent INFO0d.
@@ -372,7 +420,7 @@ index 2a1b22d..15c4642 100644
                  self.info1a_pcm = Some(asked);
                  self.status = Status::Done;
                  self.enter(Stage::Finished);
-@@ -829,6 +1012,25 @@ impl Modem {
+@@ -829,6 +1028,25 @@ impl Modem {
                  self.probe_at = self.reverse_at.map(|r| r + self.ms(AFTER_REVERSAL));
                  self.enter(Stage::AnswerSendProbe);
              }
@@ -398,7 +446,7 @@ index 2a1b22d..15c4642 100644
              // 11.2.1.2.7: the call modem's reversal before its L1 and L2.
              Stage::AnswerProbeReversal => {
                  let l2 = at + self.ms(AFTER_REVERSAL + probe::L1_SECONDS);
-@@ -851,8 +1053,44 @@ impl Modem {
+@@ -851,8 +1069,44 @@ impl Modem {
              Stage::CallInfo0 => {
                  // 11.2.1.1.2: INFO0a received, and INFO0c gone, so on to the
                  // reversals.
@@ -445,7 +493,7 @@ index 2a1b22d..15c4642 100644
                  }
              }
              Stage::CallFirstReversal => {
-@@ -961,8 +1199,31 @@ impl Modem {
+@@ -961,8 +1215,31 @@ impl Modem {
              }
  
              Stage::AnswerInfo0 => {
@@ -479,7 +527,7 @@ index 2a1b22d..15c4642 100644
                  }
              }
              Stage::AnswerAwaitTone => {
-@@ -1047,6 +1308,26 @@ impl Modem {
+@@ -1047,6 +1324,26 @@ impl Modem {
          }
      }
  
@@ -506,7 +554,7 @@ index 2a1b22d..15c4642 100644
      /// V.90's INFO1a (Table 10/V.90): the upstream symbol rate, and the
      /// codeword the digital modem is to train with.
      fn settle_pcm(&self, info1d: &Info1c, far: &Info0d) -> Info1aPcm {
-@@ -1073,6 +1354,7 @@ impl Modem {
+@@ -1073,6 +1370,7 @@ impl Modem {
              uinfo: v90::training_codeword(far),
              upstream,
              frequency_offset: self.reading.as_ref().and_then(|r| r.frequency_offset),
@@ -1017,7 +1065,7 @@ index af7d8a0..1461480 100644
  }
  
 diff --git a/crates/datapump/src/v90/startup.rs b/crates/datapump/src/v90/startup.rs
-index a31b259..87257b1 100644
+index a31b259..474fc05 100644
 --- a/crates/datapump/src/v90/startup.rs
 +++ b/crates/datapump/src/v90/startup.rs
 @@ -12,7 +12,8 @@
@@ -1040,7 +1088,7 @@ index a31b259..87257b1 100644
  }
  
  impl Analogue {
-@@ -70,9 +74,31 @@ impl Analogue {
+@@ -70,9 +74,39 @@ impl Analogue {
              holes: 0,
              notes: Vec::new(),
              pinned: None,
@@ -1048,6 +1096,14 @@ index a31b259..87257b1 100644
          }
      }
  
++    /// V.90's analogue modem, saying nothing of V.92 in phase 2: the start-up
++    /// as it was before V.92 was added.
++    pub fn v90_only(fs: f64) -> Self {
++        let mut modem = Self::new(fs);
++        modem.v34 = v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Analogue, fs).without_v92(), fs);
++        modem
++    }
++
 +    /// V.92's Quick Connect from the end of its short Phase 1 (9.2/V.92):
 +    /// the short Phase 2 asked for with what the last full start-up with
 +    /// this server settled, and V.90's phases 3 and 4 after it. A digital
@@ -1072,7 +1128,7 @@ index a31b259..87257b1 100644
      /// The rate V.90 start-ups are to ask for, as its drn, or None for the
      /// DIL's own choice: from the window, before the call. This start-up's
      /// too, if its DIL has not yet been read.
-@@ -301,12 +327,31 @@ impl Analogue {
+@@ -301,12 +335,31 @@ impl Analogue {
              self.connected_once = true;
          }
          let p2 = self.v34.phase2();
@@ -1106,7 +1162,7 @@ index a31b259..87257b1 100644
              settings.v34_receive = p2.v34_receive_rate().unwrap_or(0);
              settings.pinned = self.pinned;
              // The call's first phase 2's, which every retrain's phase 2 is
-@@ -345,7 +390,7 @@ impl Digital {
+@@ -345,7 +398,7 @@ impl Digital {
          let phase2_gain = 10f64.powf((info0d.nominal_dbm0() - 3.17) / 20.0);
          Self {
              law,
@@ -1115,7 +1171,7 @@ index a31b259..87257b1 100644
              v90: None,
              phase2_gain,
              failed_starts: 0,
-@@ -355,7 +400,18 @@ impl Digital {
+@@ -355,7 +408,18 @@ impl Digital {
          }
      }
  
@@ -1135,7 +1191,7 @@ index a31b259..87257b1 100644
      pub fn with_habits(mut self, habits: digital::Habits) -> Self {
          self.habits = habits;
          self
-@@ -534,9 +590,17 @@ impl Digital {
+@@ -534,9 +598,17 @@ impl Digital {
              self.connected_once = true;
          }
          let p2 = self.v34.phase2();
@@ -1289,6 +1345,61 @@ index 0000000..a21091f
 +    run(&mut analogue, &mut digital, line(), 40.0).expect("did not connect");
 +    assert!(!analogue.short_phase2() && !digital.v34().phase2().was_short());
 +}
+diff --git a/crates/gui/src/app.rs b/crates/gui/src/app.rs
+index 32d9319..72945e1 100644
+--- a/crates/gui/src/app.rs
++++ b/crates/gui/src/app.rs
+@@ -685,7 +685,7 @@ impl ScopeApp {
+     }
+ 
+     /// Modulations the modem will accept, in the order the box shows them.
+-    const CARRIERS: [(&'static str, &'static str); 6] = [
++    const CARRIERS: [(&'static str, &'static str); 7] = [
+         ("B103", "Bell 103 - 300 bit/s"),
+         ("V22B", "V.22bis - 1200 or 2400"),
+         ("V32", "V.32 - 4800 or 9600"),
+@@ -698,6 +698,10 @@ impl ScopeApp {
+             "V90",
+             "V.90 - up to 56000 from an ISP's server and 33600 back. A far end that is no V.90 server gets V.34",
+         ),
++        (
++            "V92",
++            "V.92 - V.90 with Quick Connect: a V.92 server dialled before comes up faster. A far end without it gets V.90",
++        ),
+     ];
+ 
+     /// Boards to start from, because a text box on its own is a box nobody
+@@ -3359,7 +3363,9 @@ impl ScopeApp {
+             let mut picked = None;
+             for (rate, carrier, label) in Self::CEILINGS {
+                 let chosen =
+-                    self.carrier == carrier && self.modulation.max_rate == rate;
++                    // 56000 is V.90's ceiling and V.92's alike.
++                    (self.carrier == carrier || (carrier == 5 && self.carrier == 6))
++                        && self.modulation.max_rate == rate;
+                 if ui
+                     .radio(chosen, label)
+                     .on_hover_text(Self::CARRIERS[carrier].1)
+@@ -3369,7 +3375,9 @@ impl ScopeApp {
+                 }
+             }
+             if let Some((rate, carrier)) = picked {
+-                self.carrier = carrier;
++                // Choosing 56000 on V.92 keeps V.92.
++                self.carrier = if carrier == 5 && self.carrier == 6 { 6 } else { carrier };
++                let carrier = self.carrier;
+                 self.modulation.fit(carrier);
+                 // A ceiling and no floor. V.250 6.4.1 has an unspecified rate
+                 // "determined by the modulation means selected", which is what
+@@ -4509,7 +4517,7 @@ mod modulation_tests {
+         // downstream is whatever the route allows, and +MS does not name it.
+         assert_eq!(ScopeApp::CARRIERS[5].0, "V90");
+         assert_eq!(Modulation::rates(5), Modulation::rates(4));
+-        assert_eq!(ScopeApp::CARRIERS.len(), 6);
++        assert_eq!(ScopeApp::CARRIERS.len(), 7);
+     }
+ 
+     /// The two V.32 carriers are two ceilings on one modulation, and the
 diff --git a/crates/modem/src/faxcall.rs b/crates/modem/src/faxcall.rs
 index c196b0c..1396a0a 100644
 --- a/crates/modem/src/faxcall.rs
@@ -1303,7 +1414,7 @@ index c196b0c..1396a0a 100644
                  if role == Role::Answerer {
                      self.call.set_v8_capable(false);
 diff --git a/crates/modem/src/lib.rs b/crates/modem/src/lib.rs
-index a0ef49a..8e3d4d0 100644
+index a0ef49a..ec996e5 100644
 --- a/crates/modem/src/lib.rs
 +++ b/crates/modem/src/lib.rs
 @@ -30,6 +30,7 @@ use datapump::v32;
@@ -1365,13 +1476,14 @@ index a0ef49a..8e3d4d0 100644
                      self.answer_request = true;
                      self.place_call(Role::Answering);
                  }
-@@ -2280,6 +2300,17 @@ impl Modem {
+@@ -2280,7 +2300,18 @@ impl Modem {
              // digital half from the end that answers. Over a VoIP call the
              // answering end's samples reach a G.711 encoder, which is as near
              // to the digital network as a sound card gets.
+-            if self.at.modulation.carrier == "V90" {
 +            self.quick_offered = None;
 +            self.quick_connected = false;
-+            if self.at.modulation.carrier == "V90" && self.role == Role::Calling && self.quick_enabled {
++            if self.at.modulation.carrier == "V92" && self.role == Role::Calling && self.quick_enabled {
 +                // V.92's Quick Connect, to a server this end has had a full
 +                // V.92 start-up with: QC1a ahead of CM (9.2.1.1/V.92).
 +                let memory = self.quick_memory.get_or_insert_with(quick::Memory::load);
@@ -1380,9 +1492,19 @@ index a0ef49a..8e3d4d0 100644
 +                    self.quick_offered = Some(recall);
 +                }
 +            }
-             if self.at.modulation.carrier == "V90" {
++            if matches!(self.at.modulation.carrier.as_str(), "V90" | "V92") {
                  negotiation = match self.role {
                      Role::Calling => negotiation.offering_pcm(Pcm::ANALOGUE),
+                     Role::Answering => negotiation.offering_pcm_on(
+@@ -2318,7 +2349,7 @@ impl Modem {
+             // Offered first, and V.32bis and V.22bis beside it below: a far end
+             // without V.34 picks one of those, and the call goes ahead on it.
+             // V.90 rides on V.34's bit, with the PCM category beside it.
+-            "V34" | "V90" => Some(Modulation::V34Duplex),
++            "V34" | "V90" | "V92" => Some(Modulation::V34Duplex),
+             "B103" => None,
+             _ => Some(Modulation::V22bis),
+         }) else {
 @@ -2418,6 +2449,19 @@ impl Modem {
                  self.negotiation = None;
                  self.start_pump(Some(modulation));
@@ -1403,7 +1525,28 @@ index a0ef49a..8e3d4d0 100644
              // 8.1.1: a far end that sent the plain answering tone of V.25 does
              // not speak V.8, and the call goes on "in accordance with Annex
              // A/V.32 bis, ITU-T T.30, or other appropriate Recommendations" --
-@@ -2556,7 +2600,43 @@ impl Modem {
+@@ -2463,13 +2507,18 @@ impl Modem {
+             // whose far end answered with a plain ANS on to V.32bis's own
+             // start-up, and so does a V.8 that was turned off.
+             _ => match self.at.modulation.carrier.as_str() {
+-                "V34" | "V90" => "V32B".to_owned(),
++                "V34" | "V90" | "V92" => "V32B".to_owned(),
+                 other => other.to_owned(),
+             },
+         };
+         self.pump = Some(match carrier.as_str() {
+             "V90" => {
+-                let mut analogue = v90::startup::Analogue::new(self.fs);
++                // V.92 says so in phase 2's INFO0a; plain V.90 does not.
++                let mut analogue = if self.at.modulation.carrier == "V92" {
++                    v90::startup::Analogue::new(self.fs)
++                } else {
++                    v90::startup::Analogue::v90_only(self.fs)
++                };
+                 analogue.set_pinned(self.pinned_rate);
+                 Pump::V90(Box::new(analogue))
+             }
+@@ -2556,7 +2605,43 @@ impl Modem {
      }
  
      /// End the call, leaving what the terminal is told to whoever asked.
@@ -1447,7 +1590,7 @@ index a0ef49a..8e3d4d0 100644
          // A fax call is a call too, and putting the line down has to stop it
          // -- otherwise the only way out of a fax that has gone wrong is to
          // close the program. What it learned is kept for the window.
-@@ -2589,6 +2669,10 @@ impl Modem {
+@@ -2589,6 +2674,10 @@ impl Modem {
  /// The level is not information. A real line delivers whatever it delivers,
  /// which is why a receiver has gain control at all, so scaling a recording to
  /// fit loses nothing that was in it.
@@ -1615,10 +1758,10 @@ index b309ee5..b4db667 100644
  
 diff --git a/crates/modem/tests/v92_quick.rs b/crates/modem/tests/v92_quick.rs
 new file mode 100644
-index 0000000..f74f3b7
+index 0000000..fad04c4
 --- /dev/null
 +++ b/crates/modem/tests/v92_quick.rs
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,222 @@
 +//! V.92's Quick Connect from the terminal: dial a V.92 server once, which
 +//! is a full start-up and teaches the modem the server; dial it again, and
 +//! the call goes through V.92's short Phase 1 and short Phase 2 and comes up
@@ -1792,7 +1935,7 @@ index 0000000..f74f3b7
 +    let _ = std::fs::remove_file(&memory);
 +
 +    let mut first = Call::new(&memory);
-+    first.type_at("AT+MS=V90");
++    first.type_at("AT+MS=V92");
 +    first.run(0.05);
 +    first.type_at("ATD5551234");
 +    let full = first.run_until_online(30.0).unwrap_or_else(|| panic!("the first call never came up: {:?}", first.saw()));
@@ -1801,7 +1944,7 @@ index 0000000..f74f3b7
 +    assert!(kept.starts_with("5551234 "), "{kept:?}");
 +
 +    let mut second = Call::new(&memory);
-+    second.type_at("AT+MS=V90");
++    second.type_at("AT+MS=V92");
 +    second.run(0.05);
 +    second.type_at("ATD5551234");
 +    let quick = second.run_until_online(30.0).unwrap_or_else(|| panic!("the second call never came up: {:?}", second.saw()));
@@ -1820,5 +1963,24 @@ index 0000000..f74f3b7
 +    second.run(3.0);
 +    let got = String::from_utf8_lossy(&second.server.received).into_owned();
 +    assert!(got.contains("quick hello"), "the server got {got:?}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// V.90 chosen rather than V.92: the same server, dialled twice, is a full
++/// start-up both times, and phase 2 says nothing of V.92.
++#[test]
++fn v90_chosen_never_quick_connects() {
++    let dir = std::env::temp_dir().join(format!("binmodem-v90-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let memory = dir.join("quick-connect");
++    let _ = std::fs::remove_file(&memory);
++    for call_number in 0..2 {
++        let mut call = Call::new(&memory);
++        call.type_at("AT+MS=V90");
++        call.run(0.05);
++        call.type_at("ATD5551234");
++        call.run_until_online(30.0).unwrap_or_else(|| panic!("call {call_number} never came up: {:?}", call.saw()));
++        assert!(!call.server.quick, "call {call_number} quick connected on V.90");
++    }
 +    let _ = std::fs::remove_dir_all(&dir);
 +}
