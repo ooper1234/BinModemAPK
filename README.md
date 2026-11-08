@@ -52,6 +52,29 @@ buffer slip works as before. It is the one change to the modem itself, kept
 as `android/patches/long-dil.patch` and applied to the submodule by
 `build-apk.sh` (the build stops if it is missing).
 
+### V.92 Quick Connect
+
+Upstream BinModem has no V.92. This build adds V.92's Quick Connect for
+calls to a V.92 server, with V.34 upstream as in V.90:
+
+- Every V.90 call says V.92 in INFO0a (Table 16/V.92). When the server says
+  it too, the call remembers what its full start-up settled for the
+  upstream, under the number dialled (`BinModem/quick-connect` in the app's
+  settings directory).
+- The next call to that number sends QC1a ahead of CM. A server that answers
+  with QCA1d gets V.92's short Phase 1 (QTS, ANSpcm, TONEq) and short Phase 2
+  (no line probing; INFO1a per Table 19/V.92), then V.90's phases 3 and 4.
+  LAPM is agreed in the short Phase 1, with no ODP/ADP.
+- A server that ignores QC1a answers the CM with JM, and V.8 goes on as
+  before. A Quick Connect that fails to reach data mode forgets the number,
+  so the next call starts in full.
+
+Not done: PCM upstream (V.92's 48 000 bit/s upstream) and modem-on-hold.
+Kept as `android/patches/v92-quick-connect.patch`, applied after the long DIL.
+
+In simulation, a call over a 15 ms line comes up in 7.9 s with Quick Connect
+against 9.9 s without, at the same rates.
+
 ### How it is put together
 
 Upstream is not edited. `android/build.rs` copies the GUI files that need it

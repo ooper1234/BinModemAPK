@@ -29,6 +29,14 @@ fn main() {
         "BinModem is missing android/patches/long-dil.patch: run ./build-apk.sh, or \
          git -C BinModem apply ../android/patches/long-dil.patch"
     );
+    // V.92's Quick Connect (android/patches/v92-quick-connect.patch), the
+    // same way.
+    let modem = here.join("../BinModem/crates/modem/src/lib.rs");
+    println!("cargo:rerun-if-changed={}", modem.display());
+    assert!(
+        fs::read_to_string(&modem).unwrap().contains("pub mod quick;"),
+        "BinModem is missing android/patches/v92-quick-connect.patch: run ./build-apk.sh"
+    );
 
     println!("cargo:rerun-if-changed={}", upstream.display());
     println!("cargo:rerun-if-changed={}", mobile.display());

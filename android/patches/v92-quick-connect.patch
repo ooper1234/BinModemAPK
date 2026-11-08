@@ -1,0 +1,1824 @@
+diff --git a/crates/datapump/src/bell103.rs b/crates/datapump/src/bell103.rs
+index 4407d70..06dbacf 100644
+--- a/crates/datapump/src/bell103.rs
++++ b/crates/datapump/src/bell103.rs
+@@ -190,6 +190,12 @@ impl Bell103Tx {
+         self.pending.len()
+     }
+ 
++    /// Drop whatever is queued, mid-character or not: V.92 stops CM "without
++    /// completing the current octet" on hearing QCA1d (9.2.1.1/V.92).
++    pub fn clear(&mut self) {
++        self.pending.clear();
++    }
++
+     pub fn next_sample(&mut self) -> f64 {
+         if !self.transmitting {
+             return 0.0;
+diff --git a/crates/datapump/src/v34/info.rs b/crates/datapump/src/v34/info.rs
+index 58aa483..5a1962f 100644
+--- a/crates/datapump/src/v34/info.rs
++++ b/crates/datapump/src/v34/info.rs
+@@ -473,6 +473,12 @@ pub struct Info0d {
+     pub a_law: bool,
+     /// Bit 40: V.90 with an upstream symbol rate of 3429.
+     pub upstream_3429: bool,
++    /// Bit 27 of V.92's INFO0d (Table 15/V.92): "V.92 capability". Reserved
++    /// in V.90, where it is sent as 0.
++    pub v92: bool,
++    /// Bit 26 of V.92's INFO0d: "Set to 1 requests short Phase 2 to be used"
++    /// (9.4/V.92).
++    pub short_phase2: bool,
+ }
+ 
+ impl Info0d {
+@@ -492,8 +498,9 @@ impl Info0d {
+         // The first seventeen information bits are INFO0a's; take them from
+         // its own encoding so the two layouts cannot drift apart.
+         let mut info: Vec<bool> = unframe(&info0, INFO0_BITS).expect("an INFO0 unframes").to_vec();
+-        info[14] = false;
+-        info[15] = false;
++        // Bits 26 and 27: reserved in V.90, short Phase 2 and V.92 in V.92.
++        info[14] = self.short_phase2;
++        info[15] = self.v92;
+         put(&mut info, u32::from(self.nominal_power), 4);
+         put(&mut info, u32::from(self.max_power), 5);
+         info.push(self.power_at_codec);
+@@ -530,6 +537,8 @@ impl Info0d {
+             power_at_codec: info[26],
+             a_law: info[27],
+             upstream_3429: info[28],
++            short_phase2: info[14],
++            v92: info[15],
+         })
+     }
+ }
+@@ -552,6 +561,10 @@ pub struct Info1aPcm {
+     pub upstream: SymbolRate,
+     /// Bits 40:49: the 1050 Hz probing tone's offset as received, or none.
+     pub frequency_offset: Option<f64>,
++    /// Bit 33: the high carrier upstream. Reserved in V.90, where INFO1d
++    /// said which carrier; V.92's short Phase 2 has no INFO1d, so the
++    /// analogue modem says it here (Table 19/V.92).
++    pub high_carrier: bool,
+ }
+ 
+ impl Info1aPcm {
+@@ -561,8 +574,9 @@ impl Info1aPcm {
+         put(&mut info, 0, 6);
+         put(&mut info, u32::from(self.md_length), 7);
+         put(&mut info, u32::from(self.uinfo), 7);
+-        // Bits 32:33: reserved again.
+-        put(&mut info, 0, 2);
++        // Bit 32: reserved again; bit 33, the carrier (V.92 only).
++        info.push(false);
++        info.push(self.high_carrier);
+         put(&mut info, self.upstream.index(), 3);
+         put(&mut info, PCM_SYMBOL_RATE, 3);
+         put(&mut info, offset_to(self.frequency_offset), 10);
+@@ -584,6 +598,7 @@ impl Info1aPcm {
+             uinfo: get(info, 13, 7) as u8,
+             upstream,
+             frequency_offset: offset_from(get(info, 28, 10)),
++            high_carrier: info[21],
+         })
+     }
+ }
+@@ -744,6 +759,8 @@ mod tests {
+             power_at_codec: false,
+             a_law: true,
+             upstream_3429: true,
++            v92: false,
++            short_phase2: false,
+         };
+         let bits = info0d.to_bits();
+         assert_eq!(bits.len(), INFO0D_BITS);
+@@ -767,7 +784,7 @@ mod tests {
+     /// which V.34's own INFO1a refuses, so the two cannot be mistaken.
+     #[test]
+     fn a_v90_info1a_carries_uinfo_and_names_8000() {
+-        let asked = Info1aPcm { md_length: 0, uinfo: 73, upstream: SymbolRate::S3200, frequency_offset: Some(-0.5) };
++        let asked = Info1aPcm { md_length: 0, uinfo: 73, upstream: SymbolRate::S3200, frequency_offset: Some(-0.5), high_carrier: false };
+         let bits = asked.to_bits();
+         assert_eq!(bits.len(), INFO1A_BITS);
+         assert_eq!(Info1aPcm::from_bits(&bits), Some(asked));
+diff --git a/crates/datapump/src/v34/phase2.rs b/crates/datapump/src/v34/phase2.rs
+index 2a1b22d..15c4642 100644
+--- a/crates/datapump/src/v34/phase2.rs
++++ b/crates/datapump/src/v34/phase2.rs
+@@ -80,6 +80,52 @@ impl Pcm {
+     }
+ }
+ 
++/// What a V.92 analogue modem keeps of a full start-up with a digital modem,
++/// to give in place of probing next time: V.92's short Phase 2 (9.4/V.92)
++/// has no line probe and no INFO1d, so the upstream it asks for in INFO1a
++/// (Table 19/V.92) is the one the last full Phase 2 settled.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Recall {
++    /// The upstream symbol rate, 3000, 3200 or 3429, and its carrier.
++    pub upstream: SymbolRate,
++    pub high_carrier: bool,
++    /// Pre-emphasis filter index and projected maximum rate, as INFO1d gave
++    /// them for that symbol rate.
++    pub pre_emphasis: u8,
++    pub max_rate: u8,
++    /// INFO1d's minimum power reduction.
++    pub power_reduction: u8,
++    /// The round trip, in milliseconds: the digital modem measures it in a
++    /// short Phase 2 (RTDEd, 9.4.1.1.4) and the analogue modem does not.
++    pub round_trip_ms: u32,
++}
++
++impl Recall {
++    /// The INFO1d this stands in for: everything zero but the one symbol rate
++    /// that will be used, as V.90's phase 3 reads it.
++    pub fn info1d(&self) -> Info1c {
++        let mut probed = [Probed::default(); 6];
++        probed[self.upstream.index() as usize] =
++            Probed { high_carrier: self.high_carrier, pre_emphasis: self.pre_emphasis, max_rate: self.max_rate };
++        Info1c {
++            min_power_reduction: self.power_reduction,
++            additional_power_reduction: 0,
++            md_length: 0,
++            probed,
++            frequency_offset: None,
++        }
++    }
++}
++
++/// INFO0a's bits 26 and 27 from a V.92 analogue modem (Table 16/V.92), where
++/// V.34 has its transmit clock: "V.92 capability" and "requests short Phase 2
++/// to be used". Kept in [`Info0::clock`], whose two bits they are.
++pub const INFO0A_V92: u8 = 1;
++pub const INFO0A_SHORT: u8 = 2;
++
++/// 9.4.1.2.2 and 9.4.2.2.2: a reversal, or INFO1a, within 2500 ms.
++const SHORT_WAIT: f64 = 2.5;
++
+ /// How phase 2 is going.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Status {
+@@ -205,6 +251,17 @@ enum Stage {
+     AnswerProbeReversal,
+     AnswerReadProbe,
+     AnswerInfo1,
++    // V.92's short Phase 2 (9.4/V.92). The digital modem, V.34's call modem
++    // here: tone B after INFO0d, its reversal once tone A has been heard,
++    // then tone A's reversal back and INFO1a.
++    ShortToneB,
++    ShortRanging,
++    ShortAwaitInfo1,
++    // The analogue modem: tone A after INFO0a, the digital modem's reversal
++    // answered 40 ms later, 10 ms more of tone A and INFO1a straight after.
++    ShortAwaitReversal,
++    ShortTurned,
++    ShortSendInfo1,
+     // Both.
+     Finished,
+ }
+@@ -219,6 +276,9 @@ impl Stage {
+             Self::CallAwaitTone | Self::AnswerProbeReversal => "V.34 tones again",
+             Self::CallSendProbe | Self::AnswerSendProbe => "V.34 sending the probe",
+             Self::CallInfo1 | Self::AnswerInfo1 => "V.34 INFO1",
++            Self::ShortToneB | Self::ShortAwaitReversal => "V.92 short phase 2: tones",
++            Self::ShortRanging | Self::ShortTurned => "V.92 short phase 2: ranging",
++            Self::ShortAwaitInfo1 | Self::ShortSendInfo1 => "V.92 short phase 2: INFO1a",
+             Self::Finished => "V.34 phase 2 done",
+         }
+     }
+@@ -357,6 +417,19 @@ pub struct Modem {
+     /// call's first phase 2 to get that far. A retrain's phase 2 is given it,
+     /// and takes nothing much quieter for tone B (see [`TONE_B_FLOOR`]).
+     tone_b_level: Option<f64>,
++    /// V.92's analogue modem: what the last full start-up settled, given to
++    /// ask for a short Phase 2 with (9.4/V.92).
++    recall: Option<Recall>,
++    /// V.92's digital modem: whether it will do a short Phase 2 if asked.
++    short_offered: bool,
++    /// Whether this phase 2 is the short one: both ends asked for it.
++    short: bool,
++    /// INFO0 goes out at this sample, after V.92's short Phase 1 handed over
++    /// with its 75 ms of silence still to run (see [`Self::with_quiet_start`]).
++    info0_at: Option<u64>,
++    /// The upstream bit of a V.92 INFO1d (bit 70, Table 17/V.92): "0
++    /// indicates that the channel does not support PCM upstream".
++    pcm_upstream: Option<bool>,
+ }
+ 
+ impl Modem {
+@@ -402,6 +475,11 @@ impl Modem {
+             far_info0d: None,
+             info1a_pcm: None,
+             tone_b_level: None,
++            recall: None,
++            short_offered: false,
++            short: false,
++            info0_at: None,
++            pcm_upstream: None,
+         }
+     }
+ 
+@@ -435,6 +513,65 @@ impl Modem {
+         modem
+     }
+ 
++    /// V.92's analogue modem asking for a short Phase 2 (9.4/V.92), with
++    /// what the last full start-up with this server settled. Whether it gets
++    /// one is the digital modem's INFO0d's to say; if it does not, this is
++    /// V.90's phase 2 as [`Self::v90`] runs it.
++    pub fn v92_short(recall: Recall, fs: f64) -> Self {
++        let mut modem = Self::blank(Role::Answer, fs);
++        modem.pcm = Some(Pcm::Analogue);
++        modem.recall = Some(recall);
++        modem.stage = Stage::AnswerInfo0;
++        modem.speaking = Speaking::Carrier;
++        let bits = modem.info0_bits();
++        modem.tx.send(&bits);
++        modem
++    }
++
++    /// V.92's digital modem: V.90's phase 2, doing the short one if the
++    /// analogue modem asks for it and INFO0d offers it.
++    pub fn v92_digital(info0d: Info0d, fs: f64) -> Self {
++        let mut modem = Self::v90(Pcm::Digital(info0d), fs);
++        modem.short_offered = info0d.v92 && info0d.short_phase2;
++        modem
++    }
++
++    /// Begin with phase 1's 75 ms of silence still to come, listening all
++    /// through it (9.2.1.3, 9.2.4.3/V.92): after V.92's short Phase 1 each end
++    /// hands over the moment it knows the other has finished, and the far
++    /// end's INFO0 can be on its way before this end's silence is over.
++    pub fn with_quiet_start(mut self) -> Self {
++        self.tx.stop();
++        self.speaking = Speaking::Silent;
++        self.info0_at = Some(self.ms(0.075));
++        self
++    }
++
++    /// Whether this was V.92's short Phase 2.
++    pub fn was_short(&self) -> bool {
++        self.short
++    }
++
++    /// What a short Phase 2 was asked for with, if it was.
++    pub fn recall(&self) -> Option<Recall> {
++        self.recall
++    }
++
++    /// Whether both ends said V.92 in their INFO0s.
++    pub fn v92(&self) -> bool {
++        match self.pcm {
++            Some(Pcm::Analogue) => self.far_info0d.is_some_and(|d| d.v92),
++            Some(Pcm::Digital(d)) => d.v92 && self.far.is_some_and(|f| f.clock & INFO0A_V92 != 0),
++            None => false,
++        }
++    }
++
++    /// A V.92 INFO1d's bit 70: whether the digital modem found the channel
++    /// would carry PCM upstream. None if no V.92 INFO1d arrived.
++    pub fn pcm_upstream(&self) -> Option<bool> {
++        self.pcm_upstream
++    }
++
+     /// V.90's phase 2 as a retrain: "Any subsequent retrains shall use Phase
+     /// 2 of V.90 regardless of the analogue modem's choice of operating mode"
+     /// (9.2.1.1.8, 9.2.2.1.9).
+@@ -474,7 +611,28 @@ impl Modem {
+     fn info0_bits(&self) -> Vec<bool> {
+         match self.pcm {
+             Some(Pcm::Digital(d)) => Info0d { v34: self.ours, ..d }.to_bits(),
+-            _ => self.ours.to_bits(),
++            // V.92's analogue modem says so in bits 26 and 27 (Table 16/V.92),
++            // and asks for the short Phase 2 when it has something to ask
++            // with: "only ... if it intends to connect in either PCM upstream
++            // or V.90 data mode" (9.4).
++            Some(Pcm::Analogue) => {
++                let mut ours = self.ours;
++                ours.clock = INFO0A_V92 | if self.recall.is_some() { INFO0A_SHORT } else { 0 };
++                ours.to_bits()
++            }
++            None => self.ours.to_bits(),
++        }
++    }
++
++    /// Whether the far end's INFO0 and this end's agree on the short Phase 2.
++    fn short_agreed(&self) -> bool {
++        match self.pcm {
++            Some(Pcm::Analogue) => self.recall.is_some() && self.far_info0d.is_some_and(|d| d.v92 && d.short_phase2),
++            Some(Pcm::Digital(_)) => {
++                self.short_offered
++                    && self.far.is_some_and(|f| f.clock & (INFO0A_V92 | INFO0A_SHORT) == INFO0A_V92 | INFO0A_SHORT)
++            }
++            None => false,
+         }
+     }
+ 
+@@ -682,6 +840,12 @@ impl Modem {
+ 
+     /// Everything scheduled for this sample.
+     fn timers(&mut self) {
++        if self.info0_at == Some(self.now) {
++            self.info0_at = None;
++            let bits = self.info0_bits();
++            self.tx.send(&bits);
++            self.speaking = Speaking::Carrier;
++        }
+         if self.tone_at == Some(self.now) {
+             self.tone_at = None;
+             self.start_tone();
+@@ -695,6 +859,13 @@ impl Modem {
+             self.reversed_at = Some(self.now);
+             self.silence_at = Some(self.now + self.ms(AFTER_REVERSAL));
+         }
++        if self.silence_at == Some(self.now) && self.stage == Stage::ShortTurned {
++            // 9.4.2.1.3 and 9.4.2.1.4: "Tone A shall be transmitted for 10 ms
++            // after the phase reversal. Then, the analogue modem shall send
++            // INFO1a" -- as one group with the tone.
++            self.silence_at = None;
++            self.send_short_info1a();
++        }
+         if self.silence_at == Some(self.now) {
+             self.silence_at = None;
+             self.tx.stop();
+@@ -745,7 +916,17 @@ impl Modem {
+                     self.tx.send(&bits);
+                 }
+             }
+-            (Role::Answer, Info::Info1c(info1c)) if self.stage == Stage::AnswerInfo1 => {
++            (Role::Answer, Info::Info1c(mut info1c)) if self.stage == Stage::AnswerInfo1 => {
++                // A V.92 INFO1d (Table 17/V.92) has its own meaning for bit 70,
++                // which V.34 gives to the 3429 symbol rate's carrier: "Set to
++                // 0 indicates that the channel does not support PCM
++                // upstream". 3429 has the one carrier, so that field's bit
++                // is the V.92 one, not a carrier to transmit on.
++                if self.pcm == Some(Pcm::Analogue) && self.v92() {
++                    let rate_3429 = SymbolRate::S3429.index() as usize;
++                    self.pcm_upstream = Some(info1c.probed[rate_3429].high_carrier);
++                    info1c.probed[rate_3429].high_carrier = false;
++                }
+                 self.info1c = Some(info1c);
+                 // An analogue modem that heard an INFO0d asks for V.90
+                 // (9.2.2.1.9); anything else is V.34's INFO1a.
+@@ -776,7 +957,9 @@ impl Modem {
+             // 9.2.1.1.8: "the digital modem shall proceed to Phase 3 of the
+             // start-up procedure if bits 37:39 of INFO1a indicate the integer
+             // 6". A V.34 modem never gets one, since it never sent INFO0d.
+-            (Role::Call, Info::Info1aPcm(asked)) if self.stage == Stage::CallInfo1 && self.pcm.is_some() => {
++            (Role::Call, Info::Info1aPcm(asked))
++                if matches!(self.stage, Stage::CallInfo1 | Stage::ShortAwaitInfo1) && self.pcm.is_some() =>
++            {
+                 self.info1a_pcm = Some(asked);
+                 self.status = Status::Done;
+                 self.enter(Stage::Finished);
+@@ -829,6 +1012,25 @@ impl Modem {
+                 self.probe_at = self.reverse_at.map(|r| r + self.ms(AFTER_REVERSAL));
+                 self.enter(Stage::AnswerSendProbe);
+             }
++            // 9.4.2.1.3: the digital modem's tone B reversal, answered with
++            // tone A's "40 +- 1 ms" after it arrived.
++            Stage::ShortAwaitReversal => {
++                self.reverse_at = Some((at + self.ms(TURN)).max(self.now + 1));
++                self.enter(Stage::ShortTurned);
++            }
++            // 9.4.1.1.4: tone A's reversal back, and the round trip: "the
++            // time interval between the appearance of the Tone B phase
++            // reversal at the digital modem line terminals and receiving the
++            // Tone A phase reversal ... minus 40 ms".
++            Stage::ShortRanging if self.reversed_at.is_some_and(|ours| at > ours) => {
++                let ours = self.reversed_at.expect("checked");
++                self.round_trip = Some((at - ours).saturating_sub(self.ms(TURN)));
++                // INFO1a follows tone A directly, and is DPSK: reversals from
++                // here on are its, not the tone's.
++                self.ignore_reversals_until = u64::MAX;
++                self.enter(Stage::ShortAwaitInfo1);
++                self.deadline = Some(ours + self.ms(SHORT_WAIT));
++            }
+             // 11.2.1.2.7: the call modem's reversal before its L1 and L2.
+             Stage::AnswerProbeReversal => {
+                 let l2 = at + self.ms(AFTER_REVERSAL + probe::L1_SECONDS);
+@@ -851,8 +1053,44 @@ impl Modem {
+             Stage::CallInfo0 => {
+                 // 11.2.1.1.2: INFO0a received, and INFO0c gone, so on to the
+                 // reversals.
+-                if self.far.is_some() && self.tx.pending() == 0 {
+-                    self.enter(Stage::CallFirstReversal);
++                if self.far.is_some() && self.info0_at.is_none() && self.tx.pending() == 0 {
++                    if self.short_agreed() {
++                        // 9.4.1.1.1: INFO0d "followed by Tone B", which the
++                        // modulator is already sending.
++                        self.short = true;
++                        self.enter(Stage::ShortToneB);
++                    } else {
++                        self.enter(Stage::CallFirstReversal);
++                    }
++                }
++            }
++            Stage::ShortToneB => {
++                // 9.4.1.1.3: "After Tone A has been detected and Tone B has
++                // been transmitted for at least 50 ms, the digital modem shall
++                // transmit a Tone B phase reversal", 10 ms more, and silence.
++                if self.reverse_at.is_none()
++                    && self.presence.held >= self.ms(TONE_HELD)
++                    && now - self.since >= self.ms(TONE_A_FIRST)
++                {
++                    self.reverse_at = Some(now + 1);
++                    self.enter(Stage::ShortRanging);
++                    // Its own reversal echoes; the analogue modem's cannot be
++                    // back before a round trip and 40 ms.
++                    self.ignore_reversals_until = now + self.ms(TURN);
++                    self.deadline = Some(now + self.ms(SHORT_WAIT));
++                }
++            }
++            Stage::ShortRanging => {
++                if self.deadline.is_some_and(|d| now > d) {
++                    // 9.4.1.2.2 goes on to the full Phase 2; a retrain is the
++                    // same start again with nothing assumed.
++                    self.fail_for_a_retrain("no tone A reversal in the short phase 2");
++                }
++            }
++            Stage::ShortAwaitInfo1 => {
++                if self.info1a_pcm.is_none() && self.deadline.is_some_and(|d| now > d) {
++                    // 9.4.1.2.3.
++                    self.fail_for_a_retrain("no INFO1a in the short phase 2");
+                 }
+             }
+             Stage::CallFirstReversal => {
+@@ -961,8 +1199,31 @@ impl Modem {
+             }
+ 
+             Stage::AnswerInfo0 => {
+-                if self.far.is_some() && self.tx.pending() == 0 {
+-                    self.enter(Stage::AnswerAwaitTone);
++                if self.far.is_some() && self.info0_at.is_none() && self.tx.pending() == 0 {
++                    if self.short_agreed() {
++                        // 9.4.2.1.1 and 9.4.2.1.2: tone A after INFO0a, and
++                        // the digital modem's tone B reversal to wait for.
++                        self.short = true;
++                        self.enter(Stage::ShortAwaitReversal);
++                        self.deadline = Some(now + self.ms(SHORT_WAIT));
++                        self.ignore_reversals_until = now + self.ms(0.040);
++                    } else {
++                        self.enter(Stage::AnswerAwaitTone);
++                    }
++                }
++            }
++            Stage::ShortAwaitReversal => {
++                if self.deadline.is_some_and(|d| now > d) {
++                    // 9.4.2.2.2: "the analogue modem shall initiate a retrain".
++                    self.fail_for_a_retrain("no tone B reversal in the short phase 2");
++                }
++            }
++            Stage::ShortTurned => {}
++            Stage::ShortSendInfo1 => {
++                // 9.4.2.1.4: INFO1a, and on to phase 3.
++                if !self.tx.is_sending() {
++                    self.status = Status::Done;
++                    self.enter(Stage::Finished);
+                 }
+             }
+             Stage::AnswerAwaitTone => {
+@@ -1047,6 +1308,26 @@ impl Modem {
+         }
+     }
+ 
++    /// V.92's INFO1a for V.34 upstream after a short Phase 2 (Table 19/V.92):
++    /// V.90's, with the carrier the last full start-up settled in bit 33.
++    fn send_short_info1a(&mut self) {
++        let recall = self.recall.expect("a short phase 2 is only agreed with a recall");
++        let far = self.far_info0d.unwrap_or_default();
++        let asked = Info1aPcm {
++            md_length: 0,
++            uinfo: v90::training_codeword(&far),
++            upstream: recall.upstream,
++            frequency_offset: None,
++            high_carrier: recall.high_carrier,
++        };
++        let bits = asked.to_bits();
++        self.info1a_pcm = Info1aPcm::from_bits(&bits);
++        self.tx.send(&bits);
++        self.tx.silence();
++        self.speaking = Speaking::Carrier;
++        self.enter(Stage::ShortSendInfo1);
++    }
++
+     /// V.90's INFO1a (Table 10/V.90): the upstream symbol rate, and the
+     /// codeword the digital modem is to train with.
+     fn settle_pcm(&self, info1d: &Info1c, far: &Info0d) -> Info1aPcm {
+@@ -1073,6 +1354,7 @@ impl Modem {
+             uinfo: v90::training_codeword(far),
+             upstream,
+             frequency_offset: self.reading.as_ref().and_then(|r| r.frequency_offset),
++            high_carrier: false,
+         }
+     }
+ 
+diff --git a/crates/datapump/src/v8.rs b/crates/datapump/src/v8.rs
+index 52e648b..d5f8c0d 100644
+--- a/crates/datapump/src/v8.rs
++++ b/crates/datapump/src/v8.rs
+@@ -11,7 +11,7 @@
+ //! differently transmit past each other until one gives up. V.8 asks first.
+ 
+ use dsp::filter::OnePole;
+-use dsp::Nco;
++use dsp::{Nco, ToneDetector};
+ use v8::{Access, CallFunction, Decoder, Heard, Menu, Modulation, Modulations, Pcm, PcmRole, Protocol, Signal};
+ 
+ use crate::bell103::{Bell103Rx, Bell103Tx};
+@@ -171,8 +171,59 @@ pub enum Status {
+     NoNegotiation,
+     /// Nothing in common, or nothing heard at all.
+     Failed,
++    /// V.92's short Phase 1 (9.2/V.92) instead of V.8: QC1a answered with
++    /// QCA1d, ANSpcm with TONEq, and on to V.92's Phase 2 as the analogue
++    /// modem (or the digital one, from the answering end). V.8's menus were
++    /// never settled; LAPM is what both ends' P bits said (9.2.5).
++    QuickConnect { lapm: bool },
+ }
+ 
++/// The Ucodes V.92 lets QTS be made of, indexed by QC1a's WXYZ (Table 2/V.92).
++pub const UQTS: [u8; 15] = [61, 62, 63, 66, 67, 70, 71, 74, 75, 78, 79, 82, 83, 86, 87];
++
++/// The synchronisation octet of V.92's short Phase 1 messages: "0101010101"
++/// as a ten-bit frame (Tables 2, 4, 11 and 13/V.92).
++const SYNC_QC: u8 = 0x55;
++
++/// The one octet after it, as Tables 2 and 13 lay it out: bit 21 is which
++/// modem sent it, bit 22 whether it is QC or QCA, bit 23 LAPM, and the five
++/// after them UQTS (from an analogue modem) or ANSpcm's level (from a digital
++/// one).
++fn qc_octet(digital: bool, acknowledging: bool, lapm: bool, rest: u8) -> u8 {
++    u8::from(digital) | u8::from(acknowledging) << 1 | u8::from(lapm) << 2 | (rest & 0x1f) << 3
++}
++
++/// QC1a's last five bits: W0XYZ, from where `uqts` is in [`UQTS`].
++fn uqts_bits(uqts: u8) -> u8 {
++    let i = UQTS.iter().position(|&u| u == uqts).unwrap_or(10) as u8;
++    let (w, x, y, z) = (i >> 3 & 1, i >> 2 & 1, i >> 1 & 1, i & 1);
++    w | x << 2 | y << 3 | z << 4
++}
++
++
++/// How long the calling end gives ANSpcm to begin after QCA1d before going
++/// back to V.8. The digital modem gives TONEq 2 s (9.2.4.3/V.92), then
++/// sends ANSam and listens for CM.
++const ANSPCM_WAIT: f64 = 2.5;
++
++/// ANSpcm heard this long without a break is believed. 9.2.1.3/V.92 lets
++/// TONEq go "upon detection of ANSpcm" once ANSam was heard for 1 s, which
++/// this end always has by the time it sends QC1a.
++const ANSPCM_HELD: f64 = 0.100;
++
++/// And gone this long is gone: then TONEq stops, and Phase 2 begins.
++const ANSPCM_GONE: f64 = 0.015;
++
++/// TONEq heard this long is believed by the answering end: longer than any
++/// run of marks in a CM, which a caller that has not yet heard QCA1d is
++/// still sending -- ten ones of preamble and the stop bit before them, 37 ms
++/// of 980 Hz. Over a long round trip that CM is what arrives first.
++const TONEQ_HELD: f64 = 0.060;
++
++/// How loud the answering end's QTS and ANSpcm go out, as fractions of full
++/// scale: -12 dBm0's ANSpcm (Table 6/V.92), and QTS around it.
++const ANSPCM_LEVEL: f64 = 0.17;
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum State {
+     /// The silence both ends open with.
+@@ -193,6 +244,16 @@ enum State {
+     SendingJm,
+     /// The 75 ms of nothing before the chosen modulation starts.
+     Handover,
++    /// V.92's short Phase 1, the calling analogue modem: QCA1d heard, CM
++    /// stopped, listening through QTS for ANSpcm.
++    QcAwaitAnspcm,
++    /// Sending TONEq until ANSpcm stops.
++    QcToneq,
++    /// The answering digital modem: QCA1d going out.
++    QcSendQca,
++    /// Its 75 ms of silence, QTS and QTS-bar, and ANSpcm until TONEq.
++    QcQts,
++    QcAnspcm,
+     Done(Status),
+ }
+ 
+@@ -258,6 +319,30 @@ pub struct Modem {
+     /// Whether a call menu for any call function but this end's own goes
+     /// unanswered.
+     own_function_only: bool,
++    /// V.92's Quick Connect, from the calling analogue modem: the UQTS its
++    /// QC1a names. None sends no QC1a.
++    quick: Option<u8>,
++    /// From the answering digital modem: whether a QC1a is answered.
++    answers_quick: bool,
++    /// The short Phase 1 octet after a [`SYNC_QC`], the last one heard, and
++    /// how many times running it has come.
++    qc_after_sync: bool,
++    qc_last: Option<u8>,
++    qc_repeats: u32,
++    /// The QC message heard twice the same, for the state machine.
++    qc_heard: Option<u8>,
++    /// The far end's P bit, once its QC or QCA has been heard.
++    qc_lapm: bool,
++    /// Seconds ANSpcm has been heard, or not heard, without a break.
++    anspcm_held: f64,
++    anspcm_gone: f64,
++    /// The answering end's ear for TONEq, and how long it has stood. TONEq
++    /// is V.21(L)'s mark alone; its space beside it is FSK, a CM.
++    toneq: ToneDetector,
++    toneq_space: ToneDetector,
++    toneq_held: f64,
++    /// The answering end's QTS and ANSpcm, by symbol at 8000 a second.
++    qc_clock: f64,
+ }
+ 
+ impl Modem {
+@@ -300,9 +385,38 @@ impl Modem {
+             sent_jm: None,
+             ansam_seconds: timing::ANSAM,
+             own_function_only: false,
++            quick: None,
++            answers_quick: false,
++            qc_after_sync: false,
++            qc_last: None,
++            qc_repeats: 0,
++            qc_heard: None,
++            qc_lapm: false,
++            anspcm_held: 0.0,
++            anspcm_gone: 0.0,
++            toneq: ToneDetector::new(LOW.1, 30.0, fs),
++            toneq_space: ToneDetector::new(LOW.0, 30.0, fs),
++            toneq_held: 0.0,
++            qc_clock: 0.0,
+         }
+     }
+ 
++    /// V.92's Quick Connect from the calling analogue modem (9.2.1.1/V.92):
++    /// QC1a ahead of the first CM, naming `uqts` for QTS. A digital modem
++    /// that answers with QCA1d takes the call to V.92's short Phase 1; one
++    /// that answers with JM, V.8 as ever.
++    pub fn offering_quick_connect(mut self, uqts: u8) -> Self {
++        self.quick = Some(uqts);
++        self
++    }
++
++    /// The answering digital modem's side of the same (9.2.4.1/V.92): a
++    /// QC1a during ANSam is answered with QCA1d, QTS and ANSpcm.
++    pub fn answering_quick_connect(mut self) -> Self {
++        self.answers_quick = true;
++        self
++    }
++
+     /// An answering end that has sent, or is sending, some other answer tone,
+     /// listening for a call menu all the same.
+     ///
+@@ -374,7 +488,12 @@ impl Modem {
+             | State::SendingCj
+             | State::Ansam
+             | State::SendingJm
+-            | State::Handover => true,
++            | State::Handover
++            | State::QcAwaitAnspcm
++            | State::QcToneq
++            | State::QcSendQca
++            | State::QcQts
++            | State::QcAnspcm => true,
+         }
+     }
+ 
+@@ -483,6 +602,11 @@ impl Modem {
+             State::Overhearing => "listening for CM",
+             State::SendingJm => "JM",
+             State::Handover => "handover",
++            State::QcAwaitAnspcm => "V.92 QC: waiting for ANSpcm",
++            State::QcToneq => "V.92 QC: TONEq",
++            State::QcSendQca => "V.92 QC: QCA1d",
++            State::QcQts => "V.92 QC: QTS",
++            State::QcAnspcm => "V.92 QC: ANSpcm",
+             State::Done(_) => "done",
+         }
+     }
+@@ -529,6 +653,23 @@ impl Modem {
+         // milliseconds on a real call.
+         self.ansam_held = if self.answer.is_ansam() { self.ansam_held + dt } else { 0.0 };
+         self.plain_held = if self.answer.is_plain() { self.plain_held + dt } else { 0.0 };
++        // ANSpcm is a 2100 Hz tone with reversals and no modulation: the
++        // answer tone detector's either way.
++        if self.answer.present() {
++            self.anspcm_held += dt;
++            self.anspcm_gone = 0.0;
++        } else {
++            self.anspcm_held = 0.0;
++            self.anspcm_gone += dt;
++        }
++        if self.answers_quick {
++            self.toneq.feed(line);
++            self.toneq_space.feed(line);
++            let heard = self.toneq.amplitude() > 0.008
++                && self.toneq.amplitude() > 0.5 * self.level.value()
++                && self.toneq.amplitude() > 4.0 * self.toneq_space.amplitude();
++            self.toneq_held = if heard { self.toneq_held + dt } else { 0.0 };
++        }
+         let octet = self.rx.feed(line);
+         // A character whose stop bit was not a mark. Clause 5 runs a sequence
+         // octet against octet with nothing between them, so a framing error
+@@ -560,6 +701,9 @@ impl Modem {
+         // of zeros read as CJ, an octet lost out of the synchronisation
+         // itself. The flag used to survive all of those and condemn the next
+         // sequence for a tear that was not in it.
++        if self.quick.is_some() || self.answers_quick {
++            self.heard_qc(octet);
++        }
+         let torn = octet == v8::SYNC_MENU && std::mem::take(&mut self.torn);
+         let Some(heard) = self.decoder.feed(octet) else { return };
+         match heard {
+@@ -624,6 +768,57 @@ impl Modem {
+         }
+     }
+ 
++    /// A short Phase 1 message is its synchronisation octet and one more,
++    /// sent twice (Tables 2 and 13/V.92); believed when the same octet has
++    /// come after the synchronisation twice running.
++    fn heard_qc(&mut self, octet: u8) {
++        if std::mem::take(&mut self.qc_after_sync) {
++            if self.qc_last == Some(octet) {
++                self.qc_repeats += 1;
++            } else {
++                self.qc_last = Some(octet);
++                self.qc_repeats = 1;
++            }
++            if self.qc_repeats >= IDENTICAL {
++                self.qc_heard = Some(octet);
++            }
++        }
++        if octet == SYNC_QC {
++            self.qc_after_sync = true;
++        }
++    }
++
++    /// A QC message heard from the far end: `digital` and `acknowledging` as
++    /// its bits 21 and 22 say, and its last five bits.
++    fn take_qc(&mut self, digital: bool, acknowledging: bool) -> Option<u8> {
++        let octet = self.qc_heard?;
++        if (octet & 1 != 0) != digital || (octet & 2 != 0) != acknowledging {
++            return None;
++        }
++        self.qc_heard = None;
++        self.qc_lapm = octet & 4 != 0;
++        Some(octet >> 3)
++    }
++
++    /// A QC message as a line of bits: ten ones, the synchronisation and the
++    /// octet, all twice, and ten ones more after a QCA (Tables 2 and 13).
++    fn qc_bits(&self, octet: u8, trailing_ones: bool) -> Vec<bool> {
++        let mut bits = Vec::new();
++        for _ in 0..2 {
++            bits.extend([true; v8::PREAMBLE_ONES]);
++            bits.extend(self.bits.encode(SYNC_QC));
++            bits.extend(self.bits.encode(octet));
++        }
++        if trailing_ones {
++            bits.extend([true; v8::PREAMBLE_ONES]);
++        }
++        bits
++    }
++
++    fn lapm_offered(&self) -> bool {
++        self.menu.protocol == Protocol::Lapm
++    }
++
+     /// Whether the far end has said the same thing twice, as 7.4 and 8.1.2
+     /// both require before it is acted on.
+     fn settled(&self) -> Option<Menu> {
+@@ -716,6 +911,13 @@ impl Modem {
+             State::Waiting => {
+                 // 8.1.1: silence for Te, "prior to transmitting signal CM".
+                 if self.elapsed >= timing::TE {
++                    // 9.2.1.1/V.92: "the analogue modem shall transmit signal
++                    // QC1a followed by CM".
++                    if let Some(uqts) = self.quick {
++                        let qc1a = self.qc_bits(qc_octet(false, false, self.lapm_offered(), uqts_bits(uqts)), false);
++                        self.tx.set_transmitting(true);
++                        self.tx.push_bits(&qc1a);
++                    }
+                     let cm = v8::sequence(Signal::Cm, &self.menu);
+                     self.send_sequence(cm);
+                     self.enter(State::SendingCm);
+@@ -723,6 +925,16 @@ impl Modem {
+             }
+ 
+             State::SendingCm => {
++                // 9.2.1.1/V.92: "If QCA1d is detected, the modem shall stop
++                // transmitting CM without completing the current octet and
++                // transmit silence".
++                if self.quick.is_some() && self.take_qc(true, true).is_some() {
++                    self.outgoing.clear();
++                    self.tx.clear();
++                    self.tx.set_transmitting(false);
++                    self.enter(State::QcAwaitAnspcm);
++                    return;
++                }
+                 // 8.1.2: "after a minimum of 2 identical JM sequences have
+                 // been received... signal CJ shall be transmitted."
+                 if let Some(jm) = self.settled() {
+@@ -752,6 +964,20 @@ impl Modem {
+             }
+ 
+             State::Ansam => {
++                // 9.2.4.1/V.92: "If QC1a is detected, the modem shall transmit
++                // QCA1d followed by silence for 75 +- 5 ms and then QTS, QTS-bar
++                // and ANSpcm".
++                if self.answers_quick && self.take_qc(false, false).is_some() {
++                    let lapm = self.qc_lapm && self.lapm_offered();
++                    // ANSpcm at -12 dBm0: LM of 01.
++                    let qca1d = self.qc_bits(qc_octet(true, true, lapm, 0b01 << 3), true);
++                    self.qc_lapm = lapm;
++                    self.outgoing.clear();
++                    self.tx.set_transmitting(true);
++                    self.tx.push_bits(&qca1d);
++                    self.enter(State::QcSendQca);
++                    return;
++                }
+                 // 8.2.2: "upon receiving a minimum of 2 identical CM
+                 // sequences, the DCE shall transmit JM".
+                 if let Some(cm) = self.settled() {
+@@ -797,10 +1023,94 @@ impl Modem {
+                 }
+             }
+ 
++            // 9.2.1.3/V.92: TONEq once ANSpcm is heard; QTS comes first and
++            // is not a 2100 Hz tone.
++            State::QcAwaitAnspcm => {
++                if self.anspcm_held >= ANSPCM_HELD {
++                    // TONEq is V.21(L)'s mark, 980 Hz: this end's
++                    // transmitter with nothing queued.
++                    self.tx.set_transmitting(true);
++                    self.enter(State::QcToneq);
++                } else if self.elapsed >= ANSPCM_WAIT {
++                    // Nothing came. The digital modem goes back to ANSam and
++                    // listens for CM (9.2.4.3/V.92), so V.8 it is.
++                    self.quick = None;
++                    let cm = v8::sequence(Signal::Cm, &self.menu);
++                    self.send_sequence(cm);
++                    self.enter(State::SendingCm);
++                }
++            }
++            // "When ANSpcm is no longer detected, the modem shall terminate
++            // TONEq and transmit silence for 75 +- 5 ms and proceed to Phase
++            // 2" -- whose start keeps those 75 ms (see
++            // `phase2::Modem::with_quiet_start`), so that it is listening
++            // through them for an INFO0d already on its way.
++            State::QcToneq => {
++                if self.anspcm_gone >= ANSPCM_GONE {
++                    self.tx.set_transmitting(false);
++                    self.enter(State::Done(Status::QuickConnect { lapm: self.qc_lapm && self.lapm_offered() }));
++                }
++            }
++            State::QcSendQca => {
++                if self.tx.pending_bits() == 0 {
++                    self.tx.set_transmitting(false);
++                    self.qc_clock = 0.0;
++                    self.enter(State::QcQts);
++                }
++            }
++            State::QcQts => {
++                // 75 ms of silence, 768T of QTS and 48T of QTS-bar.
++                if self.elapsed >= 0.075 + (768.0 + 48.0) / 8000.0 {
++                    self.qc_clock = 0.0;
++                    self.enter(State::QcAnspcm);
++                }
++            }
++            // 9.2.4.3/V.92: "If TONEq is detected, the modem shall transmit
++            // silence for 75 +- 5 ms and proceed to Phase 2" -- kept, as at
++            // the other end, by Phase 2. "If TONEq is not detected during the
++            // 2 s following transmission of QCA1d, the digital modem shall
++            // transmit ANSam and proceed according to ITU-T V.8."
++            State::QcAnspcm => {
++                if self.toneq_held >= TONEQ_HELD {
++                    self.enter(State::Done(Status::QuickConnect { lapm: self.qc_lapm }));
++                } else if self.elapsed >= 2.0 {
++                    self.answers_quick = false;
++                    self.enter(State::Ansam);
++                }
++            }
+             State::Done(_) => {}
+         }
+     }
+ 
++    /// QTS and its inverse after 75 ms of silence, or ANSpcm (8.3.6 and
++    /// 8.3.1/V.92), as a line rather than as codewords: a 2100 Hz tone that
++    /// reverses every 3612 symbols, and QTS's six-symbol pattern of UQTS's
++    /// level and nothing.
++    fn qc_signal(&mut self) -> f64 {
++        let symbol = (self.qc_clock * 8000.0) as u64;
++        self.qc_clock += 1.0 / self.fs;
++        match self.state {
++            State::QcQts => {
++                let silence = (0.075 * 8000.0) as u64;
++                if symbol < silence {
++                    return 0.0;
++                }
++                let n = symbol - silence;
++                // {+V, +0, +V, -V, -0, -V}, inverted for QTS-bar's 48T.
++                let pattern = [1.0, 0.0, 1.0, -1.0, 0.0, -1.0];
++                let sign = if n >= 768 { -1.0 } else { 1.0 };
++                sign * pattern[(n % 6) as usize] * ANSPCM_LEVEL
++            }
++            State::QcAnspcm => {
++                let k = symbol % 301;
++                let sign = if (symbol / 3612).is_multiple_of(2) { 1.0 } else { -1.0 };
++                let theta = 0.25 * std::f64::consts::PI / 301.0;
++                sign * ANSPCM_LEVEL * (2.0 * std::f64::consts::PI * k as f64 * 79.0 / 301.0 + theta).cos()
++            }
++            _ => 0.0,
++        }
++    }
++
+     /// A call menu has arrived twice the same. Answer it, unless it is for a
+     /// call this end does not take.
+     fn consider(&mut self, cm: Menu) {
+@@ -865,6 +1175,9 @@ impl Modem {
+         if self.state == State::Ansam {
+             return self.ansam();
+         }
++        if matches!(self.state, State::QcQts | State::QcAnspcm) {
++            return self.qc_signal();
++        }
+         if self.tx.is_transmitting()
+             && self.tx.pending_bits() == 0
+             && !self.outgoing.is_empty()
+@@ -929,6 +1242,53 @@ mod tests {
+ 
+ 
+ 
++    /// The two ends of V.92's short Phase 1 over a line `delay` seconds each
++    /// way: what each decided, and how long the caller took, from the start.
++    fn quick(caller_quick: bool, answerer_quick: bool, delay: f64, seconds: f64) -> (Status, Status, f64) {
++        let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS).offering_lapm();
++        if caller_quick {
++            calling = calling.offering_quick_connect(79);
++        }
++        let mut answering = Modem::new(Role::Answering, CallFunction::Data, all(), FS).offering_lapm();
++        if answerer_quick {
++            answering = answering.answering_quick_connect();
++        }
++        let lag = (delay * FS) as usize + 1;
++        let (mut up, mut down) = (std::collections::VecDeque::from(vec![0.0; lag]), std::collections::VecDeque::from(vec![0.0; lag]));
++        let mut done_at = None;
++        for n in 0..(seconds * FS) as usize {
++            let to_calling = down.pop_front().unwrap_or(0.0);
++            let to_answering = up.pop_front().unwrap_or(0.0);
++            up.push_back(calling.step(to_calling));
++            down.push_back(answering.step(to_answering));
++            if done_at.is_none() && calling.status() != Status::Negotiating {
++                done_at = Some(n as f64 / FS);
++            }
++        }
++        (calling.status(), answering.status(), done_at.unwrap_or(f64::INFINITY))
++    }
++
++    /// 9.2/V.92: QC1a ahead of CM, QCA1d back, QTS and ANSpcm, TONEq, and
++    /// both ends on to Phase 2 with LAPM as both P bits said.
++    #[test]
++    fn a_v92_pair_quick_connects() {
++        for delay in [0.010, 0.300] {
++            let (calling, answering, at) = quick(true, true, delay, 8.0);
++            assert_eq!(calling, Status::QuickConnect { lapm: true }, "{delay} s each way");
++            assert_eq!(answering, Status::QuickConnect { lapm: true }, "{delay} s each way");
++            println!("{delay} s each way: quick connect at {at:.2} s");
++        }
++    }
++
++    /// A V.90 server that knows nothing of QC1a answers the CM after it with
++    /// JM, and V.8 goes on as it would have.
++    #[test]
++    fn a_qc1a_to_a_server_without_quick_connect_is_v8_as_ever() {
++        let (calling, answering, _) = quick(true, false, 0.010, 8.0);
++        assert!(matches!(calling, Status::Agreed(_)), "{calling:?}");
++        assert!(matches!(answering, Status::Agreed(_)), "{answering:?}");
++    }
++
+     /// Run the two ends against each other, each saying whether it does LAPM.
+     fn negotiate_protocol(ours: bool, theirs: bool, seconds: f64) -> (bool, bool) {
+         let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS);
+diff --git a/crates/datapump/src/v90/server.rs b/crates/datapump/src/v90/server.rs
+index af7d8a0..1461480 100644
+--- a/crates/datapump/src/v90/server.rs
++++ b/crates/datapump/src/v90/server.rs
+@@ -47,6 +47,8 @@ pub fn ours() -> Info0d {
+         power_at_codec: true,
+         a_law: false,
+         upstream_3429: false,
++        v92: false,
++        short_phase2: false,
+     }
+ }
+ 
+diff --git a/crates/datapump/src/v90/startup.rs b/crates/datapump/src/v90/startup.rs
+index a31b259..87257b1 100644
+--- a/crates/datapump/src/v90/startup.rs
++++ b/crates/datapump/src/v90/startup.rs
+@@ -12,7 +12,8 @@
+ //! V.34's INFO1a in that phase 2 instead, and the call goes on as V.34.
+ 
+ use crate::v34::info::Info0d;
+-use crate::v34::phase2::{self, Pcm};
++use crate::v34::info::Info1c;
++use crate::v34::phase2::{self, Pcm, Recall};
+ use crate::v34::startup as v34;
+ 
+ use super::ucode::Law;
+@@ -54,6 +55,9 @@ pub struct Analogue {
+     /// The rate every V.90 start-up on this call asks for, as its drn, or
+     /// None for the DIL's own choice (see [`analogue::Settings::pinned`]).
+     pinned: Option<u8>,
++    /// What a V.92 Quick Connect next time would need: this start-up's
++    /// upstream, once a V.92 digital modem has been met and phase 3 begun.
++    learned: Option<Recall>,
+ }
+ 
+ impl Analogue {
+@@ -70,9 +74,31 @@ impl Analogue {
+             holes: 0,
+             notes: Vec::new(),
+             pinned: None,
++            learned: None,
+         }
+     }
+ 
++    /// V.92's Quick Connect from the end of its short Phase 1 (9.2/V.92):
++    /// the short Phase 2 asked for with what the last full start-up with
++    /// this server settled, and V.90's phases 3 and 4 after it. A digital
++    /// modem that does not agree to the short Phase 2 gets V.90's full one.
++    pub fn quick(recall: Recall, fs: f64) -> Self {
++        let mut modem = Self::new(fs);
++        modem.v34 = v34::Modem::with_phase2(phase2::Modem::v92_short(recall, fs).with_quiet_start(), fs);
++        modem
++    }
++
++    /// What a Quick Connect to this server next time would ask for, once
++    /// this call has met a V.92 digital modem and settled its upstream.
++    pub fn learned(&self) -> Option<Recall> {
++        self.learned
++    }
++
++    /// Whether this start-up's phase 2 was V.92's short one.
++    pub fn short_phase2(&self) -> bool {
++        self.v34.phase2().was_short()
++    }
++
+     /// The rate V.90 start-ups are to ask for, as its drn, or None for the
+     /// DIL's own choice: from the window, before the call. This start-up's
+     /// too, if its DIL has not yet been read.
+@@ -301,12 +327,31 @@ impl Analogue {
+             self.connected_once = true;
+         }
+         let p2 = self.v34.phase2();
++        // After V.92's short Phase 2 there is no INFO1d and no round trip of
++        // this end's own: what the last full start-up settled stands in.
++        let short = p2.recall().filter(|_| p2.was_short());
++        let info1d = p2.info1c().or_else(|| short.map(|r| r.info1d()));
++        let round_trip = match short {
++            Some(r) => f64::from(r.round_trip_ms) / 1000.0,
++            None => p2.round_trip().unwrap_or(0.0),
++        };
+         if p2.status() == phase2::Status::Done
+             && self.v34.training().is_none()
+-            && let (Some(asked), Some(server), Some(info1d)) = (p2.info1a_pcm(), p2.far_info0d(), p2.info1c())
++            && let (Some(asked), Some(server), Some(info1d)) = (p2.info1a_pcm(), p2.far_info0d(), info1d)
+         {
+             let ours_wide = true;
+-            let mut settings = analogue::Settings::new(&server, &info1d, &asked, p2.round_trip().unwrap_or(0.0), ours_wide);
++            if server.v92 {
++                let probed = info1d.probed[asked.upstream.index() as usize];
++                self.learned = Some(Recall {
++                    upstream: asked.upstream,
++                    high_carrier: probed.high_carrier,
++                    pre_emphasis: probed.pre_emphasis,
++                    max_rate: probed.max_rate,
++                    power_reduction: info1d.min_power_reduction,
++                    round_trip_ms: (round_trip * 1000.0).round() as u32,
++                });
++            }
++            let mut settings = analogue::Settings::new(&server, &info1d, &asked, round_trip, ours_wide);
+             settings.v34_receive = p2.v34_receive_rate().unwrap_or(0);
+             settings.pinned = self.pinned;
+             // The call's first phase 2's, which every retrain's phase 2 is
+@@ -345,7 +390,7 @@ impl Digital {
+         let phase2_gain = 10f64.powf((info0d.nominal_dbm0() - 3.17) / 20.0);
+         Self {
+             law,
+-            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Digital(info0d), digital::FS), digital::FS),
++            v34: v34::Modem::with_phase2(phase2::Modem::v92_digital(info0d, digital::FS), digital::FS),
+             v90: None,
+             phase2_gain,
+             failed_starts: 0,
+@@ -355,7 +400,18 @@ impl Digital {
+         }
+     }
+ 
+-    /// Go about phase 3 this way.
++    /// V.92's digital modem after its short Phase 1 (9.2.4.3/V.92): the 75 ms
++    /// of silence that end it are phase 2's to keep, listening.
++    pub fn quick(info0d: Info0d) -> Self {
++        let mut modem = Self::new(info0d);
++        modem.v34 = v34::Modem::with_phase2(
++            phase2::Modem::v92_digital(info0d, digital::FS).with_quiet_start(),
++            digital::FS,
++        );
++        modem
++    }
++
++        /// Go about phase 3 this way.
+     pub fn with_habits(mut self, habits: digital::Habits) -> Self {
+         self.habits = habits;
+         self
+@@ -534,9 +590,17 @@ impl Digital {
+             self.connected_once = true;
+         }
+         let p2 = self.v34.phase2();
++        // After V.92's short Phase 2 this end sent no INFO1d: the carrier the
++        // analogue modem will use is in its INFO1a (Table 19/V.92).
++        let info1d = p2.info1c().or_else(|| {
++            let asked = p2.info1a_pcm().filter(|_| p2.was_short())?;
++            let mut info1d = Info1c::default();
++            info1d.probed[asked.upstream.index() as usize].high_carrier = asked.high_carrier;
++            Some(info1d)
++        });
+         if p2.status() == phase2::Status::Done
+             && self.v34.training().is_none()
+-            && let (Some(asked), Some(info1d)) = (p2.info1a_pcm(), p2.info1c())
++            && let (Some(asked), Some(info1d)) = (p2.info1a_pcm(), info1d)
+         {
+             let wide = p2.far_capabilities().is_some_and(|f| f.constellation_1664);
+             let mut settings = digital::Settings::new(self.law, &info1d, &asked, p2.round_trip().unwrap_or(0.0), wide);
+diff --git a/crates/datapump/tests/v90_call.rs b/crates/datapump/tests/v90_call.rs
+index 36d0d26..8797ed8 100644
+--- a/crates/datapump/tests/v90_call.rs
++++ b/crates/datapump/tests/v90_call.rs
+@@ -15,6 +15,8 @@ fn server() -> Info0d {
+         power_at_codec: true,
+         a_law: false,
+         upstream_3429: false,
++        v92: false,
++        short_phase2: false,
+     }
+ }
+ 
+@@ -22,7 +24,7 @@ fn server() -> Info0d {
+ fn settled() -> (analogue::Settings, digital::Settings) {
+     let probed = [Probed { high_carrier: false, pre_emphasis: 0, max_rate: 12 }; 6];
+     let info1d = Info1c { probed, ..Info1c::default() };
+-    let asked = Info1aPcm { md_length: 0, uinfo: 79, upstream: SymbolRate::S3200, frequency_offset: None };
++    let asked = Info1aPcm { md_length: 0, uinfo: 79, upstream: SymbolRate::S3200, frequency_offset: None, high_carrier: false };
+     (
+         analogue::Settings::new(&server(), &info1d, &asked, 0.02, true),
+         digital::Settings::new(Law::Mu, &info1d, &asked, 0.02, true),
+diff --git a/crates/datapump/tests/v92_quick.rs b/crates/datapump/tests/v92_quick.rs
+new file mode 100644
+index 0000000..a21091f
+--- /dev/null
++++ b/crates/datapump/tests/v92_quick.rs
+@@ -0,0 +1,107 @@
++//! V.92's short Phase 2 (9.4/V.92) between the two modems here: a full
++//! start-up with a V.92 server first, which is what the analogue modem
++//! learns the upstream from, then a start-up asking for the short Phase 2
++//! with what it learned.
++
++use datapump::v34::info::{Info0, Info0d};
++use datapump::v34::phase2::Recall;
++use datapump::v90::network::Network;
++use datapump::v90::startup::{Analogue, Digital, Status};
++use datapump::v90::ucode::Law;
++
++const FS: f64 = 16_000.0;
++
++/// A V.92 server: V.90's test server, saying V.92 and offering the short
++/// Phase 2 in INFO0d.
++fn v92_server() -> Info0d {
++    Info0d {
++        v34: Info0 { constellation_1664: true, rate_3429: true, ..Info0::default() },
++        nominal_power: 4,
++        max_power: 23,
++        power_at_codec: true,
++        a_law: false,
++        upstream_3429: false,
++        v92: true,
++        short_phase2: true,
++    }
++}
++
++fn line() -> Network {
++    Network::new(Law::Mu, FS).with_delay(0.020, FS).with_noise(1e-5)
++}
++
++/// Run until both ends are in data mode, and say how long it took in
++/// seconds, or None if either failed or `limit` ran out.
++fn run(analogue: &mut Analogue, digital: &mut Digital, mut net: Network, limit: f64) -> Option<f64> {
++    let mut up = Vec::new();
++    let mut ticks = 0u64;
++    let mut last = (String::new(), String::new());
++    while (ticks as f64) < limit * 8000.0 {
++        let to_digital = net.up(&up);
++        up.clear();
++        let from_digital = digital.step(to_digital);
++        for x in net.down(from_digital) {
++            up.push(analogue.step(x));
++        }
++        ticks += 1;
++        let now = (analogue.phase().to_owned(), digital.phase().to_owned());
++        if now != last {
++            println!("{:7.3} s  analogue: {:36} digital: {}", ticks as f64 / 8000.0, now.0, now.1);
++            last = now;
++        }
++        let connected = |s: Status| matches!(s, Status::Connected { .. });
++        if connected(analogue.status()) && connected(digital.status()) {
++            return Some(ticks as f64 / 8000.0);
++        }
++        if matches!(analogue.status(), Status::Failed(_)) || matches!(digital.status(), Status::Failed(_)) {
++            println!("failed: {:?} / {:?}", analogue.status(), digital.status());
++            return None;
++        }
++    }
++    None
++}
++
++fn full_call() -> (Recall, f64) {
++    let mut analogue = Analogue::new(FS);
++    let mut digital = Digital::new(v92_server());
++    let seconds = run(&mut analogue, &mut digital, line(), 40.0).expect("the full start-up did not connect");
++    assert!(analogue.is_v90() && !analogue.short_phase2());
++    let learned = analogue.learned().expect("a V.92 server was met, and nothing was learned");
++    println!("full start-up: {seconds:.2} s, learned {learned:?}");
++    (learned, seconds)
++}
++
++/// A V.92 server and a V.92 analogue modem get through a full start-up as
++/// V.90's, and the analogue modem keeps what a Quick Connect needs.
++#[test]
++fn a_full_start_up_with_a_v92_server_connects_and_is_remembered() {
++    let (learned, _) = full_call();
++    assert!((0.02..0.08).contains(&(f64::from(learned.round_trip_ms) / 1000.0)), "{learned:?}");
++}
++
++/// The short Phase 2, with what the full one settled: both ends agree to it,
++/// both connect, and the start-up is quicker for having no probing.
++#[test]
++fn a_short_phase_2_with_what_was_learned_connects_sooner() {
++    let (learned, full) = full_call();
++    let mut analogue = Analogue::quick(learned, FS);
++    let mut digital = Digital::new(v92_server());
++    let quick = run(&mut analogue, &mut digital, line(), 40.0).expect("the short start-up did not connect");
++    println!("short start-up: {quick:.2} s against {full:.2} s");
++    assert!(analogue.short_phase2(), "the analogue modem did not do the short phase 2");
++    assert!(digital.v34().phase2().was_short(), "the digital modem did not do the short phase 2");
++    let Status::Connected { transmit, receive } = analogue.status() else { unreachable!() };
++    assert!(receive >= 48_000 && transmit >= 24_000, "{receive} down, {transmit} up");
++    assert!(quick < full, "{quick:.2} s is no quicker than {full:.2} s");
++}
++
++/// A server that does not offer the short Phase 2 gets the full one, asked
++/// for or not.
++#[test]
++fn a_server_without_the_short_phase_2_gets_the_full_one() {
++    let (learned, _) = full_call();
++    let mut analogue = Analogue::quick(learned, FS);
++    let mut digital = Digital::new(Info0d { short_phase2: false, ..v92_server() });
++    run(&mut analogue, &mut digital, line(), 40.0).expect("did not connect");
++    assert!(!analogue.short_phase2() && !digital.v34().phase2().was_short());
++}
+diff --git a/crates/modem/src/faxcall.rs b/crates/modem/src/faxcall.rs
+index c196b0c..1396a0a 100644
+--- a/crates/modem/src/faxcall.rs
++++ b/crates/modem/src/faxcall.rs
+@@ -1351,7 +1351,7 @@ impl FaxCall {
+             // on that, and if it does not, the DIS is the right thing for it
+             // to hear. Bit 6 stays clear: the V.8 the bit invites has just
+             // been had.
+-            v8line::Status::Agreed(_) | v8line::Status::Failed => {
++            v8line::Status::Agreed(_) | v8line::Status::Failed | v8line::Status::QuickConnect { .. } => {
+                 self.v8 = None;
+                 if role == Role::Answerer {
+                     self.call.set_v8_capable(false);
+diff --git a/crates/modem/src/lib.rs b/crates/modem/src/lib.rs
+index a0ef49a..8e3d4d0 100644
+--- a/crates/modem/src/lib.rs
++++ b/crates/modem/src/lib.rs
+@@ -30,6 +30,7 @@ use datapump::v32;
+ use datapump::v34;
+ use datapump::v90;
+ mod faxcall;
++pub mod quick;
+ 
+ pub use faxcall::FaxCall;
+ 
+@@ -808,6 +809,17 @@ pub struct Modem {
+     /// dropped on the floor by every line that has no use for it -- which is
+     /// every other one.
+     dial_request: Option<String>,
++    /// The number this call dialled, kept for V.92's Quick Connect memory.
++    dialled: Option<String>,
++    /// What V.92's Quick Connect remembers between calls, read on the first
++    /// dial (see [`quick`]).
++    quick_memory: Option<quick::Memory>,
++    /// What this call's Quick Connect was offered with, and whether it has
++    /// reached data mode.
++    quick_offered: Option<datapump::v34::phase2::Recall>,
++    quick_connected: bool,
++    /// Whether Quick Connect is offered at all (on by default).
++    quick_enabled: bool,
+     answer_request: bool,
+     /// Samples since the call was placed, which is what the line's notes
+     /// are timed by.
+@@ -926,6 +938,11 @@ impl Modem {
+             elapsed_samples: 0.0,
+             since_dial_ms: 0,
+             dial_request: None,
++            dialled: None,
++            quick_memory: None,
++            quick_offered: None,
++            quick_connected: false,
++            quick_enabled: true,
+             answer_request: false,
+             call_samples: 0,
+             line_notes: Vec::new(),
+@@ -1701,6 +1718,7 @@ impl Modem {
+                 if let Some(m) = self.pump.as_ref().and_then(Pump::v34) {
+                     self.v34_report = Some(V34Report::of(m));
+                 }
++                self.remember_quick_connect();
+                 // Everything the receiver made of the handshake is thrown
+                 // away. A demodulator that has not finished training still
+                 // hands up bits, and by the time it has there are thousands
+@@ -2159,10 +2177,12 @@ impl Modem {
+         for action in self.at.take_actions() {
+             match action {
+                 Action::Dial(number) => {
++                    self.dialled = Some(number.clone());
+                     self.dial_request = Some(number);
+                     self.place_call(Role::Calling);
+                 }
+                 Action::Answer => {
++                    self.dialled = None;
+                     self.answer_request = true;
+                     self.place_call(Role::Answering);
+                 }
+@@ -2280,6 +2300,17 @@ impl Modem {
+             // digital half from the end that answers. Over a VoIP call the
+             // answering end's samples reach a G.711 encoder, which is as near
+             // to the digital network as a sound card gets.
++            self.quick_offered = None;
++            self.quick_connected = false;
++            if self.at.modulation.carrier == "V90" && self.role == Role::Calling && self.quick_enabled {
++                // V.92's Quick Connect, to a server this end has had a full
++                // V.92 start-up with: QC1a ahead of CM (9.2.1.1/V.92).
++                let memory = self.quick_memory.get_or_insert_with(quick::Memory::load);
++                if let Some(recall) = self.dialled.as_deref().and_then(|n| memory.get(n)) {
++                    negotiation = negotiation.offering_quick_connect(QTS_UCODE);
++                    self.quick_offered = Some(recall);
++                }
++            }
+             if self.at.modulation.carrier == "V90" {
+                 negotiation = match self.role {
+                     Role::Calling => negotiation.offering_pcm(Pcm::ANALOGUE),
+@@ -2418,6 +2449,19 @@ impl Modem {
+                 self.negotiation = None;
+                 self.start_pump(Some(modulation));
+             }
++            // V.92's short Phase 1: the server answered QC1a. Straight on to
++            // V.92's short Phase 2 with what was kept for this number, and
++            // LAPM as both P bits said, with no ODP/ADP (9.2.5/V.92).
++            v8line::Status::QuickConnect { lapm } => {
++                self.declared_lapm = lapm;
++                self.pcm_role = Some(PcmRole::Analogue);
++                self.negotiation = None;
++                let recall = self.quick_offered.expect("only offered with a recall");
++                self.line_notes.push("V.92 Quick Connect: short phase 1 done, asking for the short phase 2".into());
++                let mut analogue = v90::startup::Analogue::quick(recall, self.fs);
++                analogue.set_pinned(self.pinned_rate);
++                self.pump = Some(Pump::V90(Box::new(analogue)));
++            }
+             // 8.1.1: a far end that sent the plain answering tone of V.25 does
+             // not speak V.8, and the call goes on "in accordance with Annex
+             // A/V.32 bis, ITU-T T.30, or other appropriate Recommendations" --
+@@ -2556,7 +2600,43 @@ impl Modem {
+     }
+ 
+     /// End the call, leaving what the terminal is told to whoever asked.
++    /// A V.90 call to a V.92 server has reached data mode: keep what a Quick
++    /// Connect to the same number needs next time.
++    fn remember_quick_connect(&mut self) {
++        let Some(Pump::V90(m)) = self.pump.as_ref() else { return };
++        if self.quick_offered.is_some() {
++            self.quick_connected = true;
++            if m.short_phase2() {
++                self.line_notes.push("V.92 Quick Connect: short phase 2 done".into());
++            }
++        }
++        let (Some(learned), Some(number)) = (m.learned(), self.dialled.clone()) else { return };
++        self.quick_memory.get_or_insert_with(quick::Memory::load).remember(&number, learned);
++    }
++
++    /// Whether V.92's Quick Connect is offered on calls to servers it has
++    /// been learned for.
++    pub fn set_quick_connect(&mut self, on: bool) {
++        self.quick_enabled = on;
++    }
++
++    pub fn quick_connect(&self) -> bool {
++        self.quick_enabled
++    }
++
++    /// Keep the Quick Connect memory in this file instead of the usual one.
++    pub fn set_quick_connect_file(&mut self, file: std::path::PathBuf) {
++        self.quick_memory = Some(quick::Memory::at(Some(file)));
++    }
++
+     fn drop_call(&mut self) {
++        // A Quick Connect that never reached data mode: forget what it was
++        // offered with, so the next call to the number starts in full.
++        if self.quick_offered.take().is_some() && !std::mem::take(&mut self.quick_connected)
++            && let Some(number) = self.dialled.clone()
++        {
++            self.quick_memory.get_or_insert_with(quick::Memory::load).forget(&number);
++        }
+         // A fax call is a call too, and putting the line down has to stop it
+         // -- otherwise the only way out of a fax that has gone wrong is to
+         // close the program. What it learned is kept for the window.
+@@ -2589,6 +2669,10 @@ impl Modem {
+ /// The level is not information. A real line delivers whatever it delivers,
+ /// which is why a receiver has gain control at all, so scaling a recording to
+ /// fit loses nothing that was in it.
++/// The codeword QC1a names for QTS (Table 2/V.92): 79, the μ-law UINFO the
++/// V.90 servers met so far have trained with.
++const QTS_UCODE: u8 = 79;
++
+ pub fn fit_to_scale(samples: &mut [f32], target: f32) -> f32 {
+     let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+     if peak <= 0.0 {
+diff --git a/crates/modem/src/quick.rs b/crates/modem/src/quick.rs
+new file mode 100644
+index 0000000..70f85c1
+--- /dev/null
++++ b/crates/modem/src/quick.rs
+@@ -0,0 +1,136 @@
++//! What V.92's Quick Connect needs to remember between calls (9.2, 9.4/V.92).
++//!
++//! A short Phase 2 has no line probe, so the upstream the analogue modem asks
++//! for in it is the one the last full start-up with the same server settled.
++//! That is kept here, a line per number dialled, in a file beside the
++//! program's other settings: `BINMODEM_QUICK_CONNECT` names it, or it is
++//! `BinModem/quick-connect` in the per-user configuration directory.
++//!
++//! A number with nothing kept is dialled as V.90 always was. One whose Quick
++//! Connect does not reach data mode is forgotten, so the next call to it
++//! starts in full and learns afresh.
++
++use std::collections::BTreeMap;
++use std::path::PathBuf;
++
++use datapump::v34::info::SymbolRate;
++use datapump::v34::phase2::Recall;
++
++/// Where the file is, if anywhere.
++fn path() -> Option<PathBuf> {
++    if let Some(p) = std::env::var_os("BINMODEM_QUICK_CONNECT") {
++        return Some(PathBuf::from(p));
++    }
++    let base = std::env::var_os("APPDATA")
++        .map(PathBuf::from)
++        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
++        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
++    Some(base.join("BinModem").join("quick-connect"))
++}
++
++/// A number as it is kept: what was dialled, without the spaces and dashes
++/// people write numbers with.
++pub fn key(number: &str) -> String {
++    number.chars().filter(|c| !c.is_whitespace() && *c != '-').collect()
++}
++
++/// Every number with a Quick Connect to offer.
++#[derive(Debug, Default, Clone)]
++pub struct Memory {
++    numbers: BTreeMap<String, Recall>,
++    file: Option<PathBuf>,
++}
++
++impl Memory {
++    /// Whatever the file holds. A missing or unreadable file is an empty
++    /// memory, and a line that will not read is skipped.
++    pub fn load() -> Self {
++        Self::at(path())
++    }
++
++    /// The same, from and to a file of one's own choosing.
++    pub fn at(file: Option<PathBuf>) -> Self {
++        let mut memory = Self { file, ..Self::default() };
++        let Some(text) = memory.file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) else { return memory };
++        for line in text.lines() {
++            if let Some((number, recall)) = parse(line) {
++                memory.numbers.insert(number, recall);
++            }
++        }
++        memory
++    }
++
++    fn save(&self) {
++        let Some(path) = self.file.as_ref() else { return };
++        if let Some(dir) = path.parent() {
++            let _ = std::fs::create_dir_all(dir);
++        }
++        let text: String = self.numbers.iter().map(|(n, r)| format!("{}\n", show(n, r))).collect();
++        let _ = std::fs::write(path, text);
++    }
++
++    pub fn get(&self, number: &str) -> Option<Recall> {
++        self.numbers.get(&key(number)).copied()
++    }
++
++    pub fn remember(&mut self, number: &str, recall: Recall) {
++        if self.numbers.insert(key(number), recall) != Some(recall) {
++            self.save();
++        }
++    }
++
++    pub fn forget(&mut self, number: &str) {
++        if self.numbers.remove(&key(number)).is_some() {
++            self.save();
++        }
++    }
++}
++
++/// `number symbol-rate-index high-carrier pre-emphasis max-rate power-reduction round-trip-ms`
++fn show(number: &str, r: &Recall) -> String {
++    format!(
++        "{number} {} {} {} {} {} {}",
++        r.upstream.index(),
++        u8::from(r.high_carrier),
++        r.pre_emphasis,
++        r.max_rate,
++        r.power_reduction,
++        r.round_trip_ms
++    )
++}
++
++fn parse(line: &str) -> Option<(String, Recall)> {
++    let mut f = line.split_whitespace();
++    let number = f.next()?.to_owned();
++    let mut n = || f.next()?.parse::<u32>().ok();
++    let upstream = SymbolRate::from_index(n()?)?;
++    let recall = Recall {
++        upstream,
++        high_carrier: n()? != 0,
++        pre_emphasis: u8::try_from(n()?).ok()?,
++        max_rate: u8::try_from(n()?).ok()?,
++        power_reduction: u8::try_from(n()?).ok()?,
++        round_trip_ms: n()?,
++    };
++    Some((number, recall))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_line_reads_back_as_it_was_written() {
++        let r = Recall {
++            upstream: SymbolRate::S3200,
++            high_carrier: true,
++            pre_emphasis: 3,
++            max_rate: 13,
++            power_reduction: 1,
++            round_trip_ms: 812,
++        };
++        assert_eq!(parse(&show("16165551234", &r)), Some(("16165551234".to_owned(), r)));
++        assert_eq!(key("1 616-555 1234"), "16165551234");
++        assert_eq!(parse("garbage"), None);
++    }
++}
+diff --git a/crates/modem/tests/v90_call.rs b/crates/modem/tests/v90_call.rs
+index b309ee5..b4db667 100644
+--- a/crates/modem/tests/v90_call.rs
++++ b/crates/modem/tests/v90_call.rs
+@@ -45,6 +45,8 @@ impl Server {
+             power_at_codec: true,
+             a_law: false,
+             upstream_3429: false,
++            v92: false,
++            short_phase2: false,
+         }
+     }
+ 
+diff --git a/crates/modem/tests/v92_quick.rs b/crates/modem/tests/v92_quick.rs
+new file mode 100644
+index 0000000..f74f3b7
+--- /dev/null
++++ b/crates/modem/tests/v92_quick.rs
+@@ -0,0 +1,203 @@
++//! V.92's Quick Connect from the terminal: dial a V.92 server once, which
++//! is a full start-up and teaches the modem the server; dial it again, and
++//! the call goes through V.92's short Phase 1 and short Phase 2 and comes up
++//! sooner.
++
++use datapump::v8 as v8line;
++use datapump::v34::info::{Info0, Info0d};
++use datapump::v90::network::Network;
++use datapump::v90::startup::{Digital, Status};
++use datapump::v90::ucode::Law;
++use ec::stack::Stack;
++use ec::{Params, Role as EcRole};
++use modem::{Modem, State};
++use v8::{Access, CallFunction, Modulation, Modulations, Pcm};
++
++const FS: f64 = 16_000.0;
++const NETWORK_FS: f64 = 8000.0;
++
++/// A V.92 server: V.8, or V.92's short Phase 1, then V.92's Phase 2.
++struct Server {
++    v8: Option<v8line::Modem>,
++    startup: Option<Digital>,
++    ec: Option<Stack>,
++    received: Vec<u8>,
++    ticks: u64,
++    quick: bool,
++}
++
++impl Server {
++    fn new() -> Self {
++        let v8 = v8line::Modem::new(
++            v8line::Role::Answering,
++            CallFunction::Data,
++            Modulations::of(&[Modulation::V34Duplex, Modulation::V32bis]),
++            NETWORK_FS,
++        )
++        .offering_lapm()
++        .offering_pcm_on(Pcm { digital: true, ..Pcm::default() }, Access { digital: true, ..Access::default() })
++        .answering_quick_connect();
++        Self { v8: Some(v8), startup: None, ec: None, received: Vec::new(), ticks: 0, quick: false }
++    }
++
++    fn info0d() -> Info0d {
++        Info0d {
++            v34: Info0 { constellation_1664: true, ..Info0::default() },
++            nominal_power: 4,
++            max_power: 23,
++            power_at_codec: true,
++            a_law: false,
++            upstream_3429: false,
++            v92: true,
++            short_phase2: true,
++        }
++    }
++
++    fn step(&mut self, input: f64) -> f64 {
++        self.ticks += 1;
++        if let Some(v8) = self.v8.as_mut() {
++            let out = 0.3 * v8.step(input);
++            match v8.status() {
++                v8line::Status::Negotiating => {}
++                v8line::Status::Agreed(_) => {
++                    self.v8 = None;
++                    self.startup = Some(Digital::new(Self::info0d()));
++                }
++                v8line::Status::QuickConnect { .. } => {
++                    self.v8 = None;
++                    self.quick = true;
++                    self.startup = Some(Digital::quick(Self::info0d()));
++                }
++                other => panic!("V.8 came to {other:?}"),
++            }
++            return out;
++        }
++        let startup = self.startup.as_mut().expect("V.8 is over");
++        let out = startup.step(input);
++        if let Status::Connected { transmit, receive } = startup.status() {
++            let stack = self.ec.get_or_insert_with(|| {
++                let params = Params { t401_ms: ec::lapm::t401_for_line(transmit.min(receive), 60), ..Params::default() };
++                Stack::new(EcRole::Answerer, params).over_a_round_trip(60)
++            });
++            for bit in startup.take_bits() {
++                stack.feed_bit(bit);
++            }
++            while startup.pending_bits() < 256 {
++                let bits: Vec<bool> = (0..64).map(|_| stack.next_bit()).collect();
++                startup.send_bits(&bits);
++            }
++            if self.ticks.is_multiple_of(8) {
++                stack.tick(1);
++            }
++            self.received.extend(stack.take_received());
++        }
++        out
++    }
++}
++
++struct Call {
++    net: Network,
++    caller: Modem,
++    server: Server,
++    up: Vec<f64>,
++    said: Vec<u8>,
++    notes: Vec<String>,
++}
++
++impl Call {
++    fn new(memory: &std::path::Path) -> Self {
++        let mut caller = Modem::new(FS);
++        caller.set_quick_connect_file(memory.to_path_buf());
++        Self {
++            net: Network::new(Law::Mu, FS).with_delay(0.015, FS).with_noise(1e-5),
++            caller,
++            server: Server::new(),
++            up: Vec::new(),
++            said: Vec::new(),
++            notes: Vec::new(),
++        }
++    }
++
++    fn type_at(&mut self, line: &str) {
++        for b in line.bytes() {
++            self.caller.feed_dte(b);
++        }
++        self.caller.feed_dte(b'\r');
++    }
++
++    /// Run until the caller is online or `seconds` are up; how long it took.
++    fn run_until_online(&mut self, seconds: f64) -> Option<f64> {
++        for n in 0..(seconds * NETWORK_FS) as usize {
++            let to_server = self.net.up(&self.up);
++            self.up.clear();
++            let from_server = self.server.step(to_server);
++            for x in self.net.down(from_server) {
++                self.up.push(self.caller.step(x));
++                self.said.extend(self.caller.take_dte());
++                self.notes.extend(self.caller.take_line_notes());
++            }
++            if self.caller.state() == State::Data {
++                return Some(n as f64 / NETWORK_FS);
++            }
++        }
++        None
++    }
++
++    fn run(&mut self, seconds: f64) {
++        let _ = self.run_until_online(0.0);
++        for _ in 0..(seconds * NETWORK_FS) as usize {
++            let to_server = self.net.up(&self.up);
++            self.up.clear();
++            let from_server = self.server.step(to_server);
++            for x in self.net.down(from_server) {
++                self.up.push(self.caller.step(x));
++                self.said.extend(self.caller.take_dte());
++            }
++        }
++    }
++
++    fn saw(&self) -> String {
++        String::from_utf8_lossy(&self.said).into_owned()
++    }
++}
++
++/// Dial once in full, then again with Quick Connect: the second call goes
++/// the short way, carries text, and is online sooner.
++#[test]
++fn the_second_call_to_a_v92_server_quick_connects() {
++    let dir = std::env::temp_dir().join(format!("binmodem-v92-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let memory = dir.join("quick-connect");
++    let _ = std::fs::remove_file(&memory);
++
++    let mut first = Call::new(&memory);
++    first.type_at("AT+MS=V90");
++    first.run(0.05);
++    first.type_at("ATD5551234");
++    let full = first.run_until_online(30.0).unwrap_or_else(|| panic!("the first call never came up: {:?}", first.saw()));
++    assert!(!first.server.quick, "the first call quick connected with nothing learned");
++    let kept = std::fs::read_to_string(&memory).expect("nothing was kept for the number");
++    assert!(kept.starts_with("5551234 "), "{kept:?}");
++
++    let mut second = Call::new(&memory);
++    second.type_at("AT+MS=V90");
++    second.run(0.05);
++    second.type_at("ATD5551234");
++    let quick = second.run_until_online(30.0).unwrap_or_else(|| panic!("the second call never came up: {:?}", second.saw()));
++    println!("full start-up online at {full:.2} s, quick connect at {quick:.2} s; notes {:?}", second.notes);
++    assert!(second.server.quick, "the second call did not quick connect");
++    assert!(second.notes.iter().any(|n| n.contains("short phase 2 done")), "{:?}", second.notes);
++    assert_eq!(second.caller.standard(), "V.90");
++    assert!(second.caller.rate().is_some_and(|r| r >= 48_000), "{:?}", second.caller.rate());
++    assert!(quick < full - 1.0, "{quick:.2} s is not much quicker than {full:.2} s");
++
++    // And it carries data, over LAPM with no ODP/ADP.
++    second.run(3.0);
++    for b in b"quick hello" {
++        second.caller.feed_dte(*b);
++    }
++    second.run(3.0);
++    let got = String::from_utf8_lossy(&second.server.received).into_owned();
++    assert!(got.contains("quick hello"), "the server got {got:?}");
++    let _ = std::fs::remove_dir_all(&dir);
++}
