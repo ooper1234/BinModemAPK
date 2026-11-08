@@ -1389,6 +1389,141 @@ index a31b259..474fc05 100644
          {
              let wide = p2.far_capabilities().is_some_and(|f| f.constellation_1664);
              let mut settings = digital::Settings::new(self.law, &info1d, &asked, p2.round_trip().unwrap_or(0.0), wide);
+diff --git a/crates/datapump/src/v92/finder.rs b/crates/datapump/src/v92/finder.rs
+new file mode 100644
+index 0000000..37432b2
+--- /dev/null
++++ b/crates/datapump/src/v92/finder.rs
+@@ -0,0 +1,129 @@
++//! Finding V.92's framed sequences in a stream of descrambled bits.
++//!
++//! Every one begins with seventeen ones and a start bit of 0 (8.5 to 8.8/
++//! V.92), and bit 18 says which of two it is: in phase 4 an SUV (1) or a CP
++//! (0), each way. How long the rest is follows from its first blocks. Every
++//! place that could be a start is kept until enough has arrived to read it
++//! there, as V.90's finder does.
++
++use crate::v90::sequences::{BLOCK, SYNC_ONES};
++
++use super::sequences::{self, Cpd, Suv, SUV_BITS};
++use crate::v90::sequences::Cp;
++
++/// What was found.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Found {
++    Suv(Suv),
++    /// From the digital modem.
++    Cpd(Cpd),
++    /// From the analogue modem: CPt, CPu or CPus, and what it said.
++    Cp(sequences::CpKind, Cp),
++}
++
++/// Which way the bits are going: what a CP in them is.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Direction {
++    /// From the digital modem: SUVd and CPd.
++    Down,
++    /// From the analogue modem: SUVu, CPt, CPu and CPus.
++    Up,
++}
++
++#[derive(Debug, Clone)]
++pub struct Finder {
++    direction: Direction,
++    bits: Vec<bool>,
++    ones: usize,
++    starts: Vec<usize>,
++}
++
++impl Finder {
++    pub fn new(direction: Direction) -> Self {
++        Self { direction, bits: Vec::new(), ones: 0, starts: Vec::new() }
++    }
++
++    fn length(&self, bits: &[bool]) -> usize {
++        if bits.len() <= SYNC_ONES + 1 {
++            return SYNC_ONES + 2;
++        }
++        if bits[SYNC_ONES + 1] {
++            return SUV_BITS;
++        }
++        match self.direction {
++            Direction::Down => Cpd::length(bits),
++            Direction::Up => sequences::cp_length(bits),
++        }
++    }
++
++    fn parse(&self, bits: &[bool]) -> Option<Found> {
++        if bits[SYNC_ONES + 1] {
++            return Suv::from_bits(bits).map(Found::Suv);
++        }
++        match self.direction {
++            Direction::Down => Cpd::from_bits(bits).map(Found::Cpd),
++            Direction::Up => sequences::cp_from_bits(bits).map(|(k, cp)| Found::Cp(k, cp)),
++        }
++    }
++
++    pub fn feed(&mut self, bit: bool) -> Option<Found> {
++        if !bit && self.ones == SYNC_ONES {
++            self.starts.push(self.bits.len() - SYNC_ONES);
++        }
++        self.ones = if bit { self.ones + 1 } else { 0 };
++        self.bits.push(bit);
++        let mut found = None;
++        let mut i = 0;
++        while i < self.starts.len() {
++            let start = self.starts[i];
++            let have = &self.bits[start..];
++            let needed = self.length(have);
++            if have.len() < needed {
++                i += 1;
++                continue;
++            }
++            let parsed = self.parse(&have[..needed]);
++            self.starts.remove(i);
++            if parsed.is_some() {
++                found = parsed;
++                self.starts.clear();
++                break;
++            }
++        }
++        let keep_from = self.starts.first().copied().unwrap_or(self.bits.len().saturating_sub(SYNC_ONES));
++        if keep_from > 8192 {
++            self.bits.drain(..keep_from);
++            for s in &mut self.starts {
++                *s -= keep_from;
++            }
++        }
++        // A CP the size of six constellations and their codec copies is under
++        // 3000 bits; a start that has waited longer was never one.
++        let limit = self.bits.len().saturating_sub(4000);
++        self.starts.retain(|&s| s >= limit);
++        found
++    }
++}
++
++/// Bits enough for any sequence's first blocks to say its length.
++pub const HEADER: usize = SYNC_ONES + 8 * (BLOCK + 1);
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::v34::trellis::Code;
++
++    #[test]
++    fn suvs_and_cpds_are_found_among_noise() {
++        let suv = Suv { wait_for_cpu: false, level: Suv::UNMEASURED, silence: false, acknowledge: true };
++        let cpd = Cpd { drn: 10, code: Code::States16, extend_e2u: false, acknowledge: false, gain: 0.0078125, moduli: Some([9; 12]), filters: None, constellations: None };
++        let mut stream: Vec<bool> = (0..300).map(|i| i % 3 == 0).collect();
++        stream.extend(suv.to_bits(false));
++        stream.extend((0..50).map(|i| i % 2 == 0));
++        stream.extend(cpd.to_bits());
++        stream.extend([true; 40]);
++        let mut finder = Finder::new(Direction::Down);
++        let found: Vec<Found> = stream.into_iter().filter_map(|b| finder.feed(b)).collect();
++        assert_eq!(found, vec![Found::Suv(suv), Found::Cpd(cpd)]);
++    }
++}
 diff --git a/crates/datapump/src/v92/line.rs b/crates/datapump/src/v92/line.rs
 new file mode 100644
 index 0000000..174bdfe
@@ -1682,10 +1817,10 @@ index 0000000..174bdfe
 +}
 diff --git a/crates/datapump/src/v92/mod.rs b/crates/datapump/src/v92/mod.rs
 new file mode 100644
-index 0000000..6399464
+index 0000000..42f0bde
 --- /dev/null
 +++ b/crates/datapump/src/v92/mod.rs
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,10 @@
 +//! V.92's PCM upstream: what the analogue modem sends when the digital
 +//! modem receives PCM from it (6.4, 8.5 to 8.8 and 9.5 to 9.6/V.92).
 +
@@ -1693,6 +1828,9 @@ index 0000000..6399464
 +pub mod sequences;
 +pub mod line;
 +pub mod receiver;
++pub mod finder;
++pub mod up;
++pub mod server_up;
 diff --git a/crates/datapump/src/v92/receiver.rs b/crates/datapump/src/v92/receiver.rs
 new file mode 100644
 index 0000000..d40900d
@@ -2856,6 +2994,552 @@ index 0000000..8a4e179
 +        assert_eq!(descriptor_from_bits(&bits), Some((d, ALL_UPSTREAM_RATES)));
 +    }
 +}
+diff --git a/crates/datapump/src/v92/server_up.rs b/crates/datapump/src/v92/server_up.rs
+new file mode 100644
+index 0000000..dcfc418
+--- /dev/null
++++ b/crates/datapump/src/v92/server_up.rs
+@@ -0,0 +1,540 @@
++//! The digital modem's ear for PCM upstream through phases 3 and 4 and data
++//! mode (9.5.1, 9.6.1/V.92): what it hears, as events for its start-up to
++//! act on.
++//!
++//! ```text
++//! heard:  Ru Ru' TRN1u Ja ... Su Su' Su ... Su' TRN1u ... CPt ... E1u TRN2u SUVu .. CPu .. SUVu' E2u B1u data
++//! events:    RuBar    Ja        SuTurned  SuTurnedAgain   Cpt     Trn2u     Suv    Cpu    Suv   E2u Data
++//! ```
++//!
++//! The line is learned twice from TRN1u: once after Ru, to read Ja by, and
++//! again after the second turn of Su, which the analogue modem has moved by
++//! half a symbol and Jp's fraction. The second is what CPd's prefilter and
++//! precoder are designed from (see [`super::receiver::Training::design`]).
++
++use crate::v90::sequences::{Cp, Descriptor, SYNC_ONES};
++use crate::v34::trellis::Code;
++use crate::v90::ucode::Law;
++
++use super::finder::{Direction, Finder, Found};
++use super::receiver::{self, Equaliser, RuFinder, SignReader, Trn2Reader, Training, REACH, TRAIN_OVER};
++use super::sequences::{self, CpKind, Cpd, Suv};
++use super::transmitter::{Decoder, FRAME, Params};
++use crate::v32::{Mode, Scrambler};
++
++/// What was heard.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Event {
++    /// Ru turned: TRN1u is next.
++    RuBar,
++    /// Ja read: the DIL asked for, and the upstream rates enabled.
++    Ja(Descriptor, u32),
++    /// Su's first turn (9.5.1.1.6): time for Jp.
++    SuTurned,
++    /// Su's second turn (9.5.1.1.9): time for Jp', and the DIL.
++    SuTurnedAgain,
++    /// CPt read (9.5.1.1.12).
++    Cpt(Cp),
++    /// E1u over and TRN2u begun.
++    Trn2u,
++    Suv(Suv),
++    /// CPu, or CPus.
++    Cpu(CpKind, Cp),
++    /// E2u: B1u next.
++    E2u,
++    /// The data mode's first frame decoded: B1u's scrambled ones.
++    InData,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Stage {
++    HuntRu,
++    Train1,
++    ReadJa,
++    AwaitSu,
++    AwaitSuAgain,
++    Train2,
++    ReadCpt,
++    ReadPhase4,
++    AwaitB1u,
++    Data,
++}
++
++/// The ear itself.
++#[derive(Debug, Clone)]
++pub struct UpReceiver {
++    #[allow(dead_code)]
++    law: Law,
++    levels: Vec<f64>,
++    stage: Stage,
++    ru: RuFinder,
++    su: RuFinder,
++    /// The level the Su finder's first was: it counts from there.
++    su_from: usize,
++    /// Where the TRN1u being learned from began, as near as its turn said.
++    trn_from: usize,
++    training: Option<Training>,
++    equaliser: Option<Equaliser>,
++    signs: SignReader,
++    /// The next level to read a symbol from.
++    next: usize,
++    /// Symbols read since the first of the second TRN1u.
++    symbol: usize,
++    ja_bits: Vec<bool>,
++    finder: Finder,
++    trn2: Option<Trn2Reader>,
++    last_sign: bool,
++    /// The last sign and the equaliser as they were at the start of the
++    /// frame being read, to go back to if it turns out to be TRN2u's first.
++    last_before_frame: bool,
++    equaliser_at_frame: Option<Equaliser>,
++    eight: bool,
++    small: usize,
++    /// Phase 4: bits read since TRN2u began, zeros running, where the last
++    /// sequence's fill ends, and whether an acknowledged one has come.
++    phase4_bits: usize,
++    frame_zeros: usize,
++    sequence_ends: Option<usize>,
++    acknowledged: bool,
++    /// Data: the transmitter's parameters, where B1u begins, and the decoder.
++    params: Option<Params>,
++    b1u_from: Option<usize>,
++    decoder: Option<Decoder>,
++    descrambler: Scrambler,
++    data: Vec<bool>,
++}
++
++impl UpReceiver {
++    pub fn new(law: Law) -> Self {
++        Self {
++            law,
++            levels: Vec::new(),
++            stage: Stage::HuntRu,
++            ru: RuFinder::new(),
++            su: RuFinder::new(),
++            su_from: 0,
++            trn_from: 0,
++            training: None,
++            equaliser: None,
++            signs: SignReader::new(),
++            next: 0,
++            symbol: 0,
++            ja_bits: Vec::new(),
++            finder: Finder::new(Direction::Up),
++            trn2: None,
++            last_sign: false,
++            last_before_frame: false,
++            equaliser_at_frame: None,
++            eight: false,
++            small: 0,
++            phase4_bits: 0,
++            frame_zeros: 0,
++            sequence_ends: None,
++            acknowledged: false,
++            params: None,
++            b1u_from: None,
++            decoder: None,
++            descrambler: Scrambler::new(Mode::Answer),
++            data: Vec::new(),
++        }
++    }
++
++    /// TRN2u and phase 4's sequences on eight points rather than four.
++    pub fn set_eight(&mut self, eight: bool) {
++        self.eight = eight;
++    }
++
++    /// The training the second TRN1u gave, which CPd is designed from.
++    pub fn training(&self) -> Option<&Training> {
++        self.training.as_ref()
++    }
++
++    /// The CPd this end sent: data mode is read with what it says.
++    pub fn set_params(&mut self, params: Params) {
++        self.params = Some(params);
++    }
++
++    /// Bits data mode has carried, descrambled.
++    pub fn take_data(&mut self) -> Vec<bool> {
++        std::mem::take(&mut self.data)
++    }
++
++    /// One level from the codec, in the codec's linear units.
++    pub fn feed(&mut self, level: f64) -> Option<Event> {
++        self.levels.push(level);
++        let n = self.levels.len();
++        match self.stage {
++            Stage::HuntRu => {
++                let at = self.ru.feed(level)?;
++                // TRN1u's first symbol is Ru-bar's 24th after (no MD).
++                self.trn_from = (at + 24).saturating_sub(12);
++                self.stage = Stage::Train1;
++                Some(Event::RuBar)
++            }
++            Stage::Train1 | Stage::Train2 => {
++                if n < self.trn_from + TRAIN_OVER + REACH + 64 {
++                    return None;
++                }
++                let training = Training::solve(&self.levels, self.trn_from)?;
++                self.equaliser = Some(training.equaliser());
++                // TRN1u is 2040 symbols, so what follows starts there.
++                self.next = self.trn_from + 2040 + training.delay;
++                self.signs = SignReader::new();
++                self.training = Some(training);
++                if self.stage == Stage::Train1 {
++                    self.stage = Stage::ReadJa;
++                } else {
++                    self.stage = Stage::ReadCpt;
++                    self.symbol = 2040;
++                    self.finder = Finder::new(Direction::Up);
++                }
++                None
++            }
++            Stage::ReadJa => {
++                let symbol = self.equalised()?;
++                let bit = self.signs.bit(symbol);
++                self.ja_bits.push(bit);
++                if self.ja_bits.len() < SYNC_ONES + 40 {
++                    return None;
++                }
++                // A descriptor from each place a sync could have started.
++                let len = self.ja_bits.len();
++                for start in len.saturating_sub(3000)..len.saturating_sub(SYNC_ONES + 2) {
++                    if !self.ja_bits[start..start + SYNC_ONES].iter().all(|b| *b) || self.ja_bits[start + SYNC_ONES] {
++                        continue;
++                    }
++                    if start > 0 && self.ja_bits[start - 1] {
++                        continue;
++                    }
++                    let tail = &self.ja_bits[start..];
++                    if tail.len() < sequences::descriptor_length(tail) {
++                        continue;
++                    }
++                    if let Some((d, rates)) = sequences::descriptor_from_bits(tail) {
++                        self.stage = Stage::AwaitSu;
++                        self.su = RuFinder::new();
++                        self.su_from = n;
++                        return Some(Event::Ja(d, rates));
++                    }
++                }
++                None
++            }
++            Stage::AwaitSu => {
++                self.su.feed(level)?;
++                self.stage = Stage::AwaitSuAgain;
++                self.su = RuFinder::new();
++                self.su_from = n;
++                Some(Event::SuTurned)
++            }
++            Stage::AwaitSuAgain => {
++                let at = self.su_from + self.su.feed(level)?;
++                // Su-bar for 24T and the fraction, then TRN1u.
++                self.trn_from = (at + 24).saturating_sub(12);
++                self.stage = Stage::Train2;
++                Some(Event::SuTurnedAgain)
++            }
++            Stage::ReadCpt => {
++                let symbol = self.equalised()?;
++                // TRN2u's levels are 1 and 3 over root 5 (or 21): a frame
++                // mostly below 0.7 is no longer signs of one.
++                if symbol.abs() < 0.7 {
++                    self.small += 1;
++                }
++                self.symbol += 1;
++                if self.symbol.is_multiple_of(FRAME) {
++                    let small = std::mem::take(&mut self.small);
++                    if small >= FRAME / 2 {
++                        self.stage = Stage::ReadPhase4;
++                        // The frame just read was TRN2u's first: read it
++                        // again, from where everything was at its start.
++                        self.next -= FRAME;
++                        self.symbol -= FRAME;
++                        self.last_sign = self.last_before_frame;
++                        if let Some(eq) = self.equaliser_at_frame.take() {
++                            self.equaliser = Some(eq);
++                        }
++                        self.trn2 = Some(Trn2Reader::new(self.eight, self.last_sign));
++                        self.phase4_bits = 0;
++                        self.finder = Finder::new(Direction::Up);
++                        return Some(Event::Trn2u);
++                    }
++                    self.last_before_frame = self.last_sign;
++                    self.equaliser_at_frame = self.equaliser.clone();
++                }
++                self.last_sign = symbol < 0.0;
++                let bit = self.signs.bit(symbol);
++                match self.finder.feed(bit) {
++                    Some(Found::Cp(CpKind::Training, cp)) => Some(Event::Cpt(cp)),
++                    _ => None,
++                }
++            }
++            Stage::ReadPhase4 => {
++                let symbol = self.equalised_trn2()?;
++                self.symbol += 1;
++                let bits = self.trn2.as_mut().map(|r| r.bits(symbol)).unwrap_or_default();
++                let mut event = None;
++                let per_frame = bits.len() * FRAME;
++                for bit in bits {
++                    self.phase4_bits += 1;
++                    self.frame_zeros = if bit { 0 } else { self.frame_zeros + 1 };
++                    match self.finder.feed(bit) {
++                        Some(Found::Suv(suv)) => {
++                            self.acknowledged |= suv.acknowledge;
++                            event = Some(Event::Suv(suv));
++                        }
++                        Some(Found::Cp(kind, cp)) => {
++                            self.acknowledged |= cp.acknowledge;
++                            event = Some(Event::Cpu(kind, cp));
++                        }
++                        _ => {}
++                    }
++                    if event.is_some() {
++                        // Its fill runs to the next whole frame; whatever
++                        // comes next starts there.
++                        self.sequence_ends = Some(self.phase4_bits.div_ceil(per_frame) * per_frame);
++                    }
++                }
++                // E2u: once an acknowledged sequence has come, the first whole
++                // frame after a sequence's fill all zeros, where another
++                // sequence's ones would have begun. B1u starts after it.
++                if self.symbol.is_multiple_of(FRAME) {
++                    let frame_start = self.phase4_bits - per_frame;
++                    if self.acknowledged
++                        && self.sequence_ends == Some(frame_start)
++                        && self.frame_zeros >= per_frame
++                    {
++                        self.stage = Stage::AwaitB1u;
++                        self.b1u_from = Some(self.next);
++                        return Some(Event::E2u);
++                    }
++                    if self.sequence_ends.is_some_and(|e| e < frame_start) && self.frame_zeros < per_frame {
++                        self.sequence_ends = None;
++                    }
++                }
++                event
++            }
++            Stage::AwaitB1u | Stage::Data => self.read_data(),
++        }
++    }
++
++    /// The next symbol, equalised, once its level and those after it are in.
++    fn equalised(&mut self) -> Option<f64> {
++        let training = self.training.as_ref()?;
++        let y = training.forward(&self.levels, self.next)?;
++        self.next += 1;
++        let eq = self.equaliser.as_mut()?;
++        Some(eq.next(y, receiver::sign))
++    }
++
++    fn equalised_trn2(&mut self) -> Option<f64> {
++        let training = self.training.as_ref()?;
++        let y = training.forward(&self.levels, self.next)?;
++        self.next += 1;
++        let eight = self.eight;
++        let decide = move |x: f64| {
++            let scale = if eight { 21f64.sqrt() } else { 5f64.sqrt() };
++            let top = if eight { 7.0 } else { 3.0 };
++            let m = ((x.abs() * scale - 1.0) / 2.0).round().clamp(0.0, (top - 1.0) / 2.0);
++            x.signum() * (2.0 * m + 1.0) / scale
++        };
++        let eq = self.equaliser.as_mut()?;
++        Some(eq.next(y, decide))
++    }
++
++    /// Data mode: the codec's levels are the precoder's points, after the
++    /// line's delay and the prefilter's. Where B1u's first frame is is found
++    /// by trying the places near where it should be until a frame of B1u's
++    /// ones comes out.
++    fn read_data(&mut self) -> Option<Event> {
++        let params = self.params.clone()?;
++        let delay = self.training.as_ref()?.delay;
++        if self.stage == Stage::AwaitB1u {
++            let from = self.b1u_from? + REACH;
++            // Four frames of B1u to try each place against.
++            if self.levels.len() < from + 8 * FRAME + 6 * FRAME {
++                return None;
++            }
++            let _ = delay;
++            for offset in 0..6 * FRAME {
++                let mut decoder = Decoder::new(params.clone());
++                let mut descrambler = Scrambler::new(Mode::Answer);
++                let mut ok = 0;
++                for f in 0..6 {
++                    let at = from + offset + f * FRAME;
++                    let levels: [f64; FRAME] = std::array::from_fn(|i| self.levels[at + i]);
++                    let bits = decoder.frame(&decoder.slice(&levels));
++                    let descrambled: Vec<bool> = bits.into_iter().map(|b| descrambler.descramble(b)).collect();
++                    // The descrambler fills on the first frame.
++                    if f > 0 && descrambled.iter().all(|b| *b) {
++                        ok += 1;
++                    }
++                }
++                if ok >= 4 {
++                    let mut decoder = Decoder::new(params.clone());
++                    let mut descrambler = Scrambler::new(Mode::Answer);
++                    // Decode up to here again, so both are where the line is.
++                    let mut at = from + offset;
++                    while at + FRAME <= self.levels.len() {
++                        let levels: [f64; FRAME] = std::array::from_fn(|i| self.levels[at + i]);
++                        for b in decoder.frame(&decoder.slice(&levels)) {
++                            descrambler.descramble(b);
++                        }
++                        at += FRAME;
++                    }
++                    self.decoder = Some(decoder);
++                    self.descrambler = descrambler;
++                    self.next = at;
++                    self.stage = Stage::Data;
++                    return Some(Event::InData);
++                }
++            }
++            // Not yet: perhaps B1u is later than thought.
++            if self.levels.len() > from + 60 * FRAME {
++                self.b1u_from = Some(self.b1u_from? + FRAME);
++            }
++            return None;
++        }
++        while self.next + FRAME <= self.levels.len() {
++            let levels: [f64; FRAME] = std::array::from_fn(|i| self.levels[self.next + i]);
++            let decoder = self.decoder.as_mut()?;
++            let bits = decoder.frame(&decoder.slice(&levels));
++            self.data.extend(bits.into_iter().map(|b| self.descrambler.descramble(b)));
++            self.next += FRAME;
++        }
++        None
++    }
++}
++
++/// The CPd for data mode from what the second TRN1u taught (Table 30/V.92):
++/// the prefilter and precoder, the gain, constellations of codec levels
++/// spaced well clear of what the training left, and the fastest rate those
++/// carry among `enabled` (bit 0 for 24 000).
++pub fn design_cpd(training: &Training, law: Law, enabled: u32) -> Option<Cpd> {
++    let (filters, gain) = training.design();
++    let noise = training.error.sqrt() * training.level;
++    let points = receiver::constellation(law, (8.0 * noise).max(16.0), 2.0 * training.level);
++    let n = 2 * points.positive.len();
++    // drn 1 is 24 000: (drn + 17) * 8000/6.
++    let (drn, moduli) = (1..=19u8).rev().find_map(|drn| {
++        let bits = 2 * (usize::from(drn) + 17);
++        let enabled_here = enabled >> (drn - 1) & 1 == 1;
++        enabled_here.then(|| receiver::moduli(bits, n)).flatten().map(|m| (drn, m))
++    })?;
++    let positive: Vec<u16> = points.positive.iter().map(|&p| p.round() as u16).collect();
++    Some(Cpd {
++        drn,
++        code: Code::States16,
++        extend_e2u: false,
++        acknowledge: false,
++        gain,
++        moduli: Some(moduli.map(|m| m as u8)),
++        filters: Some(filters),
++        constellations: Some(([0; 6], vec![positive])),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::v90::network::Network;
++    use crate::v92::up::Upstream;
++    use crate::v92::sequences::ALL_UPSTREAM_RATES;
++
++    const FS: f64 = 16_000.0;
++
++    /// The analogue modem's upstream, driven through phases 3 and 4 as its
++    /// downstream would drive it, against the digital modem's ear, through
++    /// the network; then data, every bit checked.
++    #[test]
++    fn phases_3_and_4_and_data_go_up_and_are_heard() {
++        let law = Law::Mu;
++        let mut net = Network::new(law, FS).with_delay(0.020, FS).with_noise(1e-5);
++        let d = crate::v90::dil::design(law, 79);
++        let ja = sequences::descriptor_bits(&d, ALL_UPSTREAM_RATES);
++        let mut up = Upstream::new(FS, ja, 0.05);
++        let mut ear = UpReceiver::new(law);
++        let full = receiver::codec_units(law);
++        let cpt = Cp { drn: 10, intervals: [0; 6], constellations: vec![0xffff_ffff_0000], ..Cp::default() };
++        let cpu = Cp { data_mode: true, drn: 19, intervals: [0; 6], constellations: vec![0xffff_ffff_0000], ..Cp::default() };
++        up.set_cpu(cpu);
++        let mut events = Vec::new();
++        let mut after: Vec<(usize, Box<dyn FnOnce(&mut Upstream)>)> = Vec::new();
++        let mut cpd_sent: Option<Cpd> = None;
++        let mut sent = Vec::new();
++        let mut x = 0x2545_f491_4f6c_dd1du64;
++        let mut upsamples = Vec::new();
++        let mut in_data_at = None;
++        for t in 0..(14.0 * 8000.0) as usize {
++            let level = net.up(&upsamples) * full;
++            upsamples.clear();
++            for _ in net.down(0.0) {
++                upsamples.push(up.sample(0.0));
++            }
++            // What the downstream would make the analogue modem do, a little
++            // after the digital modem acts.
++            let mut i = 0;
++            while i < after.len() {
++                if after[i].0 <= t {
++                    let (_, f) = after.remove(i);
++                    f(&mut up);
++                } else {
++                    i += 1;
++                }
++            }
++            if up.in_data() && up.pending_bits() < 1000 {
++                let b: Vec<bool> = (0..256)
++                    .map(|_| {
++                        x ^= x << 13;
++                        x ^= x >> 7;
++                        x ^= x << 17;
++                        x & 1 == 1
++                    })
++                    .collect();
++                sent.extend(b.iter().copied());
++                up.send_bits(&b);
++            }
++            let Some(event) = ear.feed(level) else { continue };
++            println!("{:6.3} s: {:?}", t as f64 / 8000.0, match &event { Event::Ja(..) => "Ja".to_owned(), e => format!("{e:?}").chars().take(60).collect() });
++            match &event {
++                // Sd, TRN1d and Jd take a while; Jd read, Su.
++                Event::Ja(..) => {
++                    after.push((t + 400, Box::new(|u: &mut Upstream| u.end_ja())));
++                    after.push((t + 4000, Box::new(|u: &mut Upstream| u.send_su())));
++                }
++                Event::SuTurned => after.push((t + 400, Box::new(|u: &mut Upstream| u.heard_jp(0.0, false)))),
++                // The DIL read: CPt.
++                Event::SuTurnedAgain => {
++                    let cpt = cpt.clone();
++                    after.push((t + 3000, Box::new(move |u: &mut Upstream| u.send_cpt(&cpt))));
++                }
++                Event::Cpt(_) => after.push((t + 400, Box::new(|u: &mut Upstream| u.heard_ri()))),
++                Event::Trn2u => {
++                    after.push((t + 2400, Box::new(|u: &mut Upstream| u.heard_suvd(Suv { acknowledge: false, level: Suv::UNMEASURED, ..Suv::default() }))));
++                }
++                Event::Cpu(CpKind::Data, cp) if cpd_sent.is_none() => {
++                    assert_eq!(cp.drn, 19);
++                    let cpd = design_cpd(ear.training().unwrap(), law, ALL_UPSTREAM_RATES).expect("no CPd");
++                    println!("CPd: {} bit/s", cpd.rate().unwrap());
++                    ear.set_params(cpd.params().expect("CPd has no parameters"));
++                    let acked = cpd.acknowledged();
++                    after.push((t + 400, Box::new(move |u: &mut Upstream| u.heard_cpd(acked))));
++                    cpd_sent = Some(cpd);
++                }
++                Event::InData => in_data_at = Some(t),
++                _ => {}
++            }
++            events.push(event);
++        }
++        let kinds: Vec<String> = events.iter().map(|e| format!("{e:?}").chars().take(8).collect()).collect();
++        println!("{kinds:?}");
++        assert!(in_data_at.is_some(), "never reached data mode");
++        let got = ear.take_data();
++        // B1u's ones decode away; the data comes after. Find it.
++        let window = 512;
++        let at = (0..got.len().saturating_sub(window)).find(|&i| got[i..i + window] == sent[..window]).expect("the data was not found");
++        let n = (got.len() - at).min(sent.len());
++        let wrong = got[at..at + n].iter().zip(&sent[..n]).filter(|(a, b)| a != b).count();
++        println!("{n} bits of data, {wrong} wrong");
++        assert!(n > 10_000 && wrong == 0, "{n} bits, {wrong} wrong");
++    }
++}
 diff --git a/crates/datapump/src/v92/transmitter.rs b/crates/datapump/src/v92/transmitter.rs
 new file mode 100644
 index 0000000..8041c06
@@ -3409,6 +4093,545 @@ index 0000000..8041c06
 +            assert_eq!(back, k, "frame {f}: numbers");
 +            assert_eq!(rx.frame(&etas), b, "frame {f}: bits");
 +        }
++    }
++}
+diff --git a/crates/datapump/src/v92/up.rs b/crates/datapump/src/v92/up.rs
+new file mode 100644
+index 0000000..3d257f4
+--- /dev/null
++++ b/crates/datapump/src/v92/up.rs
+@@ -0,0 +1,533 @@
++//! What the analogue modem sends upstream when PCM upstream was asked for:
++//! V.92's phase 3, phase 4 and data mode, one symbol at a time (9.5.2,
++//! 9.6.2/V.92).
++//!
++//! ```text
++//! analogue Ru Ru' (MD) Ru Ru' TRN1u Ja ... | Su Su' Su ... Su' TRN1u CPt ... E1u TRN2u SUVu .. CPu .. SUVu' E2u B1u data
++//! digital                     Sd Sd' TRN1d Jd ... Jp ... Jp' DIL ...  Ri ... Ri' TRN2d SUVd .. CPd .. SUVd' Ed B1d data
++//! ```
++//!
++//! The analogue modem's start-up says when each part begins, from what its
++//! downstream receiver hears; this says what goes on the line meanwhile, and
++//! keeps phase 4's sequences to the rules of 9.6.2.1: SUVu once TRN2u has
++//! run long enough or SUVd has been heard, one CPu after the first SUVd, an
++//! acknowledged CPu and SUVu once CPd is in, CPu again if the digital modem
++//! has not acknowledged it, and E2u once both ends have.
++
++use std::collections::VecDeque;
++
++use crate::v32::{Mode, Scrambler};
++use crate::v90::sequences::Cp;
++
++use super::line::{self, Signs, Trn2, UpLine};
++use super::sequences::{self, CpKind, Cpd, Suv};
++use super::transmitter::{FRAME, Params, Transmitter};
++
++/// LU on the line, as a fraction of full scale: about -15 dBm0, where V.90's
++/// upstream sits.
++pub const LU: f64 = 0.12;
++
++/// Ru, then Ru-bar (9.5.2.1.1).
++const RU: usize = 384;
++const RU_BAR: usize = 24;
++
++/// TRN1u: "at least 2040T", in whole frames of twelve.
++const TRN1U: usize = 2040;
++
++/// Su before its first turn (9.5.2.1.6), and Su-bar's lengths (9.5.2.1.7,
++/// 9.5.2.1.8).
++const SU_FIRST: usize = 144;
++const SU_BAR_FIRST: usize = 24;
++const SU_BAR_SECOND: usize = 24;
++
++/// TRN2u before SUVu unless SUVd comes first: "at least 12000T" (9.6.2.1.1).
++const TRN2U: usize = 12_000;
++
++/// B1u: "48 data frames" (8.7.1).
++const B1U_FRAMES: usize = 48;
++
++/// What is going up.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Up {
++    Silence,
++    Ru,
++    RuBar,
++    Trn1u,
++    Ja,
++    Su,
++    SuBar,
++    /// TRN1u through the DIL.
++    Trn1uDil,
++    Cpt,
++    E1u,
++    Trn2u,
++    /// SUVu and CPu, as phase 4's rules have them.
++    Phase4,
++    E2u,
++    B1u,
++    Data,
++}
++
++/// The upstream, from phase 3 on.
++#[derive(Debug, Clone)]
++pub struct Upstream {
++    line: UpLine,
++    up: Up,
++    /// Symbols of the current signal sent.
++    count: usize,
++    /// Symbols since the first of the second TRN1u: data frame intervals
++    /// are counted from there (8.5.7).
++    since_trn1u: Option<usize>,
++    signs: Signs,
++    trn2: Option<Trn2>,
++    eight: bool,
++    /// Bits of the sequence going out, and what it is.
++    queue: VecDeque<bool>,
++    ja: Vec<bool>,
++    cpt: Vec<bool>,
++    /// The next signal, at the next place the current one can end.
++    pending: Option<Up>,
++    /// Phase 4: what the digital modem has said, and what this end has.
++    suvd_heard: bool,
++    cpd: Option<Cpd>,
++    far_acknowledged: bool,
++    ed: bool,
++    cpu: Option<Cp>,
++    cpu_sent: usize,
++    acknowledged_sent: usize,
++    /// When the last CPu ended, in symbols, for 9.6.2.1.3's repeat.
++    cpu_ended: Option<usize>,
++    repeat_cpu: bool,
++    round_trip: usize,
++    /// Data mode.
++    transmitter: Option<Transmitter>,
++    scrambler: Scrambler,
++    data: VecDeque<bool>,
++    frame: VecDeque<f64>,
++    b1u_left: usize,
++    /// What has just begun going out, for the transcript.
++    began: Option<String>,
++    /// Where in its six-symbol pattern Su is: Su-bar is Su turned over in
++    /// step with it, never begun again.
++    su_phase: usize,
++    /// A shift of the symbol clock asked for while a symbol was being
++    /// chosen, applied before the next line sample.
++    stretch: f64,
++}
++
++impl Upstream {
++    /// `ja` is the DIL descriptor with its rate mask, as Ja repeats it.
++    pub fn new(fs: f64, ja: Vec<bool>, round_trip: f64) -> Self {
++        Self {
++            line: UpLine::new(fs),
++            up: Up::Silence,
++            count: 0,
++            since_trn1u: None,
++            signs: Signs::new(),
++            trn2: None,
++            eight: false,
++            queue: VecDeque::new(),
++            ja,
++            cpt: Vec::new(),
++            pending: Some(Up::Ru),
++            suvd_heard: false,
++            cpd: None,
++            far_acknowledged: false,
++            ed: false,
++            cpu: None,
++            cpu_sent: 0,
++            acknowledged_sent: 0,
++            cpu_ended: None,
++            repeat_cpu: false,
++            round_trip: (round_trip * line::BAUD) as usize,
++            transmitter: None,
++            scrambler: Scrambler::new(Mode::Answer),
++            data: VecDeque::new(),
++            frame: VecDeque::new(),
++            b1u_left: 0,
++            began: None,
++            su_phase: 0,
++            stretch: 0.0,
++        }
++    }
++
++    pub fn up(&self) -> Up {
++        self.up
++    }
++
++    /// One line sample: `drift` is how far the sound card runs off the
++    /// network's clock, in ppm, as the downstream receiver has it.
++    pub fn sample(&mut self, drift: f64) -> f64 {
++        self.line.set_drift(drift);
++        let mut line = std::mem::replace(&mut self.line, UpLine::new(1.0));
++        let out = line.sample(|| self.next());
++        line.extend(std::mem::take(&mut self.stretch));
++        self.line = line;
++        LU * out
++    }
++
++    /// What has just begun, if anything, for the transcript.
++    pub fn take_began(&mut self) -> Option<String> {
++        self.began.take()
++    }
++
++    /// 9.5.2.1.3: Sd-bar heard, so Ja ends at its next twelve bits, and
++    /// silence.
++    pub fn end_ja(&mut self) {
++        self.pending = Some(Up::Silence);
++    }
++
++    /// 9.5.2.1.6: Jd read: Su for 144T, Su-bar for 24.5T, then Su until Jp.
++    pub fn send_su(&mut self) {
++        if !matches!(self.up, Up::Su | Up::SuBar) {
++            self.pending = Some(Up::Su);
++        }
++    }
++
++    /// 9.5.2.1.8: Jp read: Su-bar for 24T and the fraction it asks for, and
++    /// TRN1u after it, through the DIL; TRN2u and CPu are on `eight` points
++    /// if Jp says so.
++    pub fn heard_jp(&mut self, fraction: f64, eight: bool) {
++        if self.up == Up::Su && self.count >= SU_FIRST + SU_BAR_FIRST {
++            self.eight = eight;
++            self.line.extend(fraction);
++            self.start(Up::SuBar);
++        }
++    }
++
++    /// 9.5.2.1.11: the DIL is read: CPt after at least 2040T of TRN1u, over
++    /// and over until Ri.
++    pub fn send_cpt(&mut self, cpt: &Cp) {
++        self.cpt = sequences::cp_bits(cpt, CpKind::Training);
++        self.pending = Some(Up::Cpt);
++    }
++
++    /// 9.5.2.1.11: Ri heard: the current CPt whole, E1u, and phase 4.
++    pub fn heard_ri(&mut self) {
++        if self.up == Up::Cpt {
++            self.pending = Some(Up::E1u);
++        }
++    }
++
++    /// The CPu this end sends, once it knows what it wants downstream.
++    pub fn set_cpu(&mut self, cp: Cp) {
++        self.cpu = Some(cp);
++    }
++
++    /// 9.6.2.1.1 and 9.6.2.1.2: SUVd heard.
++    pub fn heard_suvd(&mut self, suv: Suv) {
++        self.suvd_heard = true;
++        if suv.acknowledge {
++            self.far_acknowledged = true;
++        }
++        if self.up == Up::Trn2u {
++            self.pending = Some(Up::Phase4);
++        }
++    }
++
++    /// 9.6.2.1.2: CPd heard, which sets the transmitter up.
++    pub fn heard_cpd(&mut self, cpd: Cpd) {
++        if cpd.acknowledge {
++            self.far_acknowledged = true;
++        }
++        // A CPd may leave a part out when it is unchanged: keep the last.
++        let merged = match self.cpd.take() {
++            Some(old) => Cpd {
++                moduli: cpd.moduli.or(old.moduli),
++                filters: cpd.filters.clone().or(old.filters),
++                constellations: cpd.constellations.clone().or(old.constellations),
++                ..cpd
++            },
++            None => cpd,
++        };
++        self.cpd = Some(merged);
++    }
++
++    /// Ed heard: as good as an acknowledgement (9.6.2.1.4).
++    pub fn heard_ed(&mut self) {
++        self.ed = true;
++    }
++
++    /// The CPd this end is going on, and the transmitter it sets up.
++    pub fn cpd(&self) -> Option<&Cpd> {
++        self.cpd.as_ref()
++    }
++
++    pub fn params(&self) -> Option<Params> {
++        self.cpd.as_ref()?.params()
++    }
++
++    /// The upstream rate data mode will run at.
++    pub fn rate(&self) -> Option<u32> {
++        self.params().map(|p| p.rate())
++    }
++
++    /// Whether data mode has begun upstream.
++    pub fn in_data(&self) -> bool {
++        self.up == Up::Data
++    }
++
++    /// Bits for data mode.
++    pub fn send_bits(&mut self, bits: &[bool]) {
++        self.data.extend(bits.iter().copied());
++    }
++
++    pub fn pending_bits(&self) -> usize {
++        self.data.len()
++    }
++
++    fn start(&mut self, up: Up) {
++        self.up = up;
++        self.count = 0;
++        self.queue.clear();
++        match up {
++            Up::Trn1u => {
++                // "The scrambler shall be initialized to zero prior to the
++                // transmission of TRN1u" (8.5.7).
++                self.signs.restart();
++            }
++            Up::Ja => {
++                // "Sequence Ja consists of 24 binary ones followed by
++                // repetitions of the DIL descriptor".
++                self.queue.extend([true; 24]);
++                self.began = Some("sent Ja: the DIL descriptor and the upstream rates".into());
++            }
++            Up::Trn1uDil => {
++                // TRN1u again: data frame intervals counted from its first
++                // symbol (8.5.7).
++                self.signs.restart();
++                self.since_trn1u = Some(0);
++            }
++            Up::Cpt => self.began = Some("sent CPt".into()),
++            Up::E1u => {
++                // A data frame of scrambled, differentially encoded zeros.
++                self.queue.extend([false; FRAME]);
++            }
++            Up::Trn2u => {
++                let mut trn2 = Trn2::new(self.eight, self.signs.last());
++                trn2.restart();
++                self.trn2 = Some(trn2);
++                self.began = Some(format!("sent TRN2u on {} points", if self.eight { 8 } else { 4 }));
++            }
++            Up::E2u => {
++                let n = self.trn2.as_ref().map_or(2, Trn2::bits_per_symbol);
++                self.queue.extend(std::iter::repeat_n(false, n * FRAME));
++                self.began = Some("sent E2u: B1u and data next".into());
++            }
++            Up::B1u => {
++                // "The scrambler, modulus encoder, convolutional encoder,
++                // precoder and prefilter memories are initialized to zero
++                // prior to transmitting B1u" (8.7.1).
++                self.scrambler = Scrambler::new(Mode::Answer);
++                self.transmitter = self.params().map(Transmitter::new);
++                self.b1u_left = B1U_FRAMES;
++                self.frame.clear();
++                self.began = self.rate().map(|r| format!("sent B1u: data mode up at {r} bit/s"));
++            }
++            _ => {}
++        }
++    }
++
++    /// The next symbol, in units of LU.
++    fn next(&mut self) -> f64 {
++        if let Some(n) = self.since_trn1u.as_mut() {
++            *n += 1;
++        }
++        loop {
++            match self.up {
++                Up::Silence => {
++                    if let Some(next) = self.pending.take() {
++                        self.start(next);
++                        continue;
++                    }
++                    return 0.0;
++                }
++                Up::Ru | Up::RuBar => {
++                    let length = if self.up == Up::Ru { RU } else { RU_BAR };
++                    if self.count == length {
++                        self.start(if self.up == Up::Ru { Up::RuBar } else { Up::Trn1u });
++                        continue;
++                    }
++                    let s = line::ru(self.count, self.up == Up::RuBar);
++                    self.count += 1;
++                    return s;
++                }
++                Up::Trn1u => {
++                    if self.count >= TRN1U && self.count.is_multiple_of(FRAME) {
++                        self.start(Up::Ja);
++                        continue;
++                    }
++                    self.count += 1;
++                    return self.signs.trn1u();
++                }
++                Up::Ja => {
++                    // Ends at a twelve-bit boundary once asked to.
++                    if self.count.is_multiple_of(12) && let Some(next) = self.pending.take() {
++                        self.start(next);
++                        continue;
++                    }
++                    if self.queue.is_empty() {
++                        self.queue.extend(self.ja.iter().copied());
++                    }
++                    let bit = self.queue.pop_front().unwrap_or(true);
++                    self.count += 1;
++                    return self.signs.differential(bit);
++                }
++                Up::Su | Up::SuBar => {
++                    // Su for 144T and Su-bar for 24.5T -- the half symbol a
++                    // shift of the clock -- then Su until Jp, Su-bar for 24T
++                    // and the fraction, and TRN1u.
++                    if self.up == Up::Su && self.count == SU_FIRST {
++                        self.up = Up::SuBar;
++                        continue;
++                    }
++                    if self.up == Up::SuBar && self.count == SU_FIRST + SU_BAR_FIRST {
++                        self.stretch += 0.5;
++                        self.up = Up::Su;
++                        continue;
++                    }
++                    if self.up == Up::SuBar && self.count >= SU_BAR_SECOND && self.count < SU_FIRST {
++                        // The second Su-bar, begun by Jp: `count` restarted.
++                        self.start(Up::Trn1uDil);
++                        continue;
++                    }
++                    let s = line::su(self.su_phase, self.up == Up::SuBar);
++                    self.su_phase += 1;
++                    self.count += 1;
++                    return s;
++                }
++                Up::Trn1uDil => {
++                    if self.count >= TRN1U
++                        && self.since_trn1u.is_some_and(|n| n.is_multiple_of(FRAME))
++                        && let Some(next) = self.pending.take()
++                    {
++                        self.start(next);
++                        continue;
++                    }
++                    self.count += 1;
++                    return self.signs.trn1u();
++                }
++                Up::Cpt => {
++                    if self.queue.is_empty() {
++                        if let Some(next) = self.pending.take() {
++                            self.start(next);
++                            continue;
++                        }
++                        self.queue.extend(self.cpt.iter().copied());
++                    }
++                    let bit = self.queue.pop_front().unwrap_or(false);
++                    self.count += 1;
++                    return self.signs.differential(bit);
++                }
++                Up::E1u => {
++                    if self.queue.is_empty() {
++                        self.start(Up::Trn2u);
++                        continue;
++                    }
++                    let bit = self.queue.pop_front().unwrap_or(false);
++                    self.count += 1;
++                    return self.signs.differential(bit);
++                }
++                Up::Trn2u => {
++                    // In whole frames; SUVu once 12000T have gone or SUVd has
++                    // been heard.
++                    if self.count.is_multiple_of(FRAME) && (self.count >= TRN2U || self.pending == Some(Up::Phase4)) {
++                        self.pending = None;
++                        self.start(Up::Phase4);
++                        continue;
++                    }
++                    let ones = vec![true; self.trn2.as_ref().map_or(2, Trn2::bits_per_symbol)];
++                    self.count += 1;
++                    return self.trn2.as_mut().map_or(0.0, |t| t.symbol(&ones));
++                }
++                Up::Phase4 => {
++                    if self.queue.is_empty() {
++                        if self.phase4_next() {
++                            continue;
++                        }
++                    }
++                    return self.trn2_symbol();
++                }
++                Up::E2u => {
++                    if self.queue.is_empty() {
++                        self.start(Up::B1u);
++                        continue;
++                    }
++                    return self.trn2_symbol();
++                }
++                Up::B1u | Up::Data => {
++                    if self.frame.is_empty() {
++                        if self.up == Up::B1u {
++                            if self.b1u_left == 0 {
++                                self.up = Up::Data;
++                                self.began = Some("data mode upstream".into());
++                                continue;
++                            }
++                            self.b1u_left -= 1;
++                        }
++                        let k = self.transmitter.as_ref().map_or(0, |t| t.params().bits);
++                        let source: Vec<bool> = if self.up == Up::B1u {
++                            vec![true; k]
++                        } else {
++                            (0..k).map(|_| self.data.pop_front().unwrap_or(true)).collect()
++                        };
++                        let scrambled: Vec<bool> = source.into_iter().map(|b| self.scrambler.scramble(b)).collect();
++                        let Some(tx) = self.transmitter.as_mut() else { return 0.0 };
++                        self.frame.extend(tx.frame(&scrambled));
++                    }
++                    return self.frame.pop_front().unwrap_or(0.0);
++                }
++            }
++        }
++    }
++
++    /// One symbol of what phase 4 has queued, on TRN2u's levels.
++    fn trn2_symbol(&mut self) -> f64 {
++        let n = self.trn2.as_ref().map_or(2, Trn2::bits_per_symbol);
++        let bits: Vec<bool> = (0..n).map(|_| self.queue.pop_front().unwrap_or(false)).collect();
++        self.count += 1;
++        self.trn2.as_mut().map_or(0.0, |t| t.symbol(&bits))
++    }
++
++    /// What phase 4 sends next, its rules applied at a sequence's end. True
++    /// when the signal changed.
++    fn phase4_next(&mut self) -> bool {
++        let acknowledging = self.cpd.is_some();
++        // 9.6.2.1.4: an acknowledged sequence sent, and the far end's
++        // acknowledgement or Ed heard: E2u.
++        if self.acknowledged_sent > 0 && (self.far_acknowledged || self.ed) {
++            self.start(Up::E2u);
++            return true;
++        }
++        // 9.6.2.1.3: no acknowledgement of a CPu sent 100 ms and a round trip
++        // ago: CPu over and over.
++        if let Some(ended) = self.cpu_ended
++            && !self.far_acknowledged
++            && self.count > ended + 800 + self.round_trip
++        {
++            self.repeat_cpu = true;
++        }
++        let send_cpu = self.cpu.is_some()
++            && self.suvd_heard
++            && (self.cpu_sent == 0 || self.repeat_cpu || (acknowledging && self.acknowledged_sent == 0));
++        let bits = if send_cpu {
++            let cp = self.cpu.as_ref().expect("checked");
++            let cp = if acknowledging { cp.acknowledged() } else { cp.clone() };
++            self.cpu_sent += 1;
++            if self.cpu_sent == 1 {
++                self.began = Some("sent CPu".into());
++            }
++            sequences::cp_bits(&cp, CpKind::Data)
++        } else {
++            Suv { wait_for_cpu: false, level: Suv::UNMEASURED, silence: false, acknowledge: acknowledging }.to_bits(true)
++        };
++        if send_cpu {
++            self.cpu_ended = Some(self.count + bits.len() / self.trn2.as_ref().map_or(2, Trn2::bits_per_symbol));
++        }
++        if acknowledging {
++            self.acknowledged_sent += 1;
++        }
++        self.queue.extend(bits);
++        false
 +    }
 +}
 diff --git a/crates/datapump/tests/v90_call.rs b/crates/datapump/tests/v90_call.rs
