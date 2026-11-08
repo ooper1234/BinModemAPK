@@ -52,12 +52,42 @@ buffer slip works as before. It is the one change to the modem itself, kept
 as `android/patches/long-dil.patch` and applied to the submodule by
 `build-apk.sh` (the build stops if it is missing).
 
-### V.92 Quick Connect
+### V.92: Quick Connect and PCM upstream
 
-Upstream BinModem has no V.92. This build adds V.92's Quick Connect for
-calls to a V.92 server, with V.34 upstream as in V.90. It is the **V.92**
-entry in the call box (`AT+MS=V92`); **V.90** stays V.90 as upstream has it,
-saying nothing of V.92 and never quick connecting.
+Upstream BinModem has no V.92. This build adds V.92's PCM upstream and its
+Quick Connect for calls to a V.92 server. It is the **V.92** entry in the call
+box (`AT+MS=V92`); **V.90** stays V.90 as upstream has it, saying nothing of
+V.92, with V.34 upstream, never quick connecting.
+
+**PCM upstream** (clause 8/V.92). A full V.92 start-up asks for it in
+INFO1a (Table 18/V.92) of a server that offers it in INFO1d, and then:
+
+- Phase 3 (9.5/V.92): Ru and TRN1u, Ja with the upstream rates, Su after Jd,
+  and TRN1u again through the DIL, timed by Jp.
+- Phase 4 (9.6/V.92): CPt, TRN2u, CPu and the SUVu/SUVd handshake; the
+  server's CPd sets up this end's precoder, prefilter, gain and
+  constellations; E2u, B1u, data.
+- Data mode (6.4/V.92): modulus encoder, 16-state trellis, precoder choosing
+  the smallest point of each class, prefilter; 8000 symbols a second put on
+  the line by sinc interpolation.
+- The upstream runs on the network's clock, not the sound card's. Once the
+  downstream receiver has trained, a phase-locked loop holds the upstream to
+  the receiver's sampling clock. In simulation a sound card 100 ppm fast or
+  slow makes no difference.
+- After two start-ups with PCM upstream that do not come up, the call drops
+  it and uses V.34's upstream under V.90's downstream.
+
+In simulation (a V.92 server written for it here, which works out the
+precoder and constellations from TRN1u and reads the upstream with a Viterbi
+decoder), a 20 ms line comes up in 4.9 s at 52 000 down and 28 000 to
+32 000 up, then 0 bits wrong in 15 s each way. On a noisy line it is 25 333
+up. That makes PCM upstream about level with V.34's 31 200 here, not
+V.92's 48 000: the server picks its constellation to leave a safe margin.
+**None of this has met a real V.92 server yet.** A real server picks its own
+constellation from what it hears, and where the spec leaves a choice (the bit
+order of TRN2u's levels, for one) this follows its plainest reading.
+
+**Quick Connect** (clause 9/V.92):
 
 - A V.92 call says V.92 in INFO0a (Table 16/V.92). When the server says
   it too, the call remembers what its full start-up settled for the
@@ -65,17 +95,16 @@ saying nothing of V.92 and never quick connecting.
   settings directory).
 - The next call to that number sends QC1a ahead of CM. A server that answers
   with QCA1d gets V.92's short Phase 1 (QTS, ANSpcm, TONEq) and short Phase 2
-  (no line probing; INFO1a per Table 19/V.92), then V.90's phases 3 and 4.
+  (no line probing; INFO1a per Table 19/V.92), then V.90's phases 3 and 4
+  with V.34 upstream: a Quick Connect does not ask for PCM upstream.
   LAPM is agreed in the short Phase 1, with no ODP/ADP.
 - A server that ignores QC1a answers the CM with JM, and V.8 goes on as
   before. A Quick Connect that fails to reach data mode forgets the number,
   so the next call starts in full.
 
-Not done: PCM upstream (V.92's 48 000 bit/s upstream) and modem-on-hold.
+Not done: modem-on-hold, and PCM upstream with Quick Connect's short Phase 2.
+A renegotiation during PCM upstream is a full retrain.
 Kept as `android/patches/v92-quick-connect.patch`, applied after the long DIL.
-
-In simulation, a call over a 15 ms line comes up in 7.9 s with Quick Connect
-against 9.9 s without, at the same rates.
 
 ### How it is put together
 

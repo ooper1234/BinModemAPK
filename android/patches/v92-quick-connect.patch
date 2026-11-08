@@ -240,9 +240,18 @@ index 58aa483..b30bd8d 100644
          assert_eq!(bits.len(), INFO1A_BITS);
          assert_eq!(Info1aPcm::from_bits(&bits), Some(asked));
 diff --git a/crates/datapump/src/v34/phase2.rs b/crates/datapump/src/v34/phase2.rs
-index 2a1b22d..5eeb5ad 100644
+index 2a1b22d..f118495 100644
 --- a/crates/datapump/src/v34/phase2.rs
 +++ b/crates/datapump/src/v34/phase2.rs
+@@ -25,7 +25,7 @@
+ use dsp::{ReversalDetector, ToneDetector};
+ 
+ use super::dpsk::{self, Side};
+-use super::info::{Info, Info0, Info0d, Info1a, Info1aPcm, Info1c, Probed, SymbolRate};
++use super::info::{Info, Info0, Info0d, Info1a, Info1aPcm, Info1c, PcmUp, Probed, SymbolRate};
+ use crate::v90;
+ use super::probe::{self, Analyzer, Reading};
+ 
 @@ -80,6 +80,52 @@ impl Pcm {
      }
  }
@@ -324,7 +333,7 @@ index 2a1b22d..5eeb5ad 100644
              Self::Finished => "V.34 phase 2 done",
          }
      }
-@@ -357,6 +417,21 @@ pub struct Modem {
+@@ -357,6 +417,26 @@ pub struct Modem {
      /// call's first phase 2 to get that far. A retrain's phase 2 is given it,
      /// and takes nothing much quieter for tone B (see [`TONE_B_FLOOR`]).
      tone_b_level: Option<f64>,
@@ -337,6 +346,11 @@ index 2a1b22d..5eeb5ad 100644
 +    short: bool,
 +    /// V.92's analogue modem says V.92 in INFO0a; V.90's does not.
 +    says_v92: bool,
++    /// V.92's analogue modem asks for PCM upstream in INFO1a (Table 18/V.92)
++    /// when the digital modem's INFO1d says the channel carries it.
++    wants_pcm_up: bool,
++    /// V.92's digital modem says in INFO1d's bit 70 that it does.
++    offers_pcm_up: bool,
 +    /// INFO0 goes out at this sample, after V.92's short Phase 1 handed over
 +    /// with its 75 ms of silence still to run (see [`Self::with_quiet_start`]).
 +    info0_at: Option<u64>,
@@ -346,7 +360,7 @@ index 2a1b22d..5eeb5ad 100644
  }
  
  impl Modem {
-@@ -402,6 +477,12 @@ impl Modem {
+@@ -402,6 +482,14 @@ impl Modem {
              far_info0d: None,
              info1a_pcm: None,
              tone_b_level: None,
@@ -354,12 +368,14 @@ index 2a1b22d..5eeb5ad 100644
 +            short_offered: false,
 +            short: false,
 +            says_v92: true,
++            wants_pcm_up: false,
++            offers_pcm_up: false,
 +            info0_at: None,
 +            pcm_upstream: None,
          }
      }
  
-@@ -435,6 +516,77 @@ impl Modem {
+@@ -435,6 +523,88 @@ impl Modem {
          modem
      }
  
@@ -383,6 +399,7 @@ index 2a1b22d..5eeb5ad 100644
 +    pub fn v92_digital(info0d: Info0d, fs: f64) -> Self {
 +        let mut modem = Self::v90(Pcm::Digital(info0d), fs);
 +        modem.short_offered = info0d.v92 && info0d.short_phase2;
++        modem.offers_pcm_up = info0d.v92;
 +        modem
 +    }
 +
@@ -407,6 +424,16 @@ index 2a1b22d..5eeb5ad 100644
 +            self.tx.send(&bits);
 +        }
 +        self
++    }
++
++    /// Ask for PCM upstream when the digital modem offers it.
++    pub fn wanting_pcm_up(mut self) -> Self {
++        self.wants_pcm_up = true;
++        self
++    }
++
++    pub fn set_wants_pcm_up(&mut self, on: bool) {
++        self.wants_pcm_up = on;
 +    }
 +
 +    /// Whether this was V.92's short Phase 2.
@@ -437,7 +464,17 @@ index 2a1b22d..5eeb5ad 100644
      /// V.90's phase 2 as a retrain: "Any subsequent retrains shall use Phase
      /// 2 of V.90 regardless of the analogue modem's choice of operating mode"
      /// (9.2.1.1.8, 9.2.2.1.9).
-@@ -474,7 +626,29 @@ impl Modem {
+@@ -454,6 +624,9 @@ impl Modem {
+             None => Self::retrain(self.role, self.fs, far),
+         };
+         modem.pcm_declined = self.pcm_declined;
++        modem.wants_pcm_up = self.wants_pcm_up;
++        modem.offers_pcm_up = self.offers_pcm_up;
++        modem.says_v92 = self.says_v92;
+         // The digital modem's tone B comes back at the power it had the
+         // first time (8.2/V.90), so what the first time heard stands, and
+         // anything much quieter is something else.
+@@ -474,7 +647,29 @@ impl Modem {
      fn info0_bits(&self) -> Vec<bool> {
          match self.pcm {
              Some(Pcm::Digital(d)) => Info0d { v34: self.ours, ..d }.to_bits(),
@@ -468,7 +505,7 @@ index 2a1b22d..5eeb5ad 100644
          }
      }
  
-@@ -682,6 +856,12 @@ impl Modem {
+@@ -682,6 +877,12 @@ impl Modem {
  
      /// Everything scheduled for this sample.
      fn timers(&mut self) {
@@ -481,7 +518,7 @@ index 2a1b22d..5eeb5ad 100644
          if self.tone_at == Some(self.now) {
              self.tone_at = None;
              self.start_tone();
-@@ -695,6 +875,13 @@ impl Modem {
+@@ -695,6 +896,13 @@ impl Modem {
              self.reversed_at = Some(self.now);
              self.silence_at = Some(self.now + self.ms(AFTER_REVERSAL));
          }
@@ -495,7 +532,7 @@ index 2a1b22d..5eeb5ad 100644
          if self.silence_at == Some(self.now) {
              self.silence_at = None;
              self.tx.stop();
-@@ -745,7 +932,17 @@ impl Modem {
+@@ -745,7 +953,17 @@ impl Modem {
                      self.tx.send(&bits);
                  }
              }
@@ -514,7 +551,7 @@ index 2a1b22d..5eeb5ad 100644
                  self.info1c = Some(info1c);
                  // An analogue modem that heard an INFO0d asks for V.90
                  // (9.2.2.1.9); anything else is V.34's INFO1a.
-@@ -776,7 +973,9 @@ impl Modem {
+@@ -776,7 +994,9 @@ impl Modem {
              // 9.2.1.1.8: "the digital modem shall proceed to Phase 3 of the
              // start-up procedure if bits 37:39 of INFO1a indicate the integer
              // 6". A V.34 modem never gets one, since it never sent INFO0d.
@@ -525,7 +562,7 @@ index 2a1b22d..5eeb5ad 100644
                  self.info1a_pcm = Some(asked);
                  self.status = Status::Done;
                  self.enter(Stage::Finished);
-@@ -829,6 +1028,25 @@ impl Modem {
+@@ -829,6 +1049,25 @@ impl Modem {
                  self.probe_at = self.reverse_at.map(|r| r + self.ms(AFTER_REVERSAL));
                  self.enter(Stage::AnswerSendProbe);
              }
@@ -551,7 +588,7 @@ index 2a1b22d..5eeb5ad 100644
              // 11.2.1.2.7: the call modem's reversal before its L1 and L2.
              Stage::AnswerProbeReversal => {
                  let l2 = at + self.ms(AFTER_REVERSAL + probe::L1_SECONDS);
-@@ -851,8 +1069,44 @@ impl Modem {
+@@ -851,8 +1090,44 @@ impl Modem {
              Stage::CallInfo0 => {
                  // 11.2.1.1.2: INFO0a received, and INFO0c gone, so on to the
                  // reversals.
@@ -598,7 +635,19 @@ index 2a1b22d..5eeb5ad 100644
                  }
              }
              Stage::CallFirstReversal => {
-@@ -961,8 +1215,31 @@ impl Modem {
+@@ -923,6 +1198,11 @@ impl Modem {
+                             *slot = reading.probed(rate, &far, wide);
+                         }
+                     }
++                    // V.92's INFO1d: bit 70, the 3429 carrier's place in V.34,
++                    // says the channel carries PCM upstream (Table 17/V.92).
++                    if self.offers_pcm_up && self.v92() {
++                        probed[SymbolRate::S3429.index() as usize].high_carrier = true;
++                    }
+                     let info1c = Info1c {
+                         min_power_reduction: 0,
+                         additional_power_reduction: 0,
+@@ -961,8 +1241,31 @@ impl Modem {
              }
  
              Stage::AnswerInfo0 => {
@@ -632,7 +681,7 @@ index 2a1b22d..5eeb5ad 100644
                  }
              }
              Stage::AnswerAwaitTone => {
-@@ -1047,6 +1324,27 @@ impl Modem {
+@@ -1047,6 +1350,27 @@ impl Modem {
          }
      }
  
@@ -660,15 +709,36 @@ index 2a1b22d..5eeb5ad 100644
      /// V.90's INFO1a (Table 10/V.90): the upstream symbol rate, and the
      /// codeword the digital modem is to train with.
      fn settle_pcm(&self, info1d: &Info1c, far: &Info0d) -> Info1aPcm {
-@@ -1073,6 +1371,8 @@ impl Modem {
+@@ -1068,11 +1392,14 @@ impl Modem {
+             })
+             // 6.2: 3200 is the one every analogue modem has.
+             .unwrap_or(SymbolRate::S3200);
++        let pcm_up = (self.wants_pcm_up && self.v92() && self.pcm_upstream == Some(true)).then_some(PcmUp::ALL);
+         Info1aPcm {
+             md_length: 0,
              uinfo: v90::training_codeword(far),
              upstream,
              frequency_offset: self.reading.as_ref().and_then(|r| r.frequency_offset),
 +            high_carrier: false,
-+            pcm_up: None,
++            pcm_up,
          }
      }
  
+diff --git a/crates/datapump/src/v34/startup.rs b/crates/datapump/src/v34/startup.rs
+index b3a782c..5f7a02b 100644
+--- a/crates/datapump/src/v34/startup.rs
++++ b/crates/datapump/src/v34/startup.rs
+@@ -76,6 +76,10 @@ impl Modem {
+         &self.phase2
+     }
+ 
++    pub fn phase2_mut(&mut self) -> &mut phase2::Modem {
++        &mut self.phase2
++    }
++
+     /// Phases 3 and 4, once phase 2 is over.
+     pub fn training(&self) -> Option<&training::Modem> {
+         self.training.as_ref()
 diff --git a/crates/datapump/src/v8.rs b/crates/datapump/src/v8.rs
 index 52e648b..d5f8c0d 100644
 --- a/crates/datapump/src/v8.rs
@@ -1158,6 +1228,641 @@ index 52e648b..d5f8c0d 100644
      /// Run the two ends against each other, each saying whether it does LAPM.
      fn negotiate_protocol(ours: bool, theirs: bool, seconds: f64) -> (bool, bool) {
          let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS);
+diff --git a/crates/datapump/src/v90/analogue.rs b/crates/datapump/src/v90/analogue.rs
+index 63912b7..84100b0 100644
+--- a/crates/datapump/src/v90/analogue.rs
++++ b/crates/datapump/src/v90/analogue.rs
+@@ -509,6 +509,9 @@ pub struct Settings {
+     /// first phase 2, if its reversal was heard: a retrain's tone B comes at
+     /// the same (8.2), and a tone less than half as loud is not one.
+     pub tone_b_level: Option<f64>,
++    /// V.92: INFO1a asked for PCM upstream (Table 18/V.92), so phases 3 and
++    /// 4 send V.92's upstream signals (see [`crate::v92::up`]).
++    pub pcm_up: bool,
+ }
+ 
+ /// What the rate menu predicts of a downstream rate.
+@@ -567,6 +570,7 @@ impl Settings {
+             v34_receive: 0,
+             pinned: None,
+             tone_b_level: None,
++            pcm_up: asked.pcm_up.is_some(),
+         }
+     }
+ }
+@@ -1417,6 +1421,10 @@ struct Frames {
+     /// Data from frames that looked like Rd, kept back until the next frame
+     /// shows whether Rd is what they were.
+     held: VecDeque<Vec<bool>>,
++    /// V.92 with PCM upstream: SUVd and CPd where V.90 has MP, and whether
++    /// a CPd has come (Ed follows one).
++    v92: Option<crate::v92::finder::Finder>,
++    cpd_seen: bool,
+ }
+ 
+ impl Frames {
+@@ -1445,6 +1453,8 @@ impl Frames {
+             impossible: VecDeque::with_capacity(PLACE_WINDOW),
+             moved,
+             held: VecDeque::new(),
++            v92: None,
++            cpd_seen: false,
+         }
+     }
+ 
+@@ -1482,6 +1492,10 @@ enum Stage {
+ pub struct Modem {
+     settings: Settings,
+     fs: f64,
++    /// V.92's PCM upstream, when INFO1a asked for it: everything this end
++    /// sends from phase 3 on, in place of V.34's upstream.
++    up: Option<crate::v92::up::Upstream>,
++    jp_heard: bool,
+     now: u64,
+     stage: Stage,
+     status: Status,
+@@ -1597,7 +1611,13 @@ impl Modem {
+         // tone from phase 2 can still be arriving, and a tone near 1333 Hz
+         // looks enough like Sd to set a hunt off.
+         let rx = pcm::Receiver::new(settings.law, fs);
++        let up = settings.pcm_up.then(|| {
++            let ja = crate::v92::sequences::descriptor_bits(&descriptor, crate::v92::sequences::ALL_UPSTREAM_RATES);
++            crate::v92::up::Upstream::new(fs, ja, settings.round_trip)
++        });
+         let mut modem = Self {
++            up,
++            jp_heard: false,
+             settings,
+             fs,
+             now: 0,
+@@ -1983,6 +2003,13 @@ impl Modem {
+ 
+     /// Back from data mode to phase 4 (9.6.2.1.1, 9.6.2.2.1).
+     fn begin_renegotiation(&mut self, initiating: bool) {
++        // V.92's renegotiation with PCM upstream (9.8/V.92) is not here: a
++        // retrain does what it would, the long way round.
++        if self.up.is_some() {
++            self.notes.push("a rate renegotiation with PCM upstream: retraining instead".into());
++            self.wants_retrain = true;
++            return;
++        }
+         self.notes.push(
+             if initiating { "rate renegotiation, begun by this end" } else { "rate renegotiation, begun by the digital modem's Rd" }.into(),
+         );
+@@ -2080,11 +2107,18 @@ impl Modem {
+     }
+ 
+     pub fn send_bits(&mut self, bits: &[bool]) {
++        if let Some(up) = self.up.as_mut() {
++            up.send_bits(bits);
++            return;
++        }
+         self.source.data.extend(bits.iter().copied());
+     }
+ 
+     /// Data waiting to go, less what the next mapping frame takes at once.
+     pub fn pending_bits(&self) -> usize {
++        if let Some(up) = self.up.as_ref() {
++            return up.pending_bits();
++        }
+         let frame = self.source.encoder.as_ref().map_or(0, |e| e.params().framing.b);
+         self.source.data.len().saturating_sub(frame)
+     }
+@@ -2170,8 +2204,20 @@ impl Modem {
+             }
+         }
+         self.stage_step();
+-        let source = &mut self.source;
+-        let out = self.tx.next_sample(|| source.next());
++        let out = if let Some(up) = self.up.as_mut() {
++            // V.92's PCM upstream is clocked by the network: once the
++            // downstream receiver has the network's clock, it times the
++            // upstream (8.2/V.92).
++            let clock = self.rx.is_trained().then(|| self.rx.far_clock());
++            let out = up.sample(self.rx.drift_ppm(), clock);
++            if let Some(note) = up.take_began() {
++                self.notes.push(note);
++            }
++            out
++        } else {
++            let source = &mut self.source;
++            self.tx.next_sample(|| source.next())
++        };
+         match self.source.began.take() {
+             Some(Began::Cp(bits)) => {
+                 if let Some(cp) = Cp::from_bits(&bits) {
+@@ -2184,9 +2230,17 @@ impl Modem {
+         out
+     }
+ 
++    /// Whether Ja is what is going up.
++    fn sending_ja(&self) -> bool {
++        match self.up.as_ref() {
++            Some(up) => up.up() == crate::v92::up::Up::Ja,
++            None => self.source.up == Up::Ja,
++        }
++    }
++
+     fn stage_step(&mut self) {
+         match self.stage {
+-            Stage::SendTraining if self.source.up == Up::Ja => {
++            Stage::SendTraining if self.sending_ja() => {
+                 self.stage = Stage::AwaitSd;
+                 self.rx.hunt(self.settings.uinfo);
+                 // 9.3.2.4: S-bar-d within 1500 ms of the start of Ja.
+@@ -2202,12 +2256,16 @@ impl Modem {
+                 // 9.4.2.4: a CP' sent, and MP' or Ed heard: E once the
+                 // current CP' is whole.
+                 let heard_back = !self.awaiting_turn && self.frames.as_ref().is_some_and(|f| f.far_acknowledged || f.ed);
+-                if self.source.up == Up::Cp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
++                if self.up.is_none() && self.source.up == Up::Cp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
+                     self.prepare_upstream();
+                     self.source.change(Up::E);
+                 }
+                 let receiving = self.frames.as_ref().is_some_and(|f| f.data);
+-                if self.status == Status::Running && !self.renegotiating && receiving && self.source.up == Up::Data {
++                let sending = match self.up.as_ref() {
++                    Some(up) => up.in_data(),
++                    None => self.source.up == Up::Data,
++                };
++                if self.status == Status::Running && !self.renegotiating && receiving && sending {
+                     self.status = Status::Connected { downstream: self.downstream_rate, upstream: self.upstream_rate };
+                     self.deadline = None;
+                     self.margin_at = self.samples(MARGIN_SETTLE);
+@@ -2231,6 +2289,9 @@ impl Modem {
+                 if self.stage == Stage::AwaitSd {
+                     // 9.3.2.4: "terminate Ja and transmit silence".
+                     self.source.change(Up::Silence);
++                    if let Some(up) = self.up.as_mut() {
++                        up.end_ja();
++                    }
+                     self.stage = Stage::Training;
+                     self.deadline = Some((self.samples(4.5 + self.settings.round_trip), "no Jd from the digital modem"));
+                 }
+@@ -2245,6 +2306,9 @@ impl Modem {
+                 // and the hunt, while Sd can still come.
+                 self.stage = Stage::AwaitSd;
+                 self.source.change(Up::Ja);
++                if let Some(up) = self.up.as_mut() {
++                    up.resume_ja();
++                }
+                 self.rx.hunt(self.settings.uinfo);
+                 self.deadline = Some(self.sd_deadline);
+             }
+@@ -2268,6 +2332,17 @@ impl Modem {
+         match self.stage {
+             Stage::AwaitJd | Stage::AwaitJdPrime => {
+                 let jd_prime = self.jd.feed(symbol.index, symbol.positive());
++                // V.92: Jp comes the way Jd does, and says so in its bit 47
++                // (9.5.2.1.8).
++                if self.stage == Stage::AwaitJdPrime
++                    && !self.jp_heard
++                    && let Some(up) = self.up.as_mut()
++                    && let Some(jp) = crate::v92::sequences::Jp::from_bits(&self.jd.jd_bits)
++                {
++                    self.jp_heard = true;
++                    up.heard_jp(jp.fraction, jp.eight_in_training);
++                    self.notes.push(format!("found Jp: Su extended by {:.3} of a symbol", jp.fraction));
++                }
+                 let early = (JD_LATEST + S_AFTER_JD - self.settings.round_trip).max(0.0) * digital::FS;
+                 if self.stage == Stage::AwaitJd && !self.sending_s && symbol.raw as f64 >= early {
+                     self.send_s();
+@@ -2318,6 +2393,11 @@ impl Modem {
+     /// S until J'd (9.3.2.7).
+     fn send_s(&mut self) {
+         self.sending_s = true;
++        // V.92: Su, Su-bar for 24.5T and Su until Jp (9.5.2.1.6).
++        if let Some(up) = self.up.as_mut() {
++            up.send_su();
++            return;
++        }
+         self.source.s_length = None;
+         self.source.change(Up::S);
+     }
+@@ -2326,8 +2406,10 @@ impl Modem {
+     /// the frames put where the DIL says they are, and the symbols in
+     /// `already` read as its first.
+     fn begin_dil(&mut self, first: u64, already: &[(u64, f64)]) {
+-        self.source.after_s_bar = Up::Silence;
+-        self.source.change(Up::SBar);
++        if self.up.is_none() {
++            self.source.after_s_bar = Up::Silence;
++            self.source.change(Up::SBar);
++        }
+         self.stage = Stage::Dil;
+         self.dil_base = first as i64;
+         // J'd ends on a frame boundary -- Jd does, and J'd is two frames --
+@@ -2574,12 +2656,18 @@ impl Modem {
+         self.finish_cp(&mut choice.data);
+         self.finish_cp(&mut choice.training);
+         self.downstream_rate = sequences::data_rate(choice.data.drn).unwrap_or(0);
+-        // "S for 128T followed by S-bar for 16T", and phase 4: CPt.
+-        self.source.s_length = Some(signals::S_SYMBOLS);
+-        self.source.after_s_bar = Up::Cp;
+-        self.source.cp = choice.training.to_bits();
+-        self.source.cp_is_ack = false;
+-        self.source.change(Up::S);
++        if let Some(up) = self.up.as_mut() {
++            // V.92: CPt after TRN1u, and CPu ready for phase 4 (9.5.2.1.11).
++            up.send_cpt(&choice.training);
++            up.set_cpu(choice.data.clone());
++        } else {
++            // "S for 128T followed by S-bar for 16T", and phase 4: CPt.
++            self.source.s_length = Some(signals::S_SYMBOLS);
++            self.source.after_s_bar = Up::Cp;
++            self.source.cp = choice.training.to_bits();
++            self.source.cp_is_ack = false;
++            self.source.change(Up::S);
++        }
+         self.route = Some(route);
+         self.choice = Some(choice);
+         // What comes down now is more DIL, and then R: nothing to learn from
+@@ -2631,15 +2719,25 @@ impl Modem {
+             if let RSeen::Turned(from) = seen {
+                 // 9.4.2.2: the current CPt whole, then CP.
+                 self.trn2d_from = Some(from);
+-                self.source.next_cp = Some((choice.data.to_bits(), false));
++                if self.up.is_none() {
++                    self.source.next_cp = Some((choice.data.to_bits(), false));
++                }
+                 let Some(training) = Mapping::from_cp(&choice.training) else {
+                     self.fail("this end's CPt is not a mapping");
+                     return;
+                 };
+                 let levels = levels_for(&choice.training, route);
+-                self.frames = Some(Frames::new(from, training, levels, 0));
++                let mut frames = Frames::new(from, training, levels, 0);
++                if self.up.is_some() {
++                    frames.v92 = Some(crate::v92::finder::Finder::new(crate::v92::finder::Direction::Down));
++                }
++                self.frames = Some(frames);
+             } else if self.r_watch.heard && !was_heard {
+                 self.rx.set_slicer(Slicer::Binary(level));
++                // V.92: Ri heard, so E1u after the current CPt (9.5.2.1.11).
++                if let Some(up) = self.up.as_mut() {
++                    up.heard_ri();
++                }
+             }
+             return;
+         }
+@@ -2768,7 +2866,8 @@ impl Modem {
+         // that took this end into data mode on a dead line. Only frames the
+         // far end's signal carried are Ed.
+         let zeros = bits.iter().all(|b| !*b);
+-        frames.zero_frames = if zeros && carried && frames.mp.is_some() { frames.zero_frames + 1 } else { 0 };
++        frames.zero_frames =
++            if zeros && carried && (frames.mp.is_some() || frames.cpd_seen) { frames.zero_frames + 1 } else { 0 };
+         if frames.zero_frames == 2 {
+             // Ed: B1d next, at data mode's constellation, with the coding
+             // started afresh (8.6.1).
+@@ -2779,6 +2878,9 @@ impl Modem {
+             self.least_gap = dil::least_gap(&choice.data, route);
+             self.downstream_rate = sequences::data_rate(choice.data.drn).unwrap_or(0);
+             self.notes.push(format!("found Ed: B1d next, down at {} bit/s", self.downstream_rate));
++            if let Some(up) = self.up.as_mut() {
++                up.heard_ed();
++            }
+             let Some(data) = Mapping::from_cp(&choice.data) else { return };
+             frames.decoder = Decoder::new(data);
+             frames.levels = levels_for(&choice.data, route);
+@@ -2786,6 +2888,46 @@ impl Modem {
+             self.rx.set_slicer(slicer);
+             return;
+         }
++        if let Some(finder) = frames.v92.as_mut() {
++            let mut found = Vec::new();
++            for &bit in &bits {
++                if let Some(f) = finder.feed(bit) {
++                    found.push(f);
++                }
++            }
++            for f in found {
++                match f {
++                    crate::v92::finder::Found::Suv(suv) => {
++                        if let Some(up) = self.up.as_mut() {
++                            up.heard_suvd(suv);
++                        }
++                    }
++                    crate::v92::finder::Found::Cpd(cpd) => {
++                        if let Some(frames) = self.frames.as_mut() {
++                            frames.cpd_seen = true;
++                        }
++                        if cpd.drn == 0 {
++                            self.cleared_down();
++                            return;
++                        }
++                        if self.up.as_ref().is_some_and(|u| u.cpd().is_none()) {
++                            self.notes.push(format!(
++                                "found CPd: up at {} bit/s, {} coefficients, gain {:.2e}",
++                                cpd.rate().unwrap_or(0),
++                                cpd.filters.as_ref().map_or(0, |f| f.z1.len() + f.p1.len() + f.z2.len() + f.p2.len()),
++                                cpd.gain
++                            ));
++                        }
++                        if let Some(up) = self.up.as_mut() {
++                            up.heard_cpd(cpd);
++                            self.upstream_rate = up.rate().unwrap_or(0);
++                        }
++                    }
++                    crate::v92::finder::Found::Cp(..) => {}
++                }
++            }
++            return;
++        }
+         for bit in bits {
+             if let Some(Found::Mp(mp)) = frames.finder.feed(bit) {
+                 if !frames.told_mps.contains(&mp) {
+diff --git a/crates/datapump/src/v90/digital.rs b/crates/datapump/src/v90/digital.rs
+index 93fd619..859395a 100644
+--- a/crates/datapump/src/v90/digital.rs
++++ b/crates/datapump/src/v90/digital.rs
+@@ -122,6 +122,9 @@ pub struct Settings {
+     /// top rates need.
+     pub wide: bool,
+     pub habits: Habits,
++    /// V.92: INFO1a asked for PCM upstream (Table 18/V.92), and phases 3
++    /// and 4 are V.92's for it (9.5.1, 9.6.1/V.92).
++    pub pcm_up: bool,
+ }
+ 
+ impl Settings {
+@@ -139,6 +142,7 @@ impl Settings {
+             jd: Jd { rates: Jd::ALL_RATES, sixteen_in_training: false, sixteen_in_renegotiation: false, lookahead: 1 },
+             wide,
+             habits: Habits::default(),
++            pcm_up: asked.pcm_up.is_some(),
+         }
+     }
+ }
+@@ -201,6 +205,19 @@ struct Source {
+     r_codes: [u8; INTERVALS],
+     data: VecDeque<bool>,
+     trn1d_symbols: usize,
++    /// V.92 with PCM upstream: phase 4 sends SUVd and CPd where V.90 sends
++    /// MP (8.8/V.92).
++    v92: Option<V92Down>,
++}
++
++/// What the digital modem's phase 4 sends with PCM upstream (9.6.1.1/V.92):
++/// SUVd over and over, one CPd once an SUVu has come, and both acknowledged
++/// once a CPu has.
++#[derive(Debug, Clone, Default)]
++struct V92Down {
++    cpd: Option<crate::v92::sequences::Cpd>,
++    cpd_due: bool,
++    acknowledge: bool,
+ }
+ 
+ impl Source {
+@@ -231,6 +248,7 @@ impl Source {
+             mps_sent: 0,
+             r_codes: [0; INTERVALS],
+             data: VecDeque::new(),
++            v92: None,
+         }
+     }
+ 
+@@ -417,7 +435,21 @@ impl Source {
+                     }
+                 }
+                 let next = self.pending.take();
+-                if next.is_none() {
++                if next.is_none()
++                    && let Some(v92) = self.v92.as_mut()
++                {
++                    // 9.6.1.1.2/V.92: a single CPd after an SUVu, SUVd
++                    // otherwise; acknowledged once a CPu has come.
++                    let bits = match v92.cpd.clone() {
++                        Some(cpd) if v92.cpd_due => {
++                            v92.cpd_due = false;
++                            if v92.acknowledge { cpd.acknowledged() } else { cpd }.to_bits()
++                        }
++                        _ => crate::v92::sequences::Suv { acknowledge: v92.acknowledge, ..Default::default() }.to_bits(false),
++                    };
++                    self.sending_acknowledged = v92.acknowledge;
++                    self.bits.extend(bits);
++                } else if next.is_none() {
+                     // A whole MP, or MP' once the far end's CP has come.
+                     let mp = self.mp.unwrap_or_default();
+                     let mp = if self.mp_ack { mp.acknowledged() } else { mp };
+@@ -535,6 +567,13 @@ pub struct Modem {
+     /// The upstream no faster than this, as a multiple of 2400, from a
+     /// renegotiation this end began.
+     upstream_cap: Option<u8>,
++    /// V.92's PCM upstream: the ear for it, the upstream rates Ja enabled,
++    /// whether an acknowledged CPu or SUVu has come, and whether data mode's
++    /// first frame has.
++    up: Option<crate::v92::server_up::UpReceiver>,
++    up_rates: u32,
++    up_far_ack: bool,
++    up_in_data: bool,
+ }
+ 
+ impl Modem {
+@@ -579,7 +618,15 @@ impl Modem {
+             clearing: false,
+             renegotiations: 0,
+             upstream_cap: None,
++            up: None,
++            up_rates: 0,
++            up_far_ack: false,
++            up_in_data: false,
+         };
++        if settings.pcm_up {
++            modem.up = Some(crate::v92::server_up::UpReceiver::new(settings.law));
++            modem.source.v92 = Some(V92Down::default());
++        }
+         // 9.4.1: B1 "within 15 s plus 5 round-trip delays after receiving
+         // INFO1a".
+         modem.deadline = Some((modem.samples(15.0 + 5.0 * settings.round_trip), "no B1 from the analogue modem"));
+@@ -736,6 +783,9 @@ impl Modem {
+     /// One network sample in, one out.
+     pub fn step(&mut self, input: f64) -> f64 {
+         self.now += 1;
++        if self.up.is_some() {
++            return self.step_pcm_up(input);
++        }
+         self.rx.feed(input);
+         match self.watching() {
+             Some(learn) => {
+@@ -778,6 +828,137 @@ impl Modem {
+         self.source.next()
+     }
+ 
++    /// One network sample with V.92's PCM upstream: the ear in place of
++    /// V.34's receiver, and what it hears driving phases 3 and 4.
++    fn step_pcm_up(&mut self, input: f64) -> f64 {
++        match self.watching() {
++            Some(learn) => {
++                self.far_end.feed(input, learn);
++                if self.far_end.gone() {
++                    self.far_end_went = true;
++                    self.cleared_down();
++                }
++            }
++            None => self.far_end.reset(),
++        }
++        if self.stage != Stage::Finished && self.retrain_watch.feed(input, FS) {
++            self.wants_retrain = true;
++        }
++        let units = crate::v92::receiver::codec_units(self.settings.law);
++        let event = self.up.as_mut().and_then(|up| up.feed(input * units));
++        if let Some(event) = event
++            && self.stage != Stage::Finished
++        {
++            self.heard_pcm_up(event);
++        }
++        if let Some(up) = self.up.as_mut() {
++            self.received.extend(up.take_data());
++        }
++        if let Some((at, _)) = self.deadline
++            && self.now > at
++            && self.status == Status::Running
++        {
++            self.deadline = None;
++            self.wants_retrain = true;
++        }
++        self.stage_step();
++        self.source.next()
++    }
++
++    /// What the PCM upstream ear heard (9.5.1.1, 9.6.1.1/V.92).
++    fn heard_pcm_up(&mut self, event: crate::v92::server_up::Event) {
++        use crate::v92::server_up::Event;
++        match event {
++            Event::RuBar => {}
++            // 9.5.1.1.3: Ja, and Sd after it.
++            Event::Ja(descriptor, rates) => {
++                self.up_rates = rates;
++                self.heard_ja(descriptor);
++            }
++            // 9.5.1.1.8: the phase measured -- here taken as it is -- and Jp
++            // after the current Jd. Jp is Jd's length, and goes out the same
++            // way, over and over.
++            Event::SuTurned => {
++                let jp = crate::v92::sequences::Jp { fraction: 0.0, eight_in_training: false, eight_in_renegotiation: false };
++                self.source.jd = jp.to_bits();
++                self.s_deadline = None;
++            }
++            // 9.5.1.1.9: the current Jp, then Jp' and the DIL.
++            Event::SuTurnedAgain => self.s_heard = true,
++            // 9.5.1.1.12: CPt, so Ri once the DIL is at a segment's end.
++            Event::Cpt(cpt) => {
++                if self.cpt.is_none() {
++                    let Some(training) = Mapping::from_cp(&cpt) else {
++                        self.fail("the analogue modem's CPt is not one this end can send");
++                        return;
++                    };
++                    self.source.training = Some(training);
++                    self.source.change(Out::Ri);
++                    self.cpt = Some(cpt);
++                    self.stage = Stage::Phase4Cpt;
++                }
++            }
++            // E1u ended CPt: Ri-bar, TRN2d, and phase 4.
++            Event::Trn2u => {
++                self.source.change(Out::RiBar);
++                self.stage = Stage::Phase4Cp;
++            }
++            Event::Suv(suv) => {
++                self.up_far_ack |= suv.acknowledge;
++                self.design_cpd();
++            }
++            Event::Cpu(kind, cp) => {
++                self.up_far_ack |= cp.acknowledge;
++                if kind == crate::v92::sequences::CpKind::Data {
++                    if cp.drn == 0 {
++                        self.cleared_down();
++                        return;
++                    }
++                    let Some(data_mode) = Mapping::from_cp(&cp) else {
++                        self.fail("the analogue modem's CPu is not one this end can send");
++                        return;
++                    };
++                    self.source.data_mode = Some(data_mode);
++                    self.cp = Some(cp);
++                }
++                self.design_cpd();
++                if let Some(v92) = self.source.v92.as_mut() {
++                    v92.acknowledge = true;
++                }
++            }
++            // 9.6.1.1.6: E2u, then B1u and data.
++            Event::E2u => {
++                self.far_e = true;
++                self.stage = Stage::Data;
++            }
++            Event::InData => self.up_in_data = true,
++        }
++    }
++
++    /// 9.6.1.1.2/V.92: a CPd for what the second TRN1u taught, once.
++    fn design_cpd(&mut self) {
++        let Some(v92) = self.source.v92.as_mut() else { return };
++        if v92.cpd.is_some() {
++            return;
++        }
++        let Some(training) = self.up.as_ref().and_then(|up| up.training()).cloned() else { return };
++        let Some(cpd) = crate::v92::server_up::design_cpd(&training, self.settings.law, self.up_rates) else {
++            self.fail("no upstream rate the line carries");
++            return;
++        };
++        let Some(params) = cpd.params() else {
++            self.fail("this end's CPd does not make a transmitter");
++            return;
++        };
++        self.upstream_rate = params.rate();
++        if let Some(up) = self.up.as_mut() {
++            up.set_params(params);
++        }
++        let v92 = self.source.v92.as_mut().expect("checked");
++        v92.cpd = Some(cpd);
++        v92.cpd_due = true;
++    }
++
+     /// From data mode to Rd (9.6.1.1.1, 9.6.1.2.2), and phase 4 after it.
+     ///
+     /// The answering end starts on S rather than on S turning into S-bar,
+@@ -869,7 +1050,7 @@ impl Modem {
+             }
+             Stage::Phase4Cp => {
+                 // 9.4.1.4: an MP' sent, and CP' or E heard.
+-                let heard_back = self.cp.as_ref().is_some_and(|cp| cp.acknowledge) || self.far_e;
++                let heard_back = self.cp.as_ref().is_some_and(|cp| cp.acknowledge) || self.far_e || self.up_far_ack;
+                 if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
+                     self.source.change(Out::Ed);
+                 }
+@@ -879,7 +1060,7 @@ impl Modem {
+                     && !self.renegotiating
+                     && self.source.out == Out::Data
+                     && self.b1_left == 0
+-                    && self.decoder.is_some()
++                    && (self.decoder.is_some() || self.up_in_data)
+                 {
+                     let downstream = self.cp.as_ref().and_then(|cp| sequences::data_rate(cp.drn)).unwrap_or(0);
+                     self.status = Status::Connected { downstream, upstream: self.upstream_rate };
+diff --git a/crates/datapump/src/v90/pcm.rs b/crates/datapump/src/v90/pcm.rs
+index 07e40b0..f0962dc 100644
+--- a/crates/datapump/src/v90/pcm.rs
++++ b/crates/datapump/src/v90/pcm.rs
+@@ -653,6 +653,17 @@ impl Receiver {
+         self.drift * 1e6
+     }
+ 
++    /// Where the far clock is now, in its symbols since this receiver began:
++    /// the half-symbol samples taken, and how far the line has gone towards
++    /// the next. It moves as the timing loop does, so a transmitter timed by
++    /// it keeps to the network's clock (V.92's PCM upstream must, 8.2/V.92)
++    /// however this end's runs. It is late by the interpolator's reach, which
++    /// is a fixed delay and so no matter.
++    pub fn far_clock(&self) -> f64 {
++        let ahead = (self.due - self.taken as f64) / (self.half * (1.0 + self.drift));
++        (self.made as f64 - ahead) / 2.0
++    }
++
+     /// The equaliser, for looking at.
+     pub fn taps(&self) -> &[f64] {
+         &self.taps
 diff --git a/crates/datapump/src/v90/sequences.rs b/crates/datapump/src/v90/sequences.rs
 index c944e9f..190e716 100644
 --- a/crates/datapump/src/v90/sequences.rs
@@ -1244,7 +1949,7 @@ index af7d8a0..1461480 100644
  }
  
 diff --git a/crates/datapump/src/v90/startup.rs b/crates/datapump/src/v90/startup.rs
-index a31b259..474fc05 100644
+index a31b259..765f659 100644
 --- a/crates/datapump/src/v90/startup.rs
 +++ b/crates/datapump/src/v90/startup.rs
 @@ -12,7 +12,8 @@
@@ -1257,7 +1962,18 @@ index a31b259..474fc05 100644
  use crate::v34::startup as v34;
  
  use super::ucode::Law;
-@@ -54,6 +55,9 @@ pub struct Analogue {
+@@ -22,6 +23,10 @@ use super::{analogue, digital};
+ /// asks for V.34 instead.
+ const V90_RETRAINS: u32 = 2;
+ 
++/// Start-ups with V.92's PCM upstream that may fail before the upstream is
++/// V.34's instead.
++const PCM_UP_TRIES: u32 = 2;
++
+ /// How the start-up is going.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Status {
+@@ -54,6 +59,9 @@ pub struct Analogue {
      /// The rate every V.90 start-up on this call asks for, as its drn, or
      /// None for the DIL's own choice (see [`analogue::Settings::pinned`]).
      pinned: Option<u8>,
@@ -1267,7 +1983,7 @@ index a31b259..474fc05 100644
  }
  
  impl Analogue {
-@@ -70,9 +74,39 @@ impl Analogue {
+@@ -70,9 +78,51 @@ impl Analogue {
              holes: 0,
              notes: Vec::new(),
              pinned: None,
@@ -1275,7 +1991,19 @@ index a31b259..474fc05 100644
          }
      }
  
-+    /// V.90's analogue modem, saying nothing of V.92 in phase 2: the start-up
++    /// Ask for V.92's PCM upstream when the digital modem offers it
++    /// (Table 18/V.92).
++    pub fn with_pcm_upstream(mut self) -> Self {
++        self.v34.phase2_mut().set_wants_pcm_up(true);
++        self
++    }
++
++    /// Whether the upstream is V.92's PCM.
++    pub fn pcm_upstream(&self) -> bool {
++        self.v34.phase2().info1a_pcm().is_some_and(|a| a.pcm_up.is_some())
++    }
++
++        /// V.90's analogue modem, saying nothing of V.92 in phase 2: the start-up
 +    /// as it was before V.92 was added.
 +    pub fn v90_only(fs: f64) -> Self {
 +        let mut modem = Self::new(fs);
@@ -1307,7 +2035,26 @@ index a31b259..474fc05 100644
      /// The rate V.90 start-ups are to ask for, as its drn, or None for the
      /// DIL's own choice: from the window, before the call. This start-up's
      /// too, if its DIL has not yet been read.
-@@ -301,12 +335,31 @@ impl Analogue {
+@@ -283,9 +333,18 @@ impl Analogue {
+                 analogue::Status::Failed(why) => {
+                     // 9.5.2.1: back to V.90's phase 2.
+                     let hopeless = m.route().is_some() && m.choice().is_none();
++                    let pcm_up = self.pcm_upstream();
+                     self.last_failure = Some(why);
+                     self.failed_starts += 1;
+                     self.back_to_phase2();
++                    if pcm_up && self.failed_starts >= PCM_UP_TRIES {
++                        // V.92's PCM upstream asks more of the line and the
++                        // clocks than V.34's: after this many start-ups that
++                        // did not come up with it, V.34's upstream under
++                        // V.90's downstream (Table 18/V.92: not asking).
++                        self.notes.push("V.34 upstream next time round, not V.92's PCM upstream".into());
++                        self.v34.phase2_mut().set_wants_pcm_up(false);
++                    }
+                     if hopeless || self.failed_starts > V90_RETRAINS {
+                         // 9.2.2.1.9: this time, V.34's INFO1a.
+                         self.notes.push("V.34 next time round, not V.90".into());
+@@ -301,12 +360,31 @@ impl Analogue {
              self.connected_once = true;
          }
          let p2 = self.v34.phase2();
@@ -1341,7 +2088,7 @@ index a31b259..474fc05 100644
              settings.v34_receive = p2.v34_receive_rate().unwrap_or(0);
              settings.pinned = self.pinned;
              // The call's first phase 2's, which every retrain's phase 2 is
-@@ -345,7 +398,7 @@ impl Digital {
+@@ -345,7 +423,7 @@ impl Digital {
          let phase2_gain = 10f64.powf((info0d.nominal_dbm0() - 3.17) / 20.0);
          Self {
              law,
@@ -1350,7 +2097,7 @@ index a31b259..474fc05 100644
              v90: None,
              phase2_gain,
              failed_starts: 0,
-@@ -355,7 +408,18 @@ impl Digital {
+@@ -355,7 +433,18 @@ impl Digital {
          }
      }
  
@@ -1370,7 +2117,7 @@ index a31b259..474fc05 100644
      pub fn with_habits(mut self, habits: digital::Habits) -> Self {
          self.habits = habits;
          self
-@@ -534,9 +598,17 @@ impl Digital {
+@@ -534,9 +623,17 @@ impl Digital {
              self.connected_once = true;
          }
          let p2 = self.v34.phase2();
@@ -1526,10 +2273,10 @@ index 0000000..37432b2
 +}
 diff --git a/crates/datapump/src/v92/line.rs b/crates/datapump/src/v92/line.rs
 new file mode 100644
-index 0000000..174bdfe
+index 0000000..48e392d
 --- /dev/null
 +++ b/crates/datapump/src/v92/line.rs
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,335 @@
 +//! The PCM upstream on a line: symbols at the network's 8000 a second, put
 +//! out at the sound card's rate where the far codec will sample them.
 +//!
@@ -1580,11 +2327,34 @@ index 0000000..174bdfe
 +    symbols: VecDeque<f64>,
 +    /// Symbols pulled from the source so far.
 +    pulled: i64,
++    /// Where `t` is against the far clock it follows, once it does.
++    offset: Option<f64>,
++    /// Line samples the far clock has been followed for.
++    calls: u64,
 +}
++
++/// How hard the line is pulled towards the far clock, in phase, a line
++/// sample: hard at first, so that it has the far clock's rate well before the
++/// second TRN1u the digital modem trains its ear on, then gently -- the clock
++/// moves with every correction the downstream timing loop makes, and that is
++/// noise here. The rate is integrated with gain half the square of that, a
++/// loop damped at 0.7, so that a sound card some ppm off the network is
++/// followed with no lag at all once it has settled.
++fn phase_gain(calls: u64) -> f64 {
++    match calls {
++        0..2400 => 4e-3,
++        2400..8000 => 1.5e-3,
++        _ => 5e-4,
++    }
++}
++
++/// A far clock this far from where it is followed has jumped -- the receiver
++/// retrained or found its place again -- and is taken up where it now is.
++const JUMP: f64 = 2.0;
 +
 +impl UpLine {
 +    pub fn new(fs: f64) -> Self {
-+        Self { fs, step: BAUD / fs, t: 0.0, base: -HALF, symbols: VecDeque::from(vec![0.0; HALF as usize]), pulled: 0 }
++        Self { fs, step: BAUD / fs, t: 0.0, base: -HALF, symbols: VecDeque::from(vec![0.0; HALF as usize]), pulled: 0, offset: None, calls: 0 }
 +    }
 +
 +    /// Follow the network's clock: `ppm` is how far the sound card runs off
@@ -1599,6 +2369,33 @@ index 0000000..174bdfe
 +    /// "extended" by Jp's fraction (9.5.2.1.8/V.92).
 +    pub fn extend(&mut self, fraction: f64) {
 +        self.t -= fraction;
++        if let Some(offset) = self.offset.as_mut() {
++            *offset -= fraction;
++        }
++    }
++
++    /// Keep to the far clock: `clock` is where the downstream receiver has
++    /// the network's symbols at this line sample. The first call takes the
++    /// line as it is against it; after that the line is drawn to keep there,
++    /// so that the digital modem's codec takes every symbol where training
++    /// found it, however long the call.
++    pub fn follow(&mut self, clock: f64) {
++        let offset = *self.offset.get_or_insert(self.t - clock);
++        let error = clock + offset - self.t;
++        self.calls += 1;
++        if error.abs() > JUMP {
++            self.offset = Some(self.t - clock);
++            self.calls = 0;
++            return;
++        }
++        let gain = phase_gain(self.calls);
++        self.t += gain * error;
++        self.step += 0.5 * gain * gain * error;
++    }
++
++    /// Whether the far clock is being followed.
++    pub fn following(&self) -> bool {
++        self.offset.is_some()
 +    }
 +
 +    /// Symbols pulled from the source so far: the next is this one.
@@ -1833,10 +2630,10 @@ index 0000000..42f0bde
 +pub mod server_up;
 diff --git a/crates/datapump/src/v92/receiver.rs b/crates/datapump/src/v92/receiver.rs
 new file mode 100644
-index 0000000..d40900d
+index 0000000..cf01e4e
 --- /dev/null
 +++ b/crates/datapump/src/v92/receiver.rs
-@@ -0,0 +1,542 @@
+@@ -0,0 +1,548 @@
 +//! The digital modem's PCM upstream receiver: what the codec made of the
 +//! analogue modem's waveform, one level every 125 microseconds, read back
 +//! into what was sent (9.5.1, 9.6.1/V.92).
@@ -1910,15 +2707,21 @@ index 0000000..d40900d
 +            return None;
 +        }
 +        let agreement = cross / power;
-+        if agreement > 0.8 {
++        // Su is small, and the codec's quantising and the line's smearing
++        // leave a clean Su agreeing only to about 0.8 with itself, and its
++        // turn disagreeing to about as much: so 0.6 either way.
++        if agreement > 0.6 {
 +            self.agreeing += 1;
 +            return None;
 +        }
 +        // Ru for a good while, then the six just in disagree with the six
 +        // before: Ru-bar began six symbols ago. Partway through the turn the
-+        // agreement passes zero, which says nothing either way.
-+        if agreement < -0.8 {
-+            let found = (self.agreeing >= 120).then(|| n - 6);
++        // agreement passes zero, which says nothing either way. "A good
++        // while" is short of Su's 144T, less the twelve symbols compared and
++        // the line's settling after silence: asked for 120, a turn could go
++        // unseen by a symbol or two, and then nothing turns again.
++        if agreement < -0.6 {
++            let found = (self.agreeing >= 96).then(|| n - 6);
 +            self.agreeing = 0;
 +            return found;
 +        }
@@ -2996,10 +3799,10 @@ index 0000000..8a4e179
 +}
 diff --git a/crates/datapump/src/v92/server_up.rs b/crates/datapump/src/v92/server_up.rs
 new file mode 100644
-index 0000000..dcfc418
+index 0000000..cfd564d
 --- /dev/null
 +++ b/crates/datapump/src/v92/server_up.rs
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,549 @@
 +//! The digital modem's ear for PCM upstream through phases 3 and 4 and data
 +//! mode (9.5.1, 9.6.1/V.92): what it hears, as events for its start-up to
 +//! act on.
@@ -3021,7 +3824,7 @@ index 0000000..dcfc418
 +use super::finder::{Direction, Finder, Found};
 +use super::receiver::{self, Equaliser, RuFinder, SignReader, Trn2Reader, Training, REACH, TRAIN_OVER};
 +use super::sequences::{self, CpKind, Cpd, Suv};
-+use super::transmitter::{Decoder, FRAME, Params};
++use super::transmitter::{Decoder, FRAME, Params, Viterbi};
 +use crate::v32::{Mode, Scrambler};
 +
 +/// What was heard.
@@ -3101,7 +3904,7 @@ index 0000000..dcfc418
 +    /// Data: the transmitter's parameters, where B1u begins, and the decoder.
 +    params: Option<Params>,
 +    b1u_from: Option<usize>,
-+    decoder: Option<Decoder>,
++    decoder: Option<Viterbi>,
 +    descrambler: Scrambler,
 +    data: Vec<bool>,
 +}
@@ -3372,13 +4175,13 @@ index 0000000..dcfc418
 +                    }
 +                }
 +                if ok >= 4 {
-+                    let mut decoder = Decoder::new(params.clone());
++                    let mut decoder = Viterbi::new(params.clone());
 +                    let mut descrambler = Scrambler::new(Mode::Answer);
 +                    // Decode up to here again, so both are where the line is.
 +                    let mut at = from + offset;
 +                    while at + FRAME <= self.levels.len() {
 +                        let levels: [f64; FRAME] = std::array::from_fn(|i| self.levels[at + i]);
-+                        for b in decoder.frame(&decoder.slice(&levels)) {
++                        for b in decoder.frame(&levels).into_iter().flatten() {
 +                            descrambler.descramble(b);
 +                        }
 +                        at += FRAME;
@@ -3399,13 +4202,18 @@ index 0000000..dcfc418
 +        while self.next + FRAME <= self.levels.len() {
 +            let levels: [f64; FRAME] = std::array::from_fn(|i| self.levels[self.next + i]);
 +            let decoder = self.decoder.as_mut()?;
-+            let bits = decoder.frame(&decoder.slice(&levels));
++            let bits = decoder.frame(&levels).unwrap_or_default();
 +            self.data.extend(bits.into_iter().map(|b| self.descrambler.descramble(b)));
 +            self.next += FRAME;
 +        }
 +        None
 +    }
 +}
++
++/// How far apart the constellation's points are, in the noise TRN1u left.
++const SPACING: f64 = 6.5;
++/// How far up the constellation goes, in TRN1u's level.
++const CEILING: f64 = 3.0;
 +
 +/// The CPd for data mode from what the second TRN1u taught (Table 30/V.92):
 +/// the prefilter and precoder, the gain, constellations of codec levels
@@ -3414,7 +4222,11 @@ index 0000000..dcfc418
 +pub fn design_cpd(training: &Training, law: Law, enabled: u32) -> Option<Cpd> {
 +    let (filters, gain) = training.design();
 +    let noise = training.error.sqrt() * training.level;
-+    let points = receiver::constellation(law, (8.0 * noise).max(16.0), 2.0 * training.level);
++    // Points 6.5 times the noise apart: with the trellis followed by
++    // Viterbi's algorithm, comfortably clear (5 is not, on the lines tried);
++    // and up to three times TRN1u's level, which keeps the line's power
++    // within a few dB of TRN1u's.
++    let points = receiver::constellation(law, (SPACING * noise).max(16.0), CEILING * training.level);
 +    let n = 2 * points.positive.len();
 +    // drn 1 is 24 000: (drn + 17) * 8000/6.
 +    let (drn, moduli) = (1..=19u8).rev().find_map(|drn| {
@@ -3470,7 +4282,7 @@ index 0000000..dcfc418
 +            let level = net.up(&upsamples) * full;
 +            upsamples.clear();
 +            for _ in net.down(0.0) {
-+                upsamples.push(up.sample(0.0));
++                upsamples.push(up.sample(0.0, None));
 +            }
 +            // What the downstream would make the analogue modem do, a little
 +            // after the digital modem acts.
@@ -3542,10 +4354,10 @@ index 0000000..dcfc418
 +}
 diff --git a/crates/datapump/src/v92/transmitter.rs b/crates/datapump/src/v92/transmitter.rs
 new file mode 100644
-index 0000000..8041c06
+index 0000000..d471048
 --- /dev/null
 +++ b/crates/datapump/src/v92/transmitter.rs
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,698 @@
 +//! V.92's PCM upstream transmitter (6.4/V.92), and its inverse.
 +//!
 +//! ```text
@@ -3571,6 +4383,8 @@ index 0000000..8041c06
 +//! (Table 30/V.92): the moduli, the four filters, the gain, the
 +//! constellations and the trellis code. [`Decoder`] is the digital modem's
 +//! side of the same, for a server to be tested against.
++
++use std::collections::VecDeque;
 +
 +use crate::v34::trellis::{self, Code};
 +
@@ -3728,8 +4542,10 @@ index 0000000..8041c06
 +            r0 = r0 * u128::from(mi) + u128::from(ki);
 +        }
 +        let r = if self.previous { (m - 1).saturating_sub(r0) } else { r0 };
-+        let s = r > (m - 1) / 2;
-+        self.previous = s ^ self.previous;
++        // d(f) is in R0 itself: R0 is past the middle exactly when d(f) is 1,
++        // the middle itself (M odd) keeping d(f - 1). So a frame read wrong
++        // spoils the next one at most, not every one after it.
++        self.previous = 2 * r0 > m - 1 || (2 * r0 == m - 1 && self.previous);
 +        (0..bits).map(|i| r >> i & 1 == 1).collect()
 +    }
 +}
@@ -3952,6 +4768,151 @@ index 0000000..8041c06
 +    }
 +}
 +
++/// The digital modem's side, as it should be: the trellis followed by
++/// Viterbi's algorithm over what the codec delivered, so that a point read
++/// wrong is put right by the code -- and, above all, does not leave the
++/// receiver in the wrong state of a recursive code for good, as reading the
++/// trellis off hard decisions does.
++///
++/// Each symbol's candidates are the nearest point of each index modulo 4,
++/// which is all the labelling (2y + 1 modulo 8) can tell apart; a trellis
++/// frame's must add up to Y0 of the state it begins in, modulo 2.
++#[derive(Debug, Clone)]
++pub struct Viterbi {
++    params: Params,
++    modulus: ModulusDecoder,
++    /// The path metric into each state.
++    metrics: Vec<f64>,
++    /// Per trellis frame not yet given out: for each state, the state it
++    /// came from and the four indices that took it there.
++    history: VecDeque<Vec<(u8, [i64; TRELLIS])>>,
++}
++
++/// Trellis frames held before the oldest is taken as decided: 24, or 96
++/// symbols, far past where paths of a 16 to 64 state code have merged.
++const DEPTH: usize = 24;
++
++impl Viterbi {
++    pub fn new(params: Params) -> Self {
++        let states = params.code.states();
++        let mut metrics = vec![f64::INFINITY; states];
++        // "initialized to zero prior to transmitting B1u".
++        metrics[0] = 0.0;
++        Self { params, modulus: ModulusDecoder::new(), metrics, history: VecDeque::new() }
++    }
++
++    /// The nearest point of each index modulo 4 to `level`, in interval `i`.
++    fn candidates(&self, i: usize, level: f64) -> [(i64, f64); 4] {
++        let constellation = &self.params.constellations[i];
++        let half = constellation.len() / 2;
++        let centre = constellation.nearest(level);
++        let mut best = [(0i64, f64::INFINITY); 4];
++        for eta in (centre - 4).max(-half)..=(centre + 4).min(half - 1) {
++            let e = level - constellation.point(eta);
++            let slot = &mut best[eta.rem_euclid(4) as usize];
++            if e * e < slot.1 {
++                *slot = (eta, e * e);
++            }
++        }
++        best
++    }
++
++    /// One trellis frame, `t` of the data frame's three.
++    fn step(&mut self, t: usize, levels: &[f64]) {
++        let code = self.params.code;
++        let odd = |v: i64| (2 * v + 1) as i32;
++        let c: Vec<[(i64, f64); 4]> = (0..TRELLIS).map(|j| self.candidates(t * TRELLIS + j, levels[j])).collect();
++        // The best four for each parity and set of inputs to the code.
++        let mut groups: [[Option<(f64, [i64; TRELLIS])>; 16]; 2] = [[None; 16]; 2];
++        for a in c[0] {
++            for b in c[1] {
++                let first = trellis::label((odd(a.0), odd(b.0)));
++                for x in c[2] {
++                    for y in c[3] {
++                        let metric = a.1 + b.1 + x.1 + y.1;
++                        if !metric.is_finite() {
++                            continue;
++                        }
++                        let parity = (a.0 + b.0 + x.0 + y.0).rem_euclid(2) as usize;
++                        let second = trellis::label((odd(x.0), odd(y.0)));
++                        let inputs = (trellis::convert(first, second) & code.inputs()) as usize;
++                        let slot = &mut groups[parity][inputs];
++                        if slot.is_none_or(|(m, _)| metric < m) {
++                            *slot = Some((metric, [a.0, b.0, x.0, y.0]));
++                        }
++                    }
++                }
++            }
++        }
++        let states = code.states();
++        let mut next = vec![f64::INFINITY; states];
++        let mut came = vec![(0u8, [0i64; TRELLIS]); states];
++        for (state, &metric) in self.metrics.iter().enumerate() {
++            if !metric.is_finite() {
++                continue;
++            }
++            let parity = usize::from(code.output(state as u8));
++            for (inputs, group) in groups[parity].iter().enumerate() {
++                let Some((m, etas)) = group else { continue };
++                let to = code.next(state as u8, inputs as u8) as usize;
++                if metric + m < next[to] {
++                    next[to] = metric + m;
++                    came[to] = (state as u8, *etas);
++                }
++            }
++        }
++        // Keep the numbers small.
++        let least = next.iter().copied().fold(f64::INFINITY, f64::min);
++        if least.is_finite() {
++            for m in &mut next {
++                *m -= least;
++            }
++        }
++        self.metrics = next;
++        self.history.push_back(came);
++    }
++
++    /// One data frame of levels, already divided by the gain and freed of
++    /// the line's own filtering. The bits of the data frame DEPTH trellis
++    /// frames back come out, once there is one.
++    pub fn frame(&mut self, levels: &[f64; FRAME]) -> Option<Vec<bool>> {
++        for t in 0..FRAME / TRELLIS {
++            self.step(t, &levels[t * TRELLIS..(t + 1) * TRELLIS]);
++        }
++        let per = FRAME / TRELLIS;
++        if self.history.len() < DEPTH + per {
++            return None;
++        }
++        // Back from the best state to the oldest data frame held.
++        let mut state = (0..self.metrics.len()).min_by(|&a, &b| self.metrics[a].total_cmp(&self.metrics[b])).unwrap_or(0);
++        let mut path = Vec::with_capacity(self.history.len());
++        for came in self.history.iter().rev() {
++            let (from, etas) = came[state];
++            path.push((from, etas));
++            state = from as usize;
++        }
++        path.reverse();
++        let mut k = [0u32; FRAME];
++        for (t, (from, etas)) in path[..per].iter().enumerate() {
++            let y0 = self.params.code.output(*from);
++            for (slot, &eta) in etas.iter().enumerate() {
++                let i = t * TRELLIS + slot;
++                let m = i64::from(self.params.moduli[i]);
++                k[i] = if slot == 3 {
++                    let p = parity(&etas[..3], y0);
++                    ((eta - p).div_euclid(2)).rem_euclid(m) as u32
++                } else {
++                    eta.rem_euclid(m) as u32
++                };
++            }
++        }
++        for _ in 0..per {
++            self.history.pop_front();
++        }
++        Some(self.modulus.decode(&k, &self.params.moduli, self.params.bits))
++    }
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
@@ -4097,10 +5058,10 @@ index 0000000..8041c06
 +}
 diff --git a/crates/datapump/src/v92/up.rs b/crates/datapump/src/v92/up.rs
 new file mode 100644
-index 0000000..3d257f4
+index 0000000..f695371
 --- /dev/null
 +++ b/crates/datapump/src/v92/up.rs
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,546 @@
 +//! What the analogue modem sends upstream when PCM upstream was asked for:
 +//! V.92's phase 3, phase 4 and data mode, one symbol at a time (9.5.2,
 +//! 9.6.2/V.92).
@@ -4260,8 +5221,16 @@ index 0000000..3d257f4
 +
 +    /// One line sample: `drift` is how far the sound card runs off the
 +    /// network's clock, in ppm, as the downstream receiver has it.
-+    pub fn sample(&mut self, drift: f64) -> f64 {
-+        self.line.set_drift(drift);
++    ///
++    /// `clock`, once the downstream receiver has trained, is where it has
++    /// the network's symbols at this sample, and the upstream keeps to it;
++    /// `drift` is used until then.
++    pub fn sample(&mut self, drift: f64, clock: Option<f64>) -> f64 {
++        match clock {
++            Some(clock) => self.line.follow(clock),
++            None if !self.line.following() => self.line.set_drift(drift),
++            None => {}
++        }
 +        let mut line = std::mem::replace(&mut self.line, UpLine::new(1.0));
 +        let out = line.sample(|| self.next());
 +        line.extend(std::mem::take(&mut self.stretch));
@@ -4280,7 +5249,12 @@ index 0000000..3d257f4
 +        self.pending = Some(Up::Silence);
 +    }
 +
-+    /// 9.5.2.1.6: Jd read: Su for 144T, Su-bar for 24.5T, then Su until Jp.
++    /// Ja again: what Sd set off was not Sd.
++    pub fn resume_ja(&mut self) {
++        self.pending = Some(Up::Ja);
++    }
++
++        /// 9.5.2.1.6: Jd read: Su for 144T, Su-bar for 24.5T, then Su until Jp.
 +    pub fn send_su(&mut self) {
 +        if !matches!(self.up, Up::Su | Up::SuBar) {
 +            self.pending = Some(Up::Su);
@@ -4658,10 +5632,10 @@ index 36d0d26..af609df 100644
          digital::Settings::new(Law::Mu, &info1d, &asked, 0.02, true),
 diff --git a/crates/datapump/tests/v92_quick.rs b/crates/datapump/tests/v92_quick.rs
 new file mode 100644
-index 0000000..a21091f
+index 0000000..2265533
 --- /dev/null
 +++ b/crates/datapump/tests/v92_quick.rs
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,195 @@
 +//! V.92's short Phase 2 (9.4/V.92) between the two modems here: a full
 +//! start-up with a V.92 server first, which is what the analogue modem
 +//! learns the upstream from, then a start-up asking for the short Phase 2
@@ -4697,11 +5671,16 @@ index 0000000..a21091f
 +/// Run until both ends are in data mode, and say how long it took in
 +/// seconds, or None if either failed or `limit` ran out.
 +fn run(analogue: &mut Analogue, digital: &mut Digital, mut net: Network, limit: f64) -> Option<f64> {
-+    let mut up = Vec::new();
++    run_on(analogue, digital, &mut net, &mut Vec::new(), limit)
++}
++
++/// The same on a network and with the analogue modem's samples not yet sent
++/// up kept by the caller, so that a test can go on from where this stops.
++fn run_on(analogue: &mut Analogue, digital: &mut Digital, net: &mut Network, up: &mut Vec<f64>, limit: f64) -> Option<f64> {
 +    let mut ticks = 0u64;
 +    let mut last = (String::new(), String::new());
 +    while (ticks as f64) < limit * 8000.0 {
-+        let to_digital = net.up(&up);
++        let to_digital = net.up(up);
 +        up.clear();
 +        let from_digital = digital.step(to_digital);
 +        for x in net.down(from_digital) {
@@ -4769,8 +5748,91 @@ index 0000000..a21091f
 +    run(&mut analogue, &mut digital, line(), 40.0).expect("did not connect");
 +    assert!(!analogue.short_phase2() && !digital.v34().phase2().was_short());
 +}
++
++/// V.92's PCM upstream: a full start-up asking for it of a V.92 server that
++/// offers it, then `seconds` of data both ways, every bit checked.
++fn pcm_upstream_call(mut net: Network, seconds: f64) {
++    let mut analogue = Analogue::new(FS).with_pcm_upstream();
++    let mut digital = Digital::new(v92_server());
++    let mut up = Vec::new();
++    let connected = run_on(&mut analogue, &mut digital, &mut net, &mut up, 40.0);
++    println!("notes: {:?}", analogue.take_notes());
++    let connected = connected.expect("did not connect");
++    assert!(analogue.pcm_upstream(), "PCM upstream was not asked for");
++    let Status::Connected { transmit, receive } = analogue.status() else { unreachable!() };
++    println!("connected in {connected:.2} s: {receive} down, {transmit} up");
++    let mut x = 0x1234_5678_9abc_def1u64;
++    let mut random = |n: usize| -> Vec<bool> {
++        (0..n)
++            .map(|_| {
++                x ^= x << 13;
++                x ^= x >> 7;
++                x ^= x << 17;
++                x & 1 == 1
++            })
++            .collect()
++    };
++    // Rather less than either way carries, so that all of it arrives.
++    let up_sent = random((f64::from(transmit) * (seconds - 0.5)) as usize);
++    let down_sent = random((f64::from(receive) * (seconds - 0.5)) as usize);
++    analogue.send_bits(&up_sent);
++    digital.send_bits(&down_sent);
++    let (mut up_got, mut down_got) = (Vec::new(), Vec::new());
++    for _ in 0..(seconds * 8000.0) as usize {
++        let to_digital = net.up(&up);
++        up.clear();
++        let from_digital = digital.step(to_digital);
++        for x in net.down(from_digital) {
++            up.push(analogue.step(x));
++        }
++        up_got.extend(digital.take_bits());
++        down_got.extend(analogue.take_bits());
++        for note in analogue.take_notes() {
++            println!("analogue, {:.2} s into data: {note}", up_got.len() as f64 / f64::from(transmit));
++        }
++    }
++    assert!(matches!(analogue.status(), Status::Connected { .. }), "the analogue modem left data mode: {:?}", analogue.status());
++    let check = |name: &str, sent: &[bool], got: &[bool]| {
++        let window = 256;
++        let at = (0..got.len().saturating_sub(window)).find(|&i| got[i..i + window] == sent[..window]);
++        let at = at.unwrap_or_else(|| panic!("{name}: the data was not found in {} bits", got.len()));
++        let n = (got.len() - at).min(sent.len());
++        let wrong = got[at..at + n].iter().zip(sent).filter(|(a, b)| a != b).count();
++        println!("{name}: {n} bits, {wrong} wrong");
++        if wrong > 0 {
++            let chunk = n / 30;
++            let e: Vec<usize> = (0..30).map(|c| got[at + c * chunk..at + (c + 1) * chunk].iter().zip(&sent[c * chunk..]).filter(|(a, b)| a != b).count()).collect();
++            println!("{name} errors by {chunk}: {e:?}");
++        }
++        assert!(n == sent.len() && wrong == 0, "{name}: {n} of {} bits, {wrong} wrong", sent.len());
++    };
++    check("upstream", &up_sent, &up_got);
++    check("downstream", &down_sent, &down_got);
++}
++
++#[test]
++fn pcm_upstream_comes_up_and_carries_data() {
++    pcm_upstream_call(line(), 4.0);
++}
++
++/// A noisy line: the digital modem spaces its points to suit, and the
++/// upstream comes up slower but intact.
++#[test]
++fn pcm_upstream_on_a_noisy_line() {
++    pcm_upstream_call(Network::new(Law::Mu, FS).with_delay(0.020, FS).with_noise(1e-3), 6.0);
++}
++
++/// The sound card's clock is not the network's. PCM upstream must keep to the
++/// network's all the same, and does, by the downstream receiver's.
++#[test]
++fn pcm_upstream_keeps_to_the_network_clock() {
++    for ppm in [30.0, -30.0, 100.0, -100.0] {
++        println!("sound card {ppm} ppm off the network");
++        pcm_upstream_call(line().with_clock(ppm), 15.0);
++    }
++}
 diff --git a/crates/gui/src/app.rs b/crates/gui/src/app.rs
-index 32d9319..72945e1 100644
+index 32d9319..d60725d 100644
 --- a/crates/gui/src/app.rs
 +++ b/crates/gui/src/app.rs
 @@ -685,7 +685,7 @@ impl ScopeApp {
@@ -4788,7 +5850,7 @@ index 32d9319..72945e1 100644
          ),
 +        (
 +            "V92",
-+            "V.92 - V.90 with Quick Connect: a V.92 server dialled before comes up faster. A far end without it gets V.90",
++            "V.92 - up to 56000 from a V.92 server and PCM back, with Quick Connect for a server dialled before. A far end without it gets V.90",
 +        ),
      ];
  
@@ -4838,7 +5900,7 @@ index c196b0c..1396a0a 100644
                  if role == Role::Answerer {
                      self.call.set_v8_capable(false);
 diff --git a/crates/modem/src/lib.rs b/crates/modem/src/lib.rs
-index a0ef49a..ec996e5 100644
+index a0ef49a..cdd8c3b 100644
 --- a/crates/modem/src/lib.rs
 +++ b/crates/modem/src/lib.rs
 @@ -30,6 +30,7 @@ use datapump::v32;
@@ -4949,7 +6011,7 @@ index a0ef49a..ec996e5 100644
              // 8.1.1: a far end that sent the plain answering tone of V.25 does
              // not speak V.8, and the call goes on "in accordance with Annex
              // A/V.32 bis, ITU-T T.30, or other appropriate Recommendations" --
-@@ -2463,13 +2507,18 @@ impl Modem {
+@@ -2463,13 +2507,19 @@ impl Modem {
              // whose far end answered with a plain ANS on to V.32bis's own
              // start-up, and so does a V.8 that was turned off.
              _ => match self.at.modulation.carrier.as_str() {
@@ -4962,15 +6024,16 @@ index a0ef49a..ec996e5 100644
              "V90" => {
 -                let mut analogue = v90::startup::Analogue::new(self.fs);
 +                // V.92 says so in phase 2's INFO0a; plain V.90 does not.
++                // V.92 asks for its PCM upstream too, in phase 2's INFO1a.
 +                let mut analogue = if self.at.modulation.carrier == "V92" {
-+                    v90::startup::Analogue::new(self.fs)
++                    v90::startup::Analogue::new(self.fs).with_pcm_upstream()
 +                } else {
 +                    v90::startup::Analogue::v90_only(self.fs)
 +                };
                  analogue.set_pinned(self.pinned_rate);
                  Pump::V90(Box::new(analogue))
              }
-@@ -2556,7 +2605,43 @@ impl Modem {
+@@ -2556,7 +2606,43 @@ impl Modem {
      }
  
      /// End the call, leaving what the terminal is told to whoever asked.
@@ -5014,7 +6077,7 @@ index a0ef49a..ec996e5 100644
          // A fax call is a call too, and putting the line down has to stop it
          // -- otherwise the only way out of a fax that has gone wrong is to
          // close the program. What it learned is kept for the window.
-@@ -2589,6 +2674,10 @@ impl Modem {
+@@ -2589,6 +2675,10 @@ impl Modem {
  /// The level is not information. A real line delivers whatever it delivers,
  /// which is why a receiver has gain control at all, so scaling a recording to
  /// fit loses nothing that was in it.
@@ -5182,10 +6245,10 @@ index b309ee5..b4db667 100644
  
 diff --git a/crates/modem/tests/v92_quick.rs b/crates/modem/tests/v92_quick.rs
 new file mode 100644
-index 0000000..fad04c4
+index 0000000..ed101e3
 --- /dev/null
 +++ b/crates/modem/tests/v92_quick.rs
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,235 @@
 +//! V.92's Quick Connect from the terminal: dial a V.92 server once, which
 +//! is a full start-up and teaches the modem the server; dial it again, and
 +//! the call goes through V.92's short Phase 1 and short Phase 2 and comes up
@@ -5364,6 +6427,17 @@ index 0000000..fad04c4
 +    first.type_at("ATD5551234");
 +    let full = first.run_until_online(30.0).unwrap_or_else(|| panic!("the first call never came up: {:?}", first.saw()));
 +    assert!(!first.server.quick, "the first call quick connected with nothing learned");
++    // The full start-up asks a V.92 server for V.92's PCM upstream, and gets
++    // it; and it carries data.
++    assert!(first.notes.iter().any(|n| n.contains("data mode upstream")), "no PCM upstream: {:?}", first.notes);
++    println!("first call: {:?} at {:?}; notes {:?}", first.caller.standard(), first.caller.rate(), first.notes);
++    first.run(3.0);
++    for b in b"pcm upstream hello" {
++        first.caller.feed_dte(*b);
++    }
++    first.run(3.0);
++    let got = String::from_utf8_lossy(&first.server.received).into_owned();
++    assert!(got.contains("pcm upstream hello"), "the server got {got:?}");
 +    let kept = std::fs::read_to_string(&memory).expect("nothing was kept for the number");
 +    assert!(kept.starts_with("5551234 "), "{kept:?}");
 +
@@ -5377,7 +6451,9 @@ index 0000000..fad04c4
 +    assert!(second.notes.iter().any(|n| n.contains("short phase 2 done")), "{:?}", second.notes);
 +    assert_eq!(second.caller.standard(), "V.90");
 +    assert!(second.caller.rate().is_some_and(|r| r >= 48_000), "{:?}", second.caller.rate());
-+    assert!(quick < full - 1.0, "{quick:.2} s is not much quicker than {full:.2} s");
++    // The full start-up's phase 4 is quicker for PCM upstream, which Quick
++    // Connect's short Phase 2 does not ask for here, so the gap is less.
++    assert!(quick < full, "{quick:.2} s is no quicker than {full:.2} s");
 +
 +    // And it carries data, over LAPM with no ODP/ADP.
 +    second.run(3.0);
