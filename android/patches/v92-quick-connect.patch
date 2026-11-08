@@ -1682,16 +1682,565 @@ index 0000000..174bdfe
 +}
 diff --git a/crates/datapump/src/v92/mod.rs b/crates/datapump/src/v92/mod.rs
 new file mode 100644
-index 0000000..97a81e0
+index 0000000..6399464
 --- /dev/null
 +++ b/crates/datapump/src/v92/mod.rs
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,7 @@
 +//! V.92's PCM upstream: what the analogue modem sends when the digital
 +//! modem receives PCM from it (6.4, 8.5 to 8.8 and 9.5 to 9.6/V.92).
 +
 +pub mod transmitter;
 +pub mod sequences;
 +pub mod line;
++pub mod receiver;
+diff --git a/crates/datapump/src/v92/receiver.rs b/crates/datapump/src/v92/receiver.rs
+new file mode 100644
+index 0000000..d40900d
+--- /dev/null
++++ b/crates/datapump/src/v92/receiver.rs
+@@ -0,0 +1,542 @@
++//! The digital modem's PCM upstream receiver: what the codec made of the
++//! analogue modem's waveform, one level every 125 microseconds, read back
++//! into what was sent (9.5.1, 9.6.1/V.92).
++//!
++//! Three things in turn. Finding where the analogue modem's signals begin:
++//! Ru repeats every six symbols and Ru-bar is it turned over, so a level set
++//! against the one six before it agrees all through Ru and disagrees across
++//! the turn (8.5.5). Learning the line from TRN1u, which is known from its
++//! first symbol -- signs of LU from a scrambler started at zero with ones
++//! going in (8.5.7) -- by least squares: a filter that takes the codec's
++//! levels back to the symbols. And reading: phase 3's sequences on TRN1u's
++//! signs, phase 4's on TRN2u's levels, both through that filter; and data
++//! mode's points straight off the codec, which the precoder and prefilter
++//! put there.
++//!
++//! The same filter is what this end asks the analogue modem to put in front
++//! of the line, as its prefilter (see [`Training::design`]): then the codec
++//! receives the precoder's points themselves, and its own quantising takes
++//! off the noise.
++
++use crate::v32::{Mode, Scrambler};
++use crate::v90::ucode::{self, Law, UCODES};
++
++use super::line::Signs;
++use super::sequences::Filters;
++use super::transmitter::{Constellation, FRAME};
++
++/// Equaliser taps either side of its centre.
++pub const REACH: usize = 16;
++
++/// Symbols fed back: the trailing echo a decided symbol leaves, which the
++/// analogue modem's precoder takes off before the line (6.4.2/V.92).
++pub const FEEDBACK: usize = 16;
++
++/// The signal-to-noise ratio, in dB, the equaliser is designed for whatever
++/// the line's own: see [`Training::solve`].
++pub const DESIGN_SNR: f64 = 30.0;
++
++/// TRN1u symbols the equaliser is solved over.
++pub const TRAIN_OVER: usize = 1536;
++
++/// The analogue modem's signals start where Ru turns over: the first
++/// symbol of Ru-bar, as a count of levels received.
++#[derive(Debug, Clone, Default)]
++pub struct RuFinder {
++    levels: Vec<f64>,
++    agreeing: usize,
++}
++
++impl RuFinder {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// One level; Some(n) when the level n was Ru-bar's first.
++    pub fn feed(&mut self, level: f64) -> Option<usize> {
++        self.levels.push(level);
++        let n = self.levels.len();
++        if n < 13 {
++            return None;
++        }
++        // How the last six agree with the six before them.
++        let (mut cross, mut power) = (0.0, 0.0);
++        for k in 0..6 {
++            let (a, b) = (self.levels[n - 1 - k], self.levels[n - 7 - k]);
++            cross += a * b;
++            power += 0.5 * (a * a + b * b);
++        }
++        if power < 1e-9 {
++            self.agreeing = 0;
++            return None;
++        }
++        let agreement = cross / power;
++        if agreement > 0.8 {
++            self.agreeing += 1;
++            return None;
++        }
++        // Ru for a good while, then the six just in disagree with the six
++        // before: Ru-bar began six symbols ago. Partway through the turn the
++        // agreement passes zero, which says nothing either way.
++        if agreement < -0.8 {
++            let found = (self.agreeing >= 120).then(|| n - 6);
++            self.agreeing = 0;
++            return found;
++        }
++        None
++    }
++}
++
++/// What TRN1u taught: a decision-feedback equaliser from the codec's levels
++/// back to the symbols, and how well it does.
++///
++/// A band the line takes away -- the codec's anti-alias filter leaves next
++/// to nothing near 4 kHz -- is beyond any linear filter: solved without
++/// feedback, the error stays at several per cent however long the filter.
++/// The feedback is what makes the difference, as it does in a decision
++/// feedback equaliser; here it moves to the analogue modem's precoder, which
++/// knows the symbols exactly, and the feedforward filter to its prefilter.
++#[derive(Debug, Clone)]
++pub struct Training {
++    /// Taps over levels n - REACH ..= n + REACH, giving, with the feedback,
++    /// the symbol sent `delay` symbols before level n arrived.
++    pub taps: Vec<f64>,
++    /// b(1..=FEEDBACK): the feedforward output is the symbol plus the sum of
++    /// b(k) times the symbol k before it.
++    pub feedback: Vec<f64>,
++    /// Levels arrive this many symbols after the symbol they carry most of.
++    pub delay: usize,
++    /// The mean square of what the filter leaves, against a symbol of one.
++    pub error: f64,
++    /// How large a symbol of one arrives, in the codec's units: the line's
++    /// gain.
++    pub level: f64,
++}
++
++impl Training {
++    /// Solve for the filter over TRN1u, which began with level `start` (as
++    /// near as Ru said), trying alignments either side.
++    pub fn solve(levels: &[f64], start: usize) -> Option<Self> {
++        let mut signs = Signs::new();
++        let sent: Vec<f64> = (0..TRAIN_OVER + 64).map(|_| signs.trn1u()).collect();
++        let mut best: Option<Self> = None;
++        for delay in 0..=24 {
++            let Some(t) = Self::solve_at(levels, start, delay, &sent) else { continue };
++            if best.as_ref().is_none_or(|b| t.error < b.error) {
++                best = Some(t);
++            }
++        }
++        best
++    }
++
++    fn solve_at(levels: &[f64], start: usize, delay: usize, sent: &[f64]) -> Option<Self> {
++        let forward = 2 * REACH + 1;
++        let width = forward + FEEDBACK;
++        let mut ata = vec![vec![0.0; width]; width];
++        let mut atb = vec![0.0; width];
++        let mut count = 0;
++        let mut energy = 0.0;
++        for k in 32..TRAIN_OVER {
++            // Level n carries most of symbol k: n = start + k + delay.
++            let n = start + k + delay;
++            if n < REACH || n + REACH >= levels.len() {
++                return None;
++            }
++            // The regressors: the levels around, and the symbols just before
++            // with their sign turned, so that the solution's last FEEDBACK
++            // values are b(k) as the feedforward output's echo of them.
++            let mut row: Vec<f64> = levels[n - REACH..=n + REACH].to_vec();
++            row.extend((1..=FEEDBACK).map(|j| -sent.get(k.wrapping_sub(j)).copied().unwrap_or(0.0)));
++            for i in 0..width {
++                atb[i] += row[i] * sent[k];
++                for j in 0..width {
++                    ata[i][j] += row[i] * row[j];
++                }
++            }
++            energy += levels[n] * levels[n];
++            count += 1;
++        }
++        // Solved as if the line had a noise floor DESIGN_SNR below the
++        // signal even where it has next to none. Without it the solution is
++        // zero-forcing: it notches the band the line takes away so deeply
++        // that the precoder's feedback, undoing the notch, puts most of the
++        // analogue modem's power exactly there, and any error in the
++        // solution with it. With it the solution is the MMSE one, which
++        // gives that band up.
++        let ridge = (0..forward).map(|i| ata[i][i]).sum::<f64>() / forward as f64 * 10f64.powf(-DESIGN_SNR / 10.0);
++        for (i, row) in ata.iter_mut().enumerate().take(forward) {
++            row[i] += ridge;
++        }
++        let solution = solve(ata, atb)?;
++        let (taps, feedback) = (solution[..forward].to_vec(), solution[forward..].to_vec());
++        let mut error = 0.0;
++        for k in 32..TRAIN_OVER {
++            let n = start + k + delay;
++            let y: f64 = taps.iter().zip(&levels[n - REACH..=n + REACH]).map(|(t, l)| t * l).sum::<f64>()
++                - (1..=FEEDBACK).map(|j| feedback[j - 1] * sent[k - j]).sum::<f64>();
++            error += (y - sent[k]).powi(2);
++        }
++        Some(Self { taps, feedback, delay, error: error / count as f64, level: (energy / count as f64).sqrt() })
++    }
++
++    /// The feedforward filter's output at level n: the symbol it most
++    /// carries, plus the echo of the ones before (see [`Equaliser`]).
++    pub fn forward(&self, levels: &[f64], n: usize) -> Option<f64> {
++        if n < REACH || n + REACH >= levels.len() {
++            return None;
++        }
++        Some(self.taps.iter().zip(&levels[n - REACH..=n + REACH]).map(|(t, l)| t * l).sum())
++    }
++
++    /// An equaliser that runs on, taking the echo of its own decisions off.
++    pub fn equaliser(&self) -> Equaliser {
++        Equaliser { feedback: self.feedback.clone(), decided: vec![0.0; self.feedback.len()] }
++    }
++
++    /// The prefilter this end asks for, and its gain: this filter itself,
++    /// turned round to run on the analogue modem's side of the line. Its
++    /// taps scaled so the largest fits Q0.15, and G making up the scale, so
++    /// that the codec receives the precoder's output as it was:
++    /// the line's gain `level` times the filter is about a delay.
++    pub fn design(&self) -> (Filters, f64) {
++        // The filter maps codec units to symbols of one; on the far side it
++        // maps the precoder's codec units to symbols, which the line maps
++        // back. z2(k) runs in time order, so the window is reversed.
++        let mut z2: Vec<f64> = self.taps.iter().rev().copied().collect();
++        let largest = z2.iter().fold(0.0f64, |m, z| m.max(z.abs()));
++        let scale = 0.98 / largest;
++        for z in &mut z2 {
++            *z *= scale;
++        }
++        // The line and prefilter together leave each point plus b(k) times
++        // the point k before; x(n) = u(n) + sum p1(k) x(n - k) with p1 = -b
++        // takes that off before it happens.
++        let p1 = self.feedback.iter().map(|b| (-b).clamp(-1.99, 1.99)).collect();
++        (Filters { z1: Vec::new(), p1, z2, p2: Vec::new() }, 1.0 / scale)
++    }
++
++    /// Symbols the prefilter delays by: the analogue modem's x(n) arrives
++    /// this many symbols after its own delay plus the line's.
++    pub fn prefilter_delay(&self) -> usize {
++        REACH
++    }
++}
++
++/// The decision-feedback half of reading phase 3 and 4's sequences: the
++/// feedforward output, less the echo of what was decided before.
++#[derive(Debug, Clone)]
++pub struct Equaliser {
++    feedback: Vec<f64>,
++    decided: Vec<f64>,
++}
++
++impl Equaliser {
++    /// One symbol: the feedforward output `y` in, the equalised symbol out;
++    /// `decide` says which symbol it was, to be fed back.
++    pub fn next(&mut self, y: f64, decide: impl Fn(f64) -> f64) -> f64 {
++        let echo: f64 = self.feedback.iter().zip(&self.decided).map(|(b, d)| b * d).sum();
++        let symbol = y - echo;
++        if !self.decided.is_empty() {
++            self.decided.rotate_right(1);
++            self.decided[0] = decide(symbol);
++        }
++        symbol
++    }
++}
++
++/// Decisions for signs of one.
++pub fn sign(x: f64) -> f64 {
++    if x < 0.0 { -1.0 } else { 1.0 }
++}
++
++/// A set of linear equations, solved by elimination with pivoting.
++fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
++    let n = b.len();
++    for col in 0..n {
++        let pivot = (col..n).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
++        if a[pivot][col].abs() < 1e-300 {
++            return None;
++        }
++        a.swap(col, pivot);
++        b.swap(col, pivot);
++        for row in col + 1..n {
++            let f = a[row][col] / a[col][col];
++            if f == 0.0 {
++                continue;
++            }
++            for k in col..n {
++                a[row][k] -= f * a[col][k];
++            }
++            b[row] -= f * b[col];
++        }
++    }
++    let mut x = vec![0.0; n];
++    for row in (0..n).rev() {
++        let s: f64 = (row + 1..n).map(|k| a[row][k] * x[k]).sum();
++        x[row] = (b[row] - s) / a[row][row];
++    }
++    Some(x)
++}
++
++/// Reads the bits of phase 3's sequences off the signs: decided, the
++/// differential encoding taken off, and descrambled with GPA.
++#[derive(Debug, Clone)]
++pub struct SignReader {
++    descrambler: Scrambler,
++    last: bool,
++}
++
++impl Default for SignReader {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl SignReader {
++    pub fn new() -> Self {
++        Self { descrambler: Scrambler::new(Mode::Answer), last: false }
++    }
++
++    pub fn bit(&mut self, symbol: f64) -> bool {
++        let sign = symbol < 0.0;
++        let scrambled = sign ^ self.last;
++        self.last = sign;
++        self.descrambler.descramble(scrambled)
++    }
++}
++
++/// Reads TRN2u's levels back to bits, least significant first.
++#[derive(Debug, Clone)]
++pub struct Trn2Reader {
++    descrambler: Scrambler,
++    eight: bool,
++    last: bool,
++}
++
++impl Trn2Reader {
++    pub fn new(eight: bool, last_sign: bool) -> Self {
++        Self { descrambler: Scrambler::new(Mode::Answer), eight, last: last_sign }
++    }
++
++    pub fn bits(&mut self, symbol: f64) -> Vec<bool> {
++        let scale = if self.eight { 21f64.sqrt() } else { 5f64.sqrt() };
++        let top = if self.eight { 3 } else { 1 };
++        let magnitude = (((symbol.abs() * scale - 1.0) / 2.0).round() as i64).clamp(0, top) as u32;
++        let sign = symbol < 0.0;
++        let n = if self.eight { 3 } else { 2 };
++        let mut scrambled: Vec<bool> = (0..n - 1).map(|i| magnitude >> i & 1 == 1).collect();
++        scrambled.push(sign ^ self.last);
++        self.last = sign;
++        scrambled.into_iter().map(|b| self.descrambler.descramble(b)).collect()
++    }
++}
++
++/// Constellations for data mode from what training found: codec levels as
++/// far apart as `spacing` codec units at least, from the smallest up to
++/// `ceiling`, for every interval alike.
++pub fn constellation(law: Law, spacing: f64, ceiling: f64) -> Constellation {
++    let mut positive = Vec::new();
++    let mut last = 0.0;
++    for u in 0..UCODES as u8 {
++        let level = f64::from(ucode::linear(law, u));
++        if level <= 0.0 || level > ceiling {
++            continue;
++        }
++        // The smallest stands half a spacing from zero, so that it is a
++        // spacing from its own negative; each after it a spacing from the last.
++        let clear = if positive.is_empty() { level >= spacing / 2.0 } else { level - last >= spacing };
++        if clear {
++            positive.push(level);
++            last = level;
++        }
++    }
++    Constellation { positive }
++}
++
++/// Moduli for `bits` a frame from constellations of `n` points: the first
++/// three of every four symbols take a number less than M, the fourth less
++/// than M with each class two points wide. Every class keeps at least two
++/// points to choose from: with one, the precoder cannot keep its own output
++/// down, and the feedback that undoes the line runs away with it.
++pub fn moduli(bits: usize, n: usize) -> Option<[u32; FRAME]> {
++    for m3 in (1..=n as u32 / 4).rev() {
++        for m in (1..=n as u32 / 2).rev() {
++            let product = (u128::from(m)).pow(9) * u128::from(m3).pow(3);
++            if product >= 1u128 << bits {
++                continue;
++            }
++            // One step up is the smallest that carries it.
++            let (m, m3) = if m < n as u32 / 2 { (m + 1, m3) } else { (m, m3) };
++            let product = (u128::from(m)).pow(9) * u128::from(m3).pow(3);
++            if product >= 1u128 << bits {
++                return Some(std::array::from_fn(|i| if i % 4 == 3 { m3 } else { m }));
++            }
++            break;
++        }
++    }
++    None
++}
++
++/// The level a symbol of one is as the codec's linear output, in the units
++/// [`ucode::linear`] gives -- what [`Training::level`] is measured in, for
++/// a line that delivers codec levels as fractions of full scale.
++pub fn codec_units(law: Law) -> f64 {
++    f64::from(ucode::linear(law, (UCODES - 1) as u8))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::v90::network::Network;
++    use crate::v92::line::{UpLine, ru};
++    use crate::v92::sequences::{self, ALL_UPSTREAM_RATES};
++    use crate::v92::transmitter::{Decoder, Params, Transmitter};
++    use crate::v34::trellis::Code;
++
++    const FS: f64 = 16_000.0;
++    /// LU on the line, as a fraction of full scale.
++    const LU: f64 = 0.12;
++
++    /// Ru for 384, Ru-bar for 24, TRN1u for 2040, then Ja over and over:
++    /// sent through the network; the levels the codec gave.
++    fn phase3_up(net: &mut Network, seconds: f64) -> (Vec<f64>, Vec<bool>) {
++        let mut line = UpLine::new(FS);
++        let mut signs = Signs::new();
++        let d = crate::v90::dil::design(Law::Mu, 79);
++        let ja = sequences::descriptor_bits(&d, ALL_UPSTREAM_RATES);
++        let mut n = 0usize;
++        let mut ja_bits = std::iter::repeat_n(true, 24).chain(ja.clone().into_iter().cycle());
++        let mut levels = Vec::new();
++        let mut up = Vec::new();
++        let full = codec_units(Law::Mu);
++        for _ in 0..(seconds * 8000.0) as usize {
++            levels.push(net.up(&up) * full);
++            up.clear();
++            for _ in net.down(0.0) {
++                up.push(LU * line.sample(|| {
++                    let s = if n < 384 {
++                        ru(n, false)
++                    } else if n < 408 {
++                        ru(n, true)
++                    } else if n < 408 + 2400 {
++                        if n == 408 {
++                            signs.restart();
++                        }
++                        signs.trn1u()
++                    } else {
++                        signs.differential(ja_bits.next().unwrap())
++                    };
++                    n += 1;
++                    s
++                }));
++            }
++        }
++        (levels, ja)
++    }
++
++    /// Ru found, TRN1u learned, and Ja read back through the filter.
++    #[test]
++    fn ru_trn1u_and_ja_come_back_through_the_network() {
++        let mut net = Network::new(Law::Mu, FS).with_delay(0.020, FS).with_noise(1e-5).with_clock(60.0);
++        let (levels, ja) = phase3_up(&mut net, 1.2);
++        let mut finder = RuFinder::new();
++        let start = levels.iter().find_map(|&l| finder.feed(l)).expect("no Ru-bar");
++        // TRN1u's first symbol is 24 after Ru-bar's.
++        let training = Training::solve(&levels, start + 24 - 12).expect("no training");
++        println!("Ru-bar at {start}, delay {}, error {:.2e}, level {:.0}", training.delay, training.error, training.level);
++        assert!(training.error < 0.01, "the filter leaves {:.3}", training.error);
++        // Ja: from the end of TRN1u on.
++        let mut reader = SignReader::new();
++        let first = start + 24 - 12 + 2400 + training.delay;
++        let mut eq = training.equaliser();
++        let bits: Vec<bool> = (first..levels.len() - REACH - 1)
++            .filter_map(|n| training.forward(&levels, n))
++            .map(|y| reader.bit(eq.next(y, sign)))
++            .collect();
++        let found = (0..bits.len().saturating_sub(ja.len()))
++            .any(|i| sequences::descriptor_from_bits(&bits[i..i + ja.len()]).is_some());
++        assert!(found, "Ja was not read back");
++    }
++
++    /// The filter as the analogue modem's prefilter: data at the rate the
++    /// constellation allows comes through the codec as the points.
++    #[test]
++    fn data_through_the_prefilter_arrives_as_the_points() {
++        let mut net = Network::new(Law::Mu, FS).with_delay(0.020, FS).with_noise(1e-5);
++        let (levels, _) = phase3_up(&mut net, 0.6);
++        let mut finder = RuFinder::new();
++        let start = levels.iter().find_map(|&l| finder.feed(l)).expect("no Ru-bar");
++        let training = Training::solve(&levels, start + 24 - 12).expect("no training");
++        let (filters, gain) = training.design();
++        // Points up to about the level TRN1u arrived at, spaced well clear of
++        // what the filter leaves.
++        let noise = training.error.sqrt() * training.level;
++        let points = constellation(Law::Mu, (8.0 * noise).max(16.0), 2.0 * training.level);
++        let n = points.positive.len() * 2;
++        let bits = (24..=72).rev().step_by(2).find(|&b| moduli(b, n).is_some()).expect("no rate");
++        let params = Params {
++            bits,
++            moduli: moduli(bits, n).unwrap(),
++            constellations: std::array::from_fn(|_| points.clone()),
++            z1: filters.z1,
++            p1: filters.p1,
++            z2: filters.z2,
++            p2: filters.p2,
++            gain,
++            code: Code::States16,
++        };
++        assert!(params.valid(), "{params:?}");
++        println!("{} points, {} bit/s, gain {gain:.3e}", n, params.rate());
++        // Data, on a fresh network, through the same line.
++        let mut net = Network::new(Law::Mu, FS).with_delay(0.020, FS).with_noise(1e-5);
++        let mut line = UpLine::new(FS);
++        let mut tx = Transmitter::new(params.clone());
++        let mut queue: std::collections::VecDeque<f64> = Default::default();
++        let mut sent_bits = Vec::new();
++        let mut x = 0x9e37_79b9_7f4a_7c15u64;
++        let mut got = Vec::new();
++        let mut up = Vec::new();
++        let full = codec_units(Law::Mu);
++        for _ in 0..8000 {
++            got.push(net.up(&up) * full);
++            up.clear();
++            for _ in net.down(0.0) {
++                up.push(LU * line.sample(|| {
++                    if queue.is_empty() {
++                        let b: Vec<bool> = (0..bits)
++                            .map(|_| {
++                                x ^= x << 13;
++                                x ^= x >> 7;
++                                x ^= x << 17;
++                                x & 1 == 1
++                            })
++                            .collect();
++                        sent_bits.push(b.clone());
++                        queue.extend(tx.frame(&b));
++                    }
++                    queue.pop_front().unwrap()
++                }));
++            }
++        }
++        // Find where frames start in what arrived, and decode.
++        let best = (0..600)
++            .map(|offset| {
++                let mut rx = Decoder::new(params.clone());
++                let frames = (got.len() - offset) / FRAME;
++                let ok = (0..frames.min(sent_bits.len()))
++                    .filter(|&f| {
++                        let levels: [f64; FRAME] = std::array::from_fn(|i| got[offset + f * FRAME + i]);
++                        rx.frame(&rx.slice(&levels)) == sent_bits[f]
++                    })
++                    .count();
++                (offset, ok)
++            })
++            .max_by_key(|&(_, ok)| ok)
++            .unwrap();
++        println!("frames decoded right at offset {}: {} of {}", best.0, best.1, sent_bits.len());
++        // Every frame the run carried whole, which is all but the few still
++        // in the line when it stopped.
++        let carried = (got.len() - best.0) / FRAME;
++        assert_eq!(best.1, carried.min(sent_bits.len()), "{best:?} of {carried}");
++    }
++}
 diff --git a/crates/datapump/src/v92/sequences.rs b/crates/datapump/src/v92/sequences.rs
 new file mode 100644
 index 0000000..8a4e179
@@ -2309,10 +2858,10 @@ index 0000000..8a4e179
 +}
 diff --git a/crates/datapump/src/v92/transmitter.rs b/crates/datapump/src/v92/transmitter.rs
 new file mode 100644
-index 0000000..437711a
+index 0000000..8041c06
 --- /dev/null
 +++ b/crates/datapump/src/v92/transmitter.rs
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,549 @@
 +//! V.92's PCM upstream transmitter (6.4/V.92), and its inverse.
 +//!
 +//! ```text
@@ -2603,6 +3152,8 @@ index 0000000..437711a
 +#[derive(Debug, Clone)]
 +pub struct Transmitter {
 +    params: Params,
++    /// u(n) of the last frame sent: the points the codec should receive.
++    points: [f64; FRAME],
 +    modulus: ModulusEncoder,
 +    trellis: Trellis,
 +    precoder: Precoder,
@@ -2615,11 +3166,16 @@ index 0000000..437711a
 +    pub fn new(params: Params) -> Self {
 +        let precoder = Precoder::new(&params);
 +        let trellis = Trellis::new(params.code);
-+        Self { params, modulus: ModulusEncoder::new(), trellis, precoder }
++        Self { params, points: [0.0; FRAME], modulus: ModulusEncoder::new(), trellis, precoder }
 +    }
 +
 +    pub fn params(&self) -> &Params {
 +        &self.params
++    }
++
++    /// The points the last frame chose, u(n): what the codec is to receive.
++    pub fn points(&self) -> &[f64; FRAME] {
++        &self.points
 +    }
 +
 +    /// One data frame: K bits in, twelve line levels out.
@@ -2647,6 +3203,7 @@ index 0000000..437711a
 +                self.precoder.send(&self.params, &constellation, class(ki, m, half))
 +            };
 +            etas[slot] = eta;
++            self.points[i] = constellation.point(eta);
 +            out[i] = level;
 +            if slot == 3 {
 +                self.trellis.advance(etas);
@@ -2814,6 +3371,44 @@ index 0000000..437711a
 +        }
 +        // The points reach 6400; the choice keeps what is sent within reach.
 +        assert!(peak < 6400.0, "peak {peak}");
++    }
++}
++
++#[cfg(test)]
++mod uneven {
++    use super::*;
++
++    /// Moduli whose product is well past 2^K, as a digital modem's usually
++    /// are: every frame still comes back.
++    #[test]
++    fn moduli_past_two_to_the_k_round_trip() {
++        let positive = vec![8.0, 180.0, 356.0, 524.0, 716.0, 924.0, 1100.0, 1300.0, 1500.0, 1700.0];
++        let p = Params {
++            bits: 36,
++            moduli: [10, 10, 10, 5, 10, 10, 10, 5, 10, 10, 10, 5],
++            constellations: std::array::from_fn(|_| Constellation { positive: positive.clone() }),
++            z1: vec![],
++            p1: vec![],
++            z2: vec![1.0],
++            p2: vec![],
++            gain: 1.0,
++            code: Code::States16,
++        };
++        assert!(p.valid());
++        let mut tx = Transmitter::new(p.clone());
++        let mut rx = Decoder::new(p.clone());
++        let mut enc = ModulusEncoder::new();
++        let mut x = 12345u64;
++        for f in 0..200 {
++            let b: Vec<bool> = (0..36).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x & 1 == 1 }).collect();
++            let k = enc.encode(&b, &p.moduli);
++            let levels = tx.frame(&b);
++            let etas = rx.slice(&levels);
++            let mut probe = rx.clone();
++            let back = probe.numbers(&etas);
++            assert_eq!(back, k, "frame {f}: numbers");
++            assert_eq!(rx.frame(&etas), b, "frame {f}: bits");
++        }
 +    }
 +}
 diff --git a/crates/datapump/tests/v90_call.rs b/crates/datapump/tests/v90_call.rs
