@@ -740,7 +740,7 @@ index b3a782c..5f7a02b 100644
      pub fn training(&self) -> Option<&training::Modem> {
          self.training.as_ref()
 diff --git a/crates/datapump/src/v8.rs b/crates/datapump/src/v8.rs
-index 52e648b..d5f8c0d 100644
+index 52e648b..3a411cd 100644
 --- a/crates/datapump/src/v8.rs
 +++ b/crates/datapump/src/v8.rs
 @@ -11,7 +11,7 @@
@@ -752,7 +752,7 @@ index 52e648b..d5f8c0d 100644
  use v8::{Access, CallFunction, Decoder, Heard, Menu, Modulation, Modulations, Pcm, PcmRole, Protocol, Signal};
  
  use crate::bell103::{Bell103Rx, Bell103Tx};
-@@ -171,8 +171,59 @@ pub enum Status {
+@@ -171,8 +171,71 @@ pub enum Status {
      NoNegotiation,
      /// Nothing in common, or nothing heard at all.
      Failed,
@@ -786,6 +786,18 @@ index 52e648b..d5f8c0d 100644
 +}
 +
 +
++/// CRe's first segment heard this long is believed (9.2.1.2/V.92: "the
++/// initial 50 ms").
++const CRE_HELD: f64 = 0.050;
++
++/// How long the calling end waits for QCA2d after its QC2a: 1 s
++/// (9.2.1.2/V.92), and the time QC2a takes to send.
++const QC2_WAIT: f64 = 1.4;
++
++/// How long the answering end waits for QC2a after CRe before ANSam
++/// (9.2.3.2/V.92: 3 s).
++const CRE_ANSWER_WAIT: f64 = 3.0;
++
 +/// How long the calling end gives ANSpcm to begin after QCA1d before going
 +/// back to V.8. The digital modem gives TONEq 2 s (9.2.4.3/V.92), then
 +/// sends ANSam and listens for CM.
@@ -812,7 +824,7 @@ index 52e648b..d5f8c0d 100644
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  enum State {
      /// The silence both ends open with.
-@@ -193,6 +244,16 @@ enum State {
+@@ -193,6 +256,22 @@ enum State {
      SendingJm,
      /// The 75 ms of nothing before the chosen modulation starts.
      Handover,
@@ -821,6 +833,12 @@ index 52e648b..d5f8c0d 100644
 +    QcAwaitAnspcm,
 +    /// Sending TONEq until ANSpcm stops.
 +    QcToneq,
++    /// V.92's second Quick Connect, the calling analogue modem: CRe heard,
++    /// QC2a sent, listening for QCA2d (9.2.1.2/V.92).
++    QcAwaitQca2,
++    /// The answering digital modem's CRe (7.1/V.8 bis), listening for QC2a
++    /// (9.2.4.2/V.92).
++    Cre,
 +    /// The answering digital modem: QCA1d going out.
 +    QcSendQca,
 +    /// Its 75 ms of silence, QTS and QTS-bar, and ANSpcm until TONEq.
@@ -829,7 +847,7 @@ index 52e648b..d5f8c0d 100644
      Done(Status),
  }
  
-@@ -258,6 +319,30 @@ pub struct Modem {
+@@ -258,6 +337,47 @@ pub struct Modem {
      /// Whether a call menu for any call function but this end's own goes
      /// unanswered.
      own_function_only: bool,
@@ -857,10 +875,27 @@ index 52e648b..d5f8c0d 100644
 +    toneq_held: f64,
 +    /// The answering end's QTS and ANSpcm, by symbol at 8000 a second.
 +    qc_clock: f64,
++    /// V.92's second Quick Connect, by V.8 bis (9.2.1.2 and 9.2.4.2/V.92):
++    /// the calling end's ear for CRe and whether it has answered one; the
++    /// answering end's CRe; and each end's V.21 in the other band, for QC2a
++    /// one way and QCA2d the other, as V.8 bis frames.
++    cre_ear: crate::v92::v8bis::CreDetector,
++    cre_held: f64,
++    /// When CRe's first segment was last believed, in seconds from the
++    /// start: it can come and go in this end's own opening silence.
++    cre_heard_at: Option<f64>,
++    qc2_sent: bool,
++    cre: Option<crate::v92::v8bis::CreTx>,
++    sends_cre: bool,
++    bis_tx: Bell103Tx,
++    bis_rx: crate::v92::v8bis::SyncRx,
++    qc2_heard: Option<crate::v92::v8bis::Qc2>,
++    /// Whether the short Phase 1 this end went through was QC2's.
++    qc2: bool,
  }
  
  impl Modem {
-@@ -300,9 +385,38 @@ impl Modem {
+@@ -300,9 +420,72 @@ impl Modem {
              sent_jm: None,
              ansam_seconds: timing::ANSAM,
              own_function_only: false,
@@ -877,6 +912,24 @@ index 52e648b..d5f8c0d 100644
 +            toneq_space: ToneDetector::new(LOW.0, 30.0, fs),
 +            toneq_held: 0.0,
 +            qc_clock: 0.0,
++            cre_ear: crate::v92::v8bis::CreDetector::new(fs),
++            cre_held: 0.0,
++            cre_heard_at: None,
++            qc2_sent: false,
++            cre: None,
++            sends_cre: false,
++            // The other band from V.8's: the calling end sends QC2a on
++            // V.21(H) and hears QCA2d on V.21(L); the answering end the
++            // other way round.
++            bis_tx: {
++                let (space, mark) = role.receive_tones();
++                let mut t = Bell103Tx::with_tones(space, mark, fs);
++                t.set_transmitting(false);
++                t
++            },
++            bis_rx: crate::v92::v8bis::SyncRx::new(role.transmit_tones(), fs),
++            qc2_heard: None,
++            qc2: false,
          }
      }
  
@@ -896,10 +949,26 @@ index 52e648b..d5f8c0d 100644
 +        self
 +    }
 +
++    /// The answering digital modem opening with V.8 bis's CRe rather than
++    /// ANSam, so that a calling V.92 modem that knows it can answer with
++    /// QC2a (9.2.4.2/V.92). A caller that does not is given ANSam 3 s after
++    /// CRe, and V.8 -- and V.92's first Quick Connect -- as ever.
++    pub fn answering_with_cre(mut self) -> Self {
++        self.answers_quick = true;
++        self.sends_cre = true;
++        self
++    }
++
++    /// Whether the short Phase 1 was V.92's second Quick Connect, by V.8 bis
++    /// (QC2a and QCA2d), rather than its first.
++    pub fn was_qc2(&self) -> bool {
++        self.qc2
++    }
++
      /// An answering end that has sent, or is sending, some other answer tone,
      /// listening for a call menu all the same.
      ///
-@@ -374,7 +488,12 @@ impl Modem {
+@@ -374,7 +557,14 @@ impl Modem {
              | State::SendingCj
              | State::Ansam
              | State::SendingJm
@@ -907,25 +976,29 @@ index 52e648b..d5f8c0d 100644
 +            | State::Handover
 +            | State::QcAwaitAnspcm
 +            | State::QcToneq
++            | State::QcAwaitQca2
++            | State::Cre
 +            | State::QcSendQca
 +            | State::QcQts
 +            | State::QcAnspcm => true,
          }
      }
  
-@@ -483,6 +602,11 @@ impl Modem {
+@@ -483,6 +673,13 @@ impl Modem {
              State::Overhearing => "listening for CM",
              State::SendingJm => "JM",
              State::Handover => "handover",
 +            State::QcAwaitAnspcm => "V.92 QC: waiting for ANSpcm",
 +            State::QcToneq => "V.92 QC: TONEq",
++            State::QcAwaitQca2 => "V.92 QC2: QC2a sent, listening for QCA2d",
++            State::Cre => "V.8 bis CRe",
 +            State::QcSendQca => "V.92 QC: QCA1d",
 +            State::QcQts => "V.92 QC: QTS",
 +            State::QcAnspcm => "V.92 QC: ANSpcm",
              State::Done(_) => "done",
          }
      }
-@@ -529,6 +653,23 @@ impl Modem {
+@@ -529,6 +726,34 @@ impl Modem {
          // milliseconds on a real call.
          self.ansam_held = if self.answer.is_ansam() { self.ansam_held + dt } else { 0.0 };
          self.plain_held = if self.answer.is_plain() { self.plain_held + dt } else { 0.0 };
@@ -946,10 +1019,21 @@ index 52e648b..d5f8c0d 100644
 +                && self.toneq.amplitude() > 4.0 * self.toneq_space.amplitude();
 +            self.toneq_held = if heard { self.toneq_held + dt } else { 0.0 };
 +        }
++        if self.quick.is_some() && self.role == Role::Calling {
++            self.cre_held = self.cre_ear.feed(line);
++            if self.cre_held >= CRE_HELD {
++                self.cre_heard_at = Some(self.total);
++            }
++        }
++        if (self.quick.is_some() && self.qc2_sent) || self.sends_cre {
++            if let Some(info) = self.bis_rx.feed(line) {
++                self.qc2_heard = crate::v92::v8bis::Qc2::from_octets(&info);
++            }
++        }
          let octet = self.rx.feed(line);
          // A character whose stop bit was not a mark. Clause 5 runs a sequence
          // octet against octet with nothing between them, so a framing error
-@@ -560,6 +701,9 @@ impl Modem {
+@@ -560,6 +785,9 @@ impl Modem {
          // of zeros read as CJ, an octet lost out of the synchronisation
          // itself. The flag used to survive all of those and condemn the next
          // sequence for a tear that was not in it.
@@ -959,7 +1043,7 @@ index 52e648b..d5f8c0d 100644
          let torn = octet == v8::SYNC_MENU && std::mem::take(&mut self.torn);
          let Some(heard) = self.decoder.feed(octet) else { return };
          match heard {
-@@ -624,6 +768,57 @@ impl Modem {
+@@ -624,6 +852,57 @@ impl Modem {
          }
      }
  
@@ -1017,7 +1101,41 @@ index 52e648b..d5f8c0d 100644
      /// Whether the far end has said the same thing twice, as 7.4 and 8.1.2
      /// both require before it is acted on.
      fn settled(&self) -> Option<Menu> {
-@@ -716,6 +911,13 @@ impl Modem {
+@@ -690,8 +969,12 @@ impl Modem {
+                         Role::Calling => State::Listening,
+                         // 8.2.2: "if the answer DCE supports CM/JM exchanges,
+                         // ANSam shall be transmitted".
++                        Role::Answering if self.sends_cre => State::Cre,
+                         Role::Answering => State::Ansam,
+                     });
++                    if self.state == State::Cre {
++                        self.cre = Some(crate::v92::v8bis::CreTx::new(self.fs));
++                    }
+                 }
+             }
+ 
+@@ -704,6 +987,20 @@ impl Modem {
+                 // modem that does throws away everything V.8 could have found.
+                 if self.ansam_held >= timing::ANSAM_HELD {
+                     self.enter(State::Waiting);
++                } else if let Some(uqts) = self.quick
++                    && !self.qc2_sent
++                    && self.cre_heard_at.is_some_and(|at| self.total - at < CRE_ANSWER_WAIT - 1.0)
++                {
++                    // 9.2.1.2/V.92: "If the initial 50 ms of signal CRe is
++                    // detected, the analogue modem shall transmit signal QC2a
++                    // followed by silence and condition its receiver to detect
++                    // QCA2d, QCA2a, ANSam and ANS."
++                    let qc2a = crate::v92::v8bis::Qc2 { digital: false, acknowledge: false, lapm: self.lapm_offered(), value: uqts };
++                    self.bis_tx.set_transmitting(true);
++                    self.bis_tx.push_bits(&qc2a.to_bits());
++                    self.qc2_sent = true;
++                    self.qc2_heard = None;
++                    self.enter(State::QcAwaitQca2);
+                 } else if self.plain_held >= timing::TE {
+                     // Held for longer: ANSam is a modulated tone, and the
+                     // modulation takes a moment to measure. Deciding on the
+@@ -716,6 +1013,13 @@ impl Modem {
              State::Waiting => {
                  // 8.1.1: silence for Te, "prior to transmitting signal CM".
                  if self.elapsed >= timing::TE {
@@ -1031,7 +1149,7 @@ index 52e648b..d5f8c0d 100644
                      let cm = v8::sequence(Signal::Cm, &self.menu);
                      self.send_sequence(cm);
                      self.enter(State::SendingCm);
-@@ -723,6 +925,16 @@ impl Modem {
+@@ -723,6 +1027,16 @@ impl Modem {
              }
  
              State::SendingCm => {
@@ -1048,7 +1166,7 @@ index 52e648b..d5f8c0d 100644
                  // 8.1.2: "after a minimum of 2 identical JM sequences have
                  // been received... signal CJ shall be transmitted."
                  if let Some(jm) = self.settled() {
-@@ -752,6 +964,20 @@ impl Modem {
+@@ -752,6 +1066,20 @@ impl Modem {
              }
  
              State::Ansam => {
@@ -1069,10 +1187,68 @@ index 52e648b..d5f8c0d 100644
                  // 8.2.2: "upon receiving a minimum of 2 identical CM
                  // sequences, the DCE shall transmit JM".
                  if let Some(cm) = self.settled() {
-@@ -797,10 +1023,94 @@ impl Modem {
+@@ -797,10 +1125,153 @@ impl Modem {
                  }
              }
  
++            State::QcAwaitQca2 => {
++                if self.bis_tx.pending_bits() == 0 {
++                    self.bis_tx.set_transmitting(false);
++                }
++                // "If QCA2d is detected, the modem shall condition itself to
++                // detect QTS and QTS-bar followed by ANSpcm".
++                if let Some(q) = self.qc2_heard.take()
++                    && q.digital
++                    && q.acknowledge
++                {
++                    self.qc_lapm = q.lapm;
++                    self.qc2 = true;
++                    self.bis_tx.clear();
++                    self.bis_tx.set_transmitting(false);
++                    self.enter(State::QcAwaitAnspcm);
++                } else if self.ansam_held >= timing::ANSAM_HELD {
++                    // "If ANSam is detected the modem shall proceed according
++                    // to 9.2.1.1": QC1a and CM.
++                    self.bis_tx.set_transmitting(false);
++                    self.enter(State::Waiting);
++                } else if self.elapsed >= QC2_WAIT {
++                    // No QCA2d: "proceed in accordance with ITU-T V.8 bis",
++                    // which this end does not speak -- so it listens on, and
++                    // the far end, hearing no V.8 bis, sends ANSam (9.2.3.2,
++                    // 9.2.4.2/V.92), or V.25's answer tone.
++                    self.bis_tx.set_transmitting(false);
++                    self.enter(State::Listening);
++                }
++            }
++
++            State::Cre => {
++                // 9.2.4.2/V.92: "If QC2a is detected, the modem shall
++                // terminate transmission of CRe and shall transmit QCA2d
++                // followed by silence for 75 +- 5 ms and then QTS, QTS-bar and
++                // ANSpcm".
++                if let Some(q) = self.qc2_heard.take()
++                    && !q.digital
++                    && !q.acknowledge
++                {
++                    let lapm = q.lapm && self.lapm_offered();
++                    // ANSpcm at -12 dBm0: LM of 01.
++                    let qca2d = crate::v92::v8bis::Qc2 { digital: true, acknowledge: true, lapm, value: 0b01 };
++                    self.qc_lapm = lapm;
++                    self.qc2 = true;
++                    self.cre = None;
++                    self.bis_tx.set_transmitting(true);
++                    self.bis_tx.push_bits(&qca2d.to_bits());
++                    self.enter(State::QcSendQca);
++                    return;
++                }
++                // Nothing V.8 bis, nor QC2a, within 3 s of CRe: ANSam, and
++                // V.8 with V.92's first Quick Connect (9.2.3.2/V.92).
++                if self.elapsed >= 0.5 + CRE_ANSWER_WAIT {
++                    self.cre = None;
++                    self.enter(State::Ansam);
++                }
++            }
++
 +            // 9.2.1.3/V.92: TONEq once ANSpcm is heard; QTS comes first and
 +            // is not a 2100 Hz tone.
 +            State::QcAwaitAnspcm => {
@@ -1102,8 +1278,9 @@ index 52e648b..d5f8c0d 100644
 +                }
 +            }
 +            State::QcSendQca => {
-+                if self.tx.pending_bits() == 0 {
++                if self.tx.pending_bits() == 0 && self.bis_tx.pending_bits() == 0 {
 +                    self.tx.set_transmitting(false);
++                    self.bis_tx.set_transmitting(false);
 +                    self.qc_clock = 0.0;
 +                    self.enter(State::QcQts);
 +                }
@@ -1164,23 +1341,38 @@ index 52e648b..d5f8c0d 100644
      /// A call menu has arrived twice the same. Answer it, unless it is for a
      /// call this end does not take.
      fn consider(&mut self, cm: Menu) {
-@@ -865,6 +1175,9 @@ impl Modem {
+@@ -865,6 +1336,17 @@ impl Modem {
          if self.state == State::Ansam {
              return self.ansam();
          }
 +        if matches!(self.state, State::QcQts | State::QcAnspcm) {
 +            return self.qc_signal();
 +        }
++        if let Some(cre) = self.cre.as_mut() {
++            // 12 to 15 dB below the usual (7.1.4/V.8 bis).
++            return cre.next_sample(ANSAM_LEVEL * 0.2);
++        }
++        // QC2a or QCA2d, in the other band, when one is going out.
++        if self.bis_tx.is_transmitting() {
++            return self.bis_tx.next_sample();
++        }
          if self.tx.is_transmitting()
              && self.tx.pending_bits() == 0
              && !self.outgoing.is_empty()
-@@ -929,6 +1242,53 @@ mod tests {
+@@ -929,6 +1411,88 @@ mod tests {
  
  
  
 +    /// The two ends of V.92's short Phase 1 over a line `delay` seconds each
 +    /// way: what each decided, and how long the caller took, from the start.
 +    fn quick(caller_quick: bool, answerer_quick: bool, delay: f64, seconds: f64) -> (Status, Status, f64) {
++        let (calling, answering, at) = quick_with(caller_quick, answerer_quick, false, delay, seconds);
++        (calling.status(), answering.status(), at)
++    }
++
++    /// The same, the answering end opening with CRe if `cre`; the two ends
++    /// back as they finished.
++    fn quick_with(caller_quick: bool, answerer_quick: bool, cre: bool, delay: f64, seconds: f64) -> (Modem, Modem, f64) {
 +        let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS).offering_lapm();
 +        if caller_quick {
 +            calling = calling.offering_quick_connect(79);
@@ -1188,6 +1380,9 @@ index 52e648b..d5f8c0d 100644
 +        let mut answering = Modem::new(Role::Answering, CallFunction::Data, all(), FS).offering_lapm();
 +        if answerer_quick {
 +            answering = answering.answering_quick_connect();
++        }
++        if cre {
++            answering = answering.answering_with_cre();
 +        }
 +        let lag = (delay * FS) as usize + 1;
 +        let (mut up, mut down) = (std::collections::VecDeque::from(vec![0.0; lag]), std::collections::VecDeque::from(vec![0.0; lag]));
@@ -1201,7 +1396,32 @@ index 52e648b..d5f8c0d 100644
 +                done_at = Some(n as f64 / FS);
 +            }
 +        }
-+        (calling.status(), answering.status(), done_at.unwrap_or(f64::INFINITY))
++        (calling, answering, done_at.unwrap_or(f64::INFINITY))
++    }
++
++    /// 9.2.1.2 and 9.2.4.2/V.92: a digital modem opening with V.8 bis's CRe
++    /// gets QC2a, answers QCA2d, and the two go on as QC1 does, sooner than
++    /// QC1 by the second of ANSam it does not wait for.
++    #[test]
++    fn a_v92_pair_quick_connects_by_v8bis() {
++        for delay in [0.010, 0.300] {
++            let (calling, answering, at) = quick_with(true, true, true, delay, 8.0);
++            assert_eq!(calling.status(), Status::QuickConnect { lapm: true }, "{delay} s each way");
++            assert_eq!(answering.status(), Status::QuickConnect { lapm: true }, "{delay} s each way");
++            assert!(calling.was_qc2() && answering.was_qc2(), "{delay} s each way: not QC2");
++            let (_, _, qc1) = quick(true, true, delay, 8.0);
++            println!("{delay} s each way: QC2 at {at:.2} s, QC1 at {qc1:.2} s");
++            assert!(at < qc1, "QC2 at {at:.2} s is no sooner than QC1 at {qc1:.2} s");
++        }
++    }
++
++    /// A caller with nothing learned, so no Quick Connect to offer, ignores
++    /// CRe; the answering end gives ANSam after 3 s, and V.8 goes on.
++    #[test]
++    fn cre_to_a_caller_without_quick_connect_becomes_ansam_and_v8() {
++        let (calling, answering, _) = quick_with(false, true, true, 0.010, 12.0);
++        assert!(matches!(calling.status(), Status::Agreed(_)), "{:?}", calling.status());
++        assert!(matches!(answering.status(), Status::Agreed(_)), "{:?}", answering.status());
 +    }
 +
 +    /// 9.2/V.92: QC1a ahead of CM, QCA1d back, QTS and ANSpcm, TONEq, and
@@ -2826,10 +3046,10 @@ index 0000000..48e392d
 +}
 diff --git a/crates/datapump/src/v92/mod.rs b/crates/datapump/src/v92/mod.rs
 new file mode 100644
-index 0000000..42f0bde
+index 0000000..e5410b2
 --- /dev/null
 +++ b/crates/datapump/src/v92/mod.rs
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,11 @@
 +//! V.92's PCM upstream: what the analogue modem sends when the digital
 +//! modem receives PCM from it (6.4, 8.5 to 8.8 and 9.5 to 9.6/V.92).
 +
@@ -2840,6 +3060,7 @@ index 0000000..42f0bde
 +pub mod finder;
 +pub mod up;
 +pub mod server_up;
++pub mod v8bis;
 diff --git a/crates/datapump/src/v92/receiver.rs b/crates/datapump/src/v92/receiver.rs
 new file mode 100644
 index 0000000..cf01e4e
@@ -5826,6 +6047,391 @@ index 0000000..ef52901
 +        false
 +    }
 +}
+diff --git a/crates/datapump/src/v92/v8bis.rs b/crates/datapump/src/v92/v8bis.rs
+new file mode 100644
+index 0000000..4227f76
+--- /dev/null
++++ b/crates/datapump/src/v92/v8bis.rs
+@@ -0,0 +1,379 @@
++//! The little of V.8 bis that V.92's second Quick Connect needs: an answering
++//! end that opens with V.8 bis's CRe instead of ANSam is answered with QC2a or
++//! QC2d, and those with QCA2d or QCA2a (8.2.2, 8.2.4, 8.3.3, 8.3.5 and 9.2/V.92).
++//!
++//! - CRe (7.1/V.8 bis): 1375 + 2002 Hz for 400 ms (285 ms allowed), then
++//!   400 Hz for 100 ms.
++//! - Messages (7.2/V.8 bis): V.21 at 300 bit/s, 100 ms of mark, two flags or
++//!   more, the information field, a 16-bit FCS, a flag or more, with HDLC's
++//!   zero-bit insertion between the flags. For QC2 and QCA2 the information
++//!   field is the 16-bit identification field of Tables 3, 5, 12 and 14/V.92
++//!   and nothing else.
++
++use dsp::{FskDetector, Nco, ToneDetector};
++
++use crate::v8::UQTS;
++
++/// The two tones of an initiating signal's first segment, and CRe's second.
++pub const CRE_PAIR: (f64, f64) = (1375.0, 2002.0);
++pub const CRE_SECOND: f64 = 400.0;
++const CRE_FIRST_SECONDS: f64 = 0.400;
++const CRE_SECOND_SECONDS: f64 = 0.100;
++
++/// 7.2.4/V.8 bis: 100 ms of mark at 300 bit/s.
++const PREAMBLE: usize = 30;
++const FLAG: u8 = 0x7e;
++
++/// QC2a, QCA2a, QC2d or QCA2d: which end, which of the two, the LAPM bit,
++/// and UQTS (from an analogue modem) or ANSpcm's level LM (from a digital one).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Qc2 {
++    pub digital: bool,
++    pub acknowledge: bool,
++    pub lapm: bool,
++    /// UQTS for the analogue modem's; LM (0 to 3) for the digital modem's.
++    pub value: u8,
++}
++
++impl Qc2 {
++    /// The identification field in the order it is sent, bit 0 first.
++    fn field_bits(&self) -> [bool; 16] {
++        let mut b = [false; 16];
++        // 0:3 message type "1011", 4:7 revision "0100", as the tables give
++        // them first bit first (Table 3/V.8 bis: 1101, bit 1 first).
++        b[..8].copy_from_slice(&[true, false, true, true, false, true, false, false]);
++        if self.digital {
++            // 8:9 LM, 10:12 reserved.
++            b[8] = self.value >> 1 & 1 == 1;
++            b[9] = self.value & 1 == 1;
++        } else {
++            // 8:11 WXYZ: UQTS's place in Table 2/V.92, W first.
++            let i = UQTS.iter().position(|&u| u == self.value).unwrap_or(10) as u8;
++            for k in 0..4 {
++                b[8 + k] = i >> (3 - k) & 1 == 1;
++            }
++        }
++        b[13] = self.lapm;
++        b[14] = self.acknowledge;
++        b[15] = self.digital;
++        b
++    }
++
++    /// The information field's two octets, bit 1 of each sent first.
++    pub fn octets(&self) -> [u8; 2] {
++        let b = self.field_bits();
++        std::array::from_fn(|o| (0..8).fold(0u8, |v, i| v | u8::from(b[8 * o + i]) << i))
++    }
++
++    pub fn from_octets(info: &[u8]) -> Option<Self> {
++        if info.len() < 2 {
++            return None;
++        }
++        let bit = |n: usize| info[n / 8] >> (n % 8) & 1 == 1;
++        // Message type 1011, "defined in ITU-T V.92"; the revision is ignored
++        // (the Note to each table).
++        if !(bit(0) && !bit(1) && bit(2) && bit(3)) {
++            return None;
++        }
++        let digital = bit(15);
++        let value = if digital {
++            u8::from(bit(8)) << 1 | u8::from(bit(9))
++        } else {
++            let i = (0..4).fold(0usize, |v, k| v << 1 | usize::from(bit(8 + k)));
++            *UQTS.get(i)?
++        };
++        Some(Self { digital, acknowledge: bit(14), lapm: bit(13), value })
++    }
++
++    /// The whole message as bits to send: preamble, flags, the field and its
++    /// FCS with zeros inserted, and closing flags.
++    pub fn to_bits(&self) -> Vec<bool> {
++        frame(&self.octets())
++    }
++}
++
++/// HDLC's FCS (7.2.7/V.8 bis): CRC-16 with the polynomial x^16 + x^12 + x^5
++/// + 1 from all ones, over the bits as sent, complemented.
++fn crc(bits: impl Iterator<Item = bool>) -> u16 {
++    let mut c = 0xffffu16;
++    for b in bits {
++        let x = (c & 1 == 1) ^ b;
++        c >>= 1;
++        if x {
++            c ^= 0x8408;
++        }
++    }
++    c
++}
++
++fn octet_bits(o: u8) -> impl Iterator<Item = bool> {
++    (0..8).map(move |i| o >> i & 1 == 1)
++}
++
++/// A V.8 bis message carrying `info`.
++pub fn frame(info: &[u8]) -> Vec<bool> {
++    let fcs = !crc(info.iter().flat_map(|&o| octet_bits(o)));
++    let body: Vec<bool> = info.iter().flat_map(|&o| octet_bits(o)).chain((0..16).map(|i| fcs >> i & 1 == 1)).collect();
++    let mut bits = vec![true; PREAMBLE];
++    for _ in 0..2 {
++        bits.extend(octet_bits(FLAG));
++    }
++    let mut ones = 0;
++    for b in body {
++        bits.push(b);
++        ones = if b { ones + 1 } else { 0 };
++        if ones == 5 {
++            bits.push(false);
++            ones = 0;
++        }
++    }
++    for _ in 0..2 {
++        bits.extend(octet_bits(FLAG));
++    }
++    bits
++}
++
++/// Messages back out of a bit stream: frames between flags, zeros taken out,
++/// the FCS checked (7.2.8, 7.2.9/V.8 bis).
++#[derive(Debug, Clone, Default)]
++pub struct Deframer {
++    ones: usize,
++    /// Bits since the last flag, zeros taken out; None outside a frame.
++    bits: Option<Vec<bool>>,
++}
++
++impl Deframer {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn feed(&mut self, bit: bool) -> Option<Vec<u8>> {
++        if bit {
++            self.ones += 1;
++            if self.ones > 6 {
++                // Seven ones: an abort, or idle mark.
++                self.bits = None;
++            } else if let Some(b) = self.bits.as_mut() {
++                b.push(true);
++            }
++            return None;
++        }
++        let ones = std::mem::replace(&mut self.ones, 0);
++        if ones == 6 {
++            // A flag: its six ones went in as data; take them, and its
++            // opening zero, back out.
++            let got = self.bits.take().and_then(|mut b| {
++                b.truncate(b.len().saturating_sub(7));
++                Self::finish(&b)
++            });
++            self.bits = Some(Vec::new());
++            return got;
++        }
++        if ones == 5 {
++            // An inserted zero.
++            return None;
++        }
++        if let Some(b) = self.bits.as_mut() {
++            b.push(false);
++        }
++        None
++    }
++
++    fn finish(bits: &[bool]) -> Option<Vec<u8>> {
++        if bits.len() < 24 || !bits.len().is_multiple_of(8) {
++            return None;
++        }
++        // Over the field and its FCS, a good frame leaves 0xf0b8.
++        if crc(bits.iter().copied()) != 0xf0b8 {
++            return None;
++        }
++        let info = &bits[..bits.len() - 16];
++        Some(info.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |v, (i, &b)| v | u8::from(b) << i)).collect())
++    }
++}
++
++/// V.21 as a synchronous bit stream, for V.8 bis's frames: the discriminator
++/// sampled once a bit, the clock set by each change of tone.
++#[derive(Debug)]
++pub struct SyncRx {
++    detector: FskDetector,
++    per_bit: f64,
++    /// Samples to the next bit centre.
++    until: f64,
++    last: f64,
++    deframer: Deframer,
++}
++
++impl SyncRx {
++    /// For the band of `(space, mark)`.
++    pub fn new(tones: (f64, f64), fs: f64) -> Self {
++        let per_bit = fs / 300.0;
++        Self { detector: FskDetector::new(tones.0, tones.1, 300.0, fs), per_bit, until: per_bit, last: 0.0, deframer: Deframer::new() }
++    }
++
++    /// One line sample; a message's information field when one ends.
++    pub fn feed(&mut self, sample: f64) -> Option<Vec<u8>> {
++        let level = self.detector.feed(sample);
++        if !self.detector.carrier() {
++            self.last = level;
++            return None;
++        }
++        if (level > 0.0) != (self.last > 0.0) {
++            // A change of tone is a bit's edge: its centre half a bit on.
++            self.until = self.per_bit / 2.0;
++        }
++        self.last = level;
++        self.until -= 1.0;
++        if self.until > 0.0 {
++            return None;
++        }
++        self.until += self.per_bit;
++        self.deframer.feed(level > 0.0)
++    }
++}
++
++/// CRe, as the answering end sends it.
++#[derive(Debug)]
++pub struct CreTx {
++    a: Nco,
++    b: Nco,
++    second: Nco,
++    t: f64,
++    fs: f64,
++}
++
++impl CreTx {
++    pub fn new(fs: f64) -> Self {
++        Self { a: Nco::new(CRE_PAIR.0, fs), b: Nco::new(CRE_PAIR.1, fs), second: Nco::new(CRE_SECOND, fs), t: 0.0, fs }
++    }
++
++    /// Whether all of it has been sent.
++    pub fn done(&self) -> bool {
++        self.t >= CRE_FIRST_SECONDS + CRE_SECOND_SECONDS
++    }
++
++    /// At 12 to 15 dB below the usual level (7.1.4/V.8 bis): `level` is
++    /// what each tone of the pair gets.
++    pub fn next_sample(&mut self, level: f64) -> f64 {
++        let t = self.t;
++        self.t += 1.0 / self.fs;
++        let (a, b, s) = (self.a.step().0, self.b.step().0, self.second.step().0);
++        if t < CRE_FIRST_SECONDS {
++            level * (a + b)
++        } else if t < CRE_FIRST_SECONDS + CRE_SECOND_SECONDS {
++            level * 1.4 * s
++        } else {
++            0.0
++        }
++    }
++}
++
++/// An ear for CRe's first segment (9.2.1.2/V.92: "If the initial 50 ms of
++/// signal CRe is detected"): both tones of the pair, each well above the line
++/// around them, held without a break.
++#[derive(Debug)]
++pub struct CreDetector {
++    a: ToneDetector,
++    b: ToneDetector,
++    /// Bands either side and between, far enough off the pair not to hear it:
++    /// V.21's lands in the middle one. ANSam at 2100 Hz reaches the 2002 Hz
++    /// ear but not the 1375 Hz one, and the two must match.
++    beside: [ToneDetector; 3],
++    held: f64,
++    fs: f64,
++}
++
++impl CreDetector {
++    pub fn new(fs: f64) -> Self {
++        Self {
++            a: ToneDetector::new(CRE_PAIR.0, 40.0, fs),
++            b: ToneDetector::new(CRE_PAIR.1, 40.0, fs),
++            beside: [ToneDetector::new(1080.0, 40.0, fs), ToneDetector::new(1700.0, 40.0, fs), ToneDetector::new(2450.0, 40.0, fs)],
++            held: 0.0,
++            fs,
++        }
++    }
++
++    /// Seconds the pair has been heard without a break.
++    pub fn feed(&mut self, x: f64) -> f64 {
++        self.a.feed(x);
++        self.b.feed(x);
++        for d in &mut self.beside {
++            d.feed(x);
++        }
++        let (a, b) = (self.a.amplitude(), self.b.amplitude());
++        let other = self.beside.iter().map(ToneDetector::amplitude).fold(0.0, f64::max);
++        let heard = a > 0.003 && b > 0.003 && a.min(b) > 4.0 * other && a.max(b) < 3.0 * a.min(b);
++        self.held = if heard { self.held + 1.0 / self.fs } else { 0.0 };
++        self.held
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::bell103::Bell103Tx;
++
++    #[test]
++    fn each_field_reads_back_as_it_was_written() {
++        for q in [
++            Qc2 { digital: false, acknowledge: false, lapm: true, value: 79 },
++            Qc2 { digital: false, acknowledge: true, lapm: false, value: 61 },
++            Qc2 { digital: true, acknowledge: false, lapm: true, value: 1 },
++            Qc2 { digital: true, acknowledge: true, lapm: true, value: 3 },
++        ] {
++            assert_eq!(Qc2::from_octets(&q.octets()), Some(q));
++        }
++        // Message type and revision as Table 3/V.92 lists them.
++        assert_eq!(Qc2 { digital: false, acknowledge: false, lapm: false, value: 61 }.octets()[0], 0b0010_1101);
++    }
++
++    #[test]
++    fn a_frame_comes_back_through_the_deframer_and_a_spoiled_one_does_not() {
++        let info = [0x7e, 0xff, 0x1f, 0x00];
++        let mut d = Deframer::new();
++        let mut bits = vec![true; 40];
++        bits.extend(frame(&info));
++        let got: Vec<Vec<u8>> = bits.iter().filter_map(|&b| d.feed(b)).collect();
++        assert_eq!(got, vec![info.to_vec()]);
++        let mut bad = frame(&info);
++        let n = bad.len() / 2;
++        bad[n] = !bad[n];
++        let mut d = Deframer::new();
++        assert!(bad.iter().all(|&b| d.feed(b).is_none()));
++    }
++
++    /// QC2a on V.21(H) through the receiver, from the line.
++    #[test]
++    fn a_qc2a_on_the_line_is_read() {
++        let fs = 16_000.0;
++        let q = Qc2 { digital: false, acknowledge: false, lapm: true, value: 79 };
++        let mut tx = Bell103Tx::with_tones(crate::v8::HIGH.0, crate::v8::HIGH.1, fs);
++        tx.set_transmitting(true);
++        tx.push_bits(&q.to_bits());
++        let mut rx = SyncRx::new(crate::v8::HIGH, fs);
++        let mut got = None;
++        for _ in 0..(1.0 * fs) as usize {
++            if let Some(info) = rx.feed(0.3 * tx.next_sample()) {
++                got = Qc2::from_octets(&info);
++            }
++        }
++        assert_eq!(got, Some(q));
++    }
++
++    #[test]
++    fn cre_is_heard_and_ansam_and_v21_are_not() {
++        let fs = 16_000.0;
++        let mut d = CreDetector::new(fs);
++        let mut cre = CreTx::new(fs);
++        let held = (0..(0.3 * fs) as usize).map(|_| d.feed(cre.next_sample(0.05))).fold(0.0, f64::max);
++        assert!(held > 0.2, "{held}");
++        let mut d = CreDetector::new(fs);
++        let mut tx = Bell103Tx::with_tones(crate::v8::HIGH.0, crate::v8::HIGH.1, fs);
++        tx.set_transmitting(true);
++        tx.push_bits(&(0..300).map(|i| i % 3 == 0).collect::<Vec<_>>());
++        let mut tone = Nco::new(2100.0, fs);
++        let held = (0..fs as usize).map(|_| d.feed(0.2 * tx.next_sample() + 0.1 * tone.step().0)).fold(0.0, f64::max);
++        assert!(held < 0.02, "{held}");
++    }
++}
 diff --git a/crates/datapump/tests/v90_call.rs b/crates/datapump/tests/v90_call.rs
 index 36d0d26..af609df 100644
 --- a/crates/datapump/tests/v90_call.rs
@@ -6162,7 +6768,7 @@ index c196b0c..1396a0a 100644
                  if role == Role::Answerer {
                      self.call.set_v8_capable(false);
 diff --git a/crates/modem/src/lib.rs b/crates/modem/src/lib.rs
-index a0ef49a..9861149 100644
+index a0ef49a..28cfbb4 100644
 --- a/crates/modem/src/lib.rs
 +++ b/crates/modem/src/lib.rs
 @@ -30,6 +30,7 @@ use datapump::v32;
@@ -6253,7 +6859,7 @@ index a0ef49a..9861149 100644
              "B103" => None,
              _ => Some(Modulation::V22bis),
          }) else {
-@@ -2418,6 +2449,19 @@ impl Modem {
+@@ -2418,6 +2449,25 @@ impl Modem {
                  self.negotiation = None;
                  self.start_pump(Some(modulation));
              }
@@ -6263,9 +6869,15 @@ index a0ef49a..9861149 100644
 +            v8line::Status::QuickConnect { lapm } => {
 +                self.declared_lapm = lapm;
 +                self.pcm_role = Some(PcmRole::Analogue);
++                // QC2 when the server opened with V.8 bis's CRe and took QC2a;
++                // QC1 when it sent ANSam and took QC1a.
++                let qc2 = self.negotiation.as_ref().is_some_and(v8line::Modem::was_qc2);
 +                self.negotiation = None;
 +                let recall = self.quick_offered.expect("only offered with a recall");
-+                self.line_notes.push("V.92 Quick Connect: short phase 1 done, asking for the short phase 2".into());
++                self.line_notes.push(format!(
++                    "V.92 Quick Connect {}: short phase 1 done, asking for the short phase 2",
++                    if qc2 { "2 (QC2a to the server's CRe, QCA2d back)" } else { "1 (QC1a, QCA1d back)" }
++                ));
 +                let mut analogue = v90::startup::Analogue::quick(recall, self.fs);
 +                analogue.set_pinned(self.pinned_rate);
 +                self.pump = Some(Pump::V90(Box::new(analogue)));
@@ -6273,7 +6885,7 @@ index a0ef49a..9861149 100644
              // 8.1.1: a far end that sent the plain answering tone of V.25 does
              // not speak V.8, and the call goes on "in accordance with Annex
              // A/V.32 bis, ITU-T T.30, or other appropriate Recommendations" --
-@@ -2463,13 +2507,27 @@ impl Modem {
+@@ -2463,13 +2513,27 @@ impl Modem {
              // whose far end answered with a plain ANS on to V.32bis's own
              // start-up, and so does a V.8 that was turned off.
              _ => match self.at.modulation.carrier.as_str() {
@@ -6303,7 +6915,7 @@ index a0ef49a..9861149 100644
                  analogue.set_pinned(self.pinned_rate);
                  Pump::V90(Box::new(analogue))
              }
-@@ -2556,7 +2614,52 @@ impl Modem {
+@@ -2556,7 +2620,52 @@ impl Modem {
      }
  
      /// End the call, leaving what the terminal is told to whoever asked.
@@ -6356,7 +6968,7 @@ index a0ef49a..9861149 100644
          // A fax call is a call too, and putting the line down has to stop it
          // -- otherwise the only way out of a fax that has gone wrong is to
          // close the program. What it learned is kept for the window.
-@@ -2589,6 +2692,10 @@ impl Modem {
+@@ -2589,6 +2698,10 @@ impl Modem {
  /// The level is not information. A real line delivers whatever it delivers,
  /// which is why a receiver has gain control at all, so scaling a recording to
  /// fit loses nothing that was in it.
@@ -6579,10 +7191,10 @@ index b309ee5..b4db667 100644
  
 diff --git a/crates/modem/tests/v92_quick.rs b/crates/modem/tests/v92_quick.rs
 new file mode 100644
-index 0000000..49d114a
+index 0000000..c0677f2
 --- /dev/null
 +++ b/crates/modem/tests/v92_quick.rs
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,319 @@
 +//! V.92's Quick Connect from the terminal: dial a V.92 server once, which
 +//! is a full start-up and teaches the modem the server; dial it again, and
 +//! the call goes through V.92's short Phase 1 and short Phase 2 and comes up
@@ -6625,6 +7237,13 @@ index 0000000..49d114a
 +        .offering_pcm_on(Pcm { digital: true, ..Pcm::default() }, Access { digital: true, ..Access::default() })
 +        .answering_quick_connect();
 +        Self { v8: Some(v8), startup: None, ec: None, received: Vec::new(), ticks: 0, quick: false, deaf_to_cpt: false }
++    }
++
++    /// The same server, opening with V.8 bis's CRe rather than ANSam.
++    fn with_cre() -> Self {
++        let mut server = Self::new();
++        server.v8 = server.v8.take().map(v8line::Modem::answering_with_cre);
++        server
 +    }
 +
 +    fn info0d() -> Info0d {
@@ -6855,5 +7474,43 @@ index 0000000..49d114a
 +    assert!(second.notes.iter().any(|n| n.contains("not PCM upstream")), "{:?}", second.notes);
 +    assert!(!second.notes.iter().any(|n| n.contains("no Ri")), "{:?}", second.notes);
 +    assert!(quick < took - 3.0, "{quick:.2} s against {took:.2} s");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// A V.92 server that opens with V.8 bis's CRe: the first call, with nothing
++/// learned, ignores it and gets ANSam and a full start-up; the second answers
++/// it with QC2a, gets QCA2d, and comes up the short way.
++#[test]
++fn a_server_opening_with_cre_gets_quick_connect_2() {
++    let dir = std::env::temp_dir().join(format!("binmodem-qc2-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let memory = dir.join("quick-connect");
++    let _ = std::fs::remove_file(&memory);
++
++    let mut first = Call::new(&memory);
++    first.server = Server::with_cre();
++    first.type_at("AT+MS=V92");
++    first.run(0.05);
++    first.type_at("ATD5551234");
++    let full = first.run_until_online(40.0).unwrap_or_else(|| panic!("the first call never came up: {:?}", first.saw()));
++    assert!(!first.server.quick);
++
++    let mut second = Call::new(&memory);
++    second.server = Server::with_cre();
++    second.type_at("AT+MS=V92");
++    second.run(0.05);
++    second.type_at("ATD5551234");
++    let quick = second.run_until_online(40.0).unwrap_or_else(|| panic!("the second call never came up: {:?}", second.saw()));
++    println!("full {full:.2} s, QC2 {quick:.2} s; {:?}", second.notes.first());
++    assert!(second.server.quick, "the second call did not quick connect");
++    assert!(second.notes.iter().any(|n| n.contains("Quick Connect 2")), "{:?}", second.notes);
++    assert!(quick < full, "{quick:.2} s against {full:.2} s");
++    second.run(3.0);
++    for b in b"qc2 hello" {
++        second.caller.feed_dte(*b);
++    }
++    second.run(3.0);
++    let got = String::from_utf8_lossy(&second.server.received).into_owned();
++    assert!(got.contains("qc2 hello"), "the server got {got:?}");
 +    let _ = std::fs::remove_dir_all(&dir);
 +}

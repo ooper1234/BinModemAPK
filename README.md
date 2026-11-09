@@ -114,6 +114,14 @@ order of TRN2u's levels, for one) this follows its plainest reading.
   (no line probing; INFO1a per Table 19/V.92), then V.90's phases 3 and 4
   with V.34 upstream: a Quick Connect does not ask for PCM upstream.
   LAPM is agreed in the short Phase 1, with no ODP/ADP.
+- **Quick Connect 2** (9.2.1.2/V.92): a server that opens with V.8 bis's
+  CRe (1375 + 2002 Hz, then 400 Hz) instead of ANSam is answered with QC2a, a
+  V.8 bis frame on V.21(H). Its QCA2d (on V.21(L)) leads to the same QTS,
+  ANSpcm, TONEq and short Phase 2 as QC1, a little sooner: in simulation
+  7.2 s to online against 11.6 s in full. A CRe with no QCA2d after it is
+  waited past for ANSam, and QC1 or V.8. The Line notes say which Quick
+  Connect a call used. Only the V.8 bis this needs is here: CRe, and
+  QC2a/QCA2d framed as 7.2/V.8 bis has it (flags, FCS, zero insertion).
 - A server that ignores QC1a answers the CM with JM, and V.8 goes on as
   before. A Quick Connect that fails to reach data mode forgets the number,
   so the next call starts in full.
