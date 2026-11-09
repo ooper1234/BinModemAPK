@@ -18,18 +18,34 @@ tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
 [ -f "$here/BinModem/Cargo.toml" ] || git -C "$here" submodule update --init --recursive
 
-# Android-build changes to the modem itself (android/patches), applied to the
-# submodule's working tree; the submodule stays at its upstream commit.
-for patch in "$here"/android/patches/*.patch; do
-    [ -e "$patch" ] || continue
-    if git -C "$here/BinModem" apply --check "$patch" 2>/dev/null; then
-        git -C "$here/BinModem" apply "$patch"
+# Android-build changes to the modem itself (android/patches), applied in
+# order to the submodule's working tree; the submodule stays at its upstream
+# commit. A clean tree gets them all. Otherwise they must already be there:
+# the patched files are checked against the upstream commit with every patch
+# applied -- one at a time does not do, as a later patch may change lines next
+# to an earlier one's.
+patches=("$here"/android/patches/*.patch)
+if [ -z "$(git -C "$here/BinModem" status --porcelain --untracked-files=no)" ]; then
+    for patch in "${patches[@]}"; do
+        git -C "$here/BinModem" apply "$patch" || { echo "$(basename "$patch") no longer applies to BinModem" >&2; exit 1; }
         echo "applied $(basename "$patch")"
-    elif ! git -C "$here/BinModem" apply -R --check "$patch" 2>/dev/null; then
-        echo "$(basename "$patch") no longer applies to BinModem" >&2
-        exit 1
-    fi
-done
+    done
+else
+    want=$(mktemp -d)
+    trap 'rm -rf "$want"' EXIT
+    git -C "$here/BinModem" archive HEAD | tar -x -C "$want"
+    for patch in "${patches[@]}"; do
+        (cd "$want" && git apply "$patch") || { echo "$(basename "$patch") no longer applies to BinModem" >&2; exit 1; }
+    done
+    for f in $(cd "$here/BinModem" && git status --porcelain --untracked-files=all | awk '{print $2}') \
+             $(cat "${patches[@]}" | sed -n 's|^+++ b/||p' | sort -u); do
+        if ! cmp -s "$want/$f" "$here/BinModem/$f"; then
+            echo "BinModem/$f is not what android/patches make it: start from a clean submodule" >&2
+            exit 1
+        fi
+    done
+    echo "android/patches already applied"
+fi
 
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android$api-clang"
 export CC_aarch64_linux_android="$tc/aarch64-linux-android$api-clang"
