@@ -62,6 +62,14 @@ say each of these: "reading the DIL", "lost the DIL's place ... looking for
 it", "found the DIL again", "the DIL read once over ... going on with that".
 This is in `android/patches/v92-quick-connect.patch` with the V.92 work.
 
+### Recording a call
+
+**Record** on the Line page, while a line is open, keeps the call as a stereo
+WAV (what arrived on one channel, what was sent on the other) in
+`Android/data/io.github.binmodem/files/captures/` on the phone, which a
+computer reaches over USB. A recording of a call that went wrong can be run
+through the receiver again, on a computer, to find out why.
+
 ### V.92: Quick Connect and PCM upstream
 
 Upstream BinModem has no V.92. This build adds V.92's PCM upstream and its

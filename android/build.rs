@@ -5,7 +5,8 @@
 //! submodule, the sources are copied into OUT_DIR with four swaps -- rows
 //! held to the screen, combo boxes and sliders that wrap, and windows that open as full-screen sheets
 //! (mobile::wrapped, Combo, Slider, Window) -- live.rs's two ways out
-//! to a speaker go through the sound switch (mobile::muted), and app.rs gets one
+//! to a speaker go through the sound switch (mobile::muted), its recordings go
+//! to mobile::captures_dir, and app.rs gets one
 //! line added: `mod mobile;`, pointing at src/mobile.rs here. Upstream stays
 //! byte-for-byte as checked out.
 
@@ -95,6 +96,11 @@ fn main() {
                 (
                     "sink.push(&from_line);",
                     "crate::app::mobile::monitor(&sink, &from_line, &to_line, if modem.exact_levels() { 1.0 } else { drive }, audio.sip().is_some(), modem.role() == Role::Answering);",
+                ),
+                // Recordings where they can be got at (mobile::captures_dir).
+                (
+                    "let dir = std::path::Path::new(\"captures\");",
+                    "let dir = &crate::app::mobile::captures_dir();",
                 ),
                 // The spectrum and waterfall show the sides that are on.
                 (

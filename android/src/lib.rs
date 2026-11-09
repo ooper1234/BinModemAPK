@@ -55,6 +55,9 @@ fn android_main(android_app: AndroidApp) {
         }
         let _ = std::env::set_current_dir(&home);
     }
+    if let Some(outside) = android_app.external_data_path() {
+        app::mobile::set_captures_dir(outside.join("captures"));
+    }
     app::mobile::load_muted();
 
     if let Err(e) = request_microphone() {

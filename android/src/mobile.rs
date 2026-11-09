@@ -419,6 +419,20 @@ impl ScopeApp {
 
 /// Whether everything the phone would play out loud is silenced: the modem's
 /// own tones on a sound-card line, and the monitor that plays the caller.
+/// Where Record puts its files: the app's external files folder on the
+/// phone (Android/data/io.github.binmodem/files/captures), which a computer
+/// on USB or a file manager can reach, so a recording can be sent on; its
+/// private data folder cannot be reached at all.
+static CAPTURES: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_captures_dir(dir: std::path::PathBuf) {
+    let _ = CAPTURES.set(dir);
+}
+
+pub fn captures_dir() -> std::path::PathBuf {
+    CAPTURES.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("captures"))
+}
+
 static MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Where the choice is kept between runs: a file that exists while muted, in
