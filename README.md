@@ -74,8 +74,14 @@ INFO1a (Table 18/V.92) of a server that offers it in INFO1d, and then:
   downstream receiver has trained, a phase-locked loop holds the upstream to
   the receiver's sampling clock. In simulation a sound card 100 ppm fast or
   slow makes no difference.
-- After two start-ups with PCM upstream that do not come up, the call drops
-  it and uses V.34's upstream under V.90's downstream.
+- Phase 3 is watched a step at a time: Jp within 6 s of Su, Jp' within 2 s
+  of Jp, the DIL read within 10 s, Ri within 3 s of CPt (each plus the round
+  trip). The Line notes say which step a start-up stopped at ("found Jp'",
+  "sent CPt", "found Ri", or "failed: V.92: no Ri ...").
+- A start-up with PCM upstream that does not come up is retrained at once
+  with V.34's upstream under V.90's downstream, and the next five calls to
+  that number go with V.34's upstream from the start (kept in the same
+  `quick-connect` file). A call that comes up with PCM upstream clears this.
 
 In simulation (a V.92 server written for it here, which works out the
 precoder and constellations from TRN1u and reads the upstream with a Viterbi

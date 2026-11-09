@@ -1229,7 +1229,7 @@ index 52e648b..d5f8c0d 100644
      fn negotiate_protocol(ours: bool, theirs: bool, seconds: f64) -> (bool, bool) {
          let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS);
 diff --git a/crates/datapump/src/v90/analogue.rs b/crates/datapump/src/v90/analogue.rs
-index 63912b7..84100b0 100644
+index 63912b7..78aca22 100644
 --- a/crates/datapump/src/v90/analogue.rs
 +++ b/crates/datapump/src/v90/analogue.rs
 @@ -509,6 +509,9 @@ pub struct Settings {
@@ -1309,7 +1309,7 @@ index 63912b7..84100b0 100644
          self.notes.push(
              if initiating { "rate renegotiation, begun by this end" } else { "rate renegotiation, begun by the digital modem's Rd" }.into(),
          );
-@@ -2080,11 +2107,18 @@ impl Modem {
+@@ -2080,15 +2107,33 @@ impl Modem {
      }
  
      pub fn send_bits(&mut self, bits: &[bool]) {
@@ -1328,7 +1328,22 @@ index 63912b7..84100b0 100644
          let frame = self.source.encoder.as_ref().map_or(0, |e| e.params().framing.b);
          self.source.data.len().saturating_sub(frame)
      }
-@@ -2170,8 +2204,20 @@ impl Modem {
+ 
++    /// V.92's phase 3 with PCM upstream, a step at a time (9.5.2.1.6 to
++    /// 9.5.2.1.11): each thing the digital modem should answer with has
++    /// `seconds` and the round trip to come, or the start-up fails saying
++    /// which -- and the next goes with V.34's upstream. Waiting out B1d's
++    /// fifteen seconds instead leaves a stuck DIL running for half a minute.
++    fn v92_watch(&mut self, seconds: f64, why: &'static str) {
++        if self.up.is_some() {
++            self.deadline = Some((self.samples(seconds + 2.0 * self.settings.round_trip), why));
++        }
++    }
++
+     fn fail(&mut self, why: &'static str) {
+         self.notes.push(format!("failed: {why}"));
+         self.status = Status::Failed(why);
+@@ -2170,8 +2215,20 @@ impl Modem {
              }
          }
          self.stage_step();
@@ -1351,7 +1366,7 @@ index 63912b7..84100b0 100644
          match self.source.began.take() {
              Some(Began::Cp(bits)) => {
                  if let Some(cp) = Cp::from_bits(&bits) {
-@@ -2184,9 +2230,17 @@ impl Modem {
+@@ -2184,9 +2241,17 @@ impl Modem {
          out
      }
  
@@ -1370,7 +1385,7 @@ index 63912b7..84100b0 100644
                  self.stage = Stage::AwaitSd;
                  self.rx.hunt(self.settings.uinfo);
                  // 9.3.2.4: S-bar-d within 1500 ms of the start of Ja.
-@@ -2202,12 +2256,16 @@ impl Modem {
+@@ -2202,12 +2267,16 @@ impl Modem {
                  // 9.4.2.4: a CP' sent, and MP' or Ed heard: E once the
                  // current CP' is whole.
                  let heard_back = !self.awaiting_turn && self.frames.as_ref().is_some_and(|f| f.far_acknowledged || f.ed);
@@ -1389,7 +1404,7 @@ index 63912b7..84100b0 100644
                      self.status = Status::Connected { downstream: self.downstream_rate, upstream: self.upstream_rate };
                      self.deadline = None;
                      self.margin_at = self.samples(MARGIN_SETTLE);
-@@ -2231,6 +2289,9 @@ impl Modem {
+@@ -2231,6 +2300,9 @@ impl Modem {
                  if self.stage == Stage::AwaitSd {
                      // 9.3.2.4: "terminate Ja and transmit silence".
                      self.source.change(Up::Silence);
@@ -1399,7 +1414,7 @@ index 63912b7..84100b0 100644
                      self.stage = Stage::Training;
                      self.deadline = Some((self.samples(4.5 + self.settings.round_trip), "no Jd from the digital modem"));
                  }
-@@ -2245,6 +2306,9 @@ impl Modem {
+@@ -2245,6 +2317,9 @@ impl Modem {
                  // and the hunt, while Sd can still come.
                  self.stage = Stage::AwaitSd;
                  self.source.change(Up::Ja);
@@ -1409,7 +1424,7 @@ index 63912b7..84100b0 100644
                  self.rx.hunt(self.settings.uinfo);
                  self.deadline = Some(self.sd_deadline);
              }
-@@ -2268,6 +2332,17 @@ impl Modem {
+@@ -2268,6 +2343,18 @@ impl Modem {
          match self.stage {
              Stage::AwaitJd | Stage::AwaitJdPrime => {
                  let jd_prime = self.jd.feed(symbol.index, symbol.positive());
@@ -1423,23 +1438,26 @@ index 63912b7..84100b0 100644
 +                    self.jp_heard = true;
 +                    up.heard_jp(jp.fraction, jp.eight_in_training);
 +                    self.notes.push(format!("found Jp: Su extended by {:.3} of a symbol", jp.fraction));
++                    self.v92_watch(2.0, "V.92: Jp, but no Jp' after it");
 +                }
                  let early = (JD_LATEST + S_AFTER_JD - self.settings.round_trip).max(0.0) * digital::FS;
                  if self.stage == Stage::AwaitJd && !self.sending_s && symbol.raw as f64 >= early {
                      self.send_s();
-@@ -2318,6 +2393,11 @@ impl Modem {
+@@ -2318,6 +2405,13 @@ impl Modem {
      /// S until J'd (9.3.2.7).
      fn send_s(&mut self) {
          self.sending_s = true;
 +        // V.92: Su, Su-bar for 24.5T and Su until Jp (9.5.2.1.6).
 +        if let Some(up) = self.up.as_mut() {
 +            up.send_su();
++            // 9.5.1.2.2: the digital modem looks for Su for 5100 ms.
++            self.v92_watch(6.0, "V.92: no Jp from the digital modem after Su");
 +            return;
 +        }
          self.source.s_length = None;
          self.source.change(Up::S);
      }
-@@ -2326,8 +2406,10 @@ impl Modem {
+@@ -2326,8 +2420,15 @@ impl Modem {
      /// the frames put where the DIL says they are, and the symbols in
      /// `already` read as its first.
      fn begin_dil(&mut self, first: u64, already: &[(u64, f64)]) {
@@ -1448,11 +1466,16 @@ index 63912b7..84100b0 100644
 +        if self.up.is_none() {
 +            self.source.after_s_bar = Up::Silence;
 +            self.source.change(Up::SBar);
++        } else {
++            self.notes.push("found Jp': the DIL next".into());
 +        }
++        // Two passes of the longest DIL a descriptor here asks for take
++        // well under this.
++        self.v92_watch(10.0, "V.92: the DIL was not read");
          self.stage = Stage::Dil;
          self.dil_base = first as i64;
          // J'd ends on a frame boundary -- Jd does, and J'd is two frames --
-@@ -2574,12 +2656,18 @@ impl Modem {
+@@ -2574,12 +2675,19 @@ impl Modem {
          self.finish_cp(&mut choice.data);
          self.finish_cp(&mut choice.training);
          self.downstream_rate = sequences::data_rate(choice.data.drn).unwrap_or(0);
@@ -1466,6 +1489,7 @@ index 63912b7..84100b0 100644
 +            // V.92: CPt after TRN1u, and CPu ready for phase 4 (9.5.2.1.11).
 +            up.send_cpt(&choice.training);
 +            up.set_cpu(choice.data.clone());
++            self.v92_watch(3.0, "V.92: no Ri: the digital modem did not take CPt");
 +        } else {
 +            // "S for 128T followed by S-bar for 16T", and phase 4: CPt.
 +            self.source.s_length = Some(signals::S_SYMBOLS);
@@ -1477,7 +1501,7 @@ index 63912b7..84100b0 100644
          self.route = Some(route);
          self.choice = Some(choice);
          // What comes down now is more DIL, and then R: nothing to learn from
-@@ -2631,15 +2719,25 @@ impl Modem {
+@@ -2631,15 +2739,27 @@ impl Modem {
              if let RSeen::Turned(from) = seen {
                  // 9.4.2.2: the current CPt whole, then CP.
                  self.trn2d_from = Some(from);
@@ -1501,11 +1525,13 @@ index 63912b7..84100b0 100644
 +                // V.92: Ri heard, so E1u after the current CPt (9.5.2.1.11).
 +                if let Some(up) = self.up.as_mut() {
 +                    up.heard_ri();
++                    self.notes.push("found Ri: phase 4 next".into());
++                    self.deadline = Some(self.start_deadline);
 +                }
              }
              return;
          }
-@@ -2768,7 +2866,8 @@ impl Modem {
+@@ -2768,7 +2888,8 @@ impl Modem {
          // that took this end into data mode on a dead line. Only frames the
          // far end's signal carried are Ed.
          let zeros = bits.iter().all(|b| !*b);
@@ -1515,7 +1541,7 @@ index 63912b7..84100b0 100644
          if frames.zero_frames == 2 {
              // Ed: B1d next, at data mode's constellation, with the coding
              // started afresh (8.6.1).
-@@ -2779,6 +2878,9 @@ impl Modem {
+@@ -2779,6 +2900,9 @@ impl Modem {
              self.least_gap = dil::least_gap(&choice.data, route);
              self.downstream_rate = sequences::data_rate(choice.data.drn).unwrap_or(0);
              self.notes.push(format!("found Ed: B1d next, down at {} bit/s", self.downstream_rate));
@@ -1525,7 +1551,7 @@ index 63912b7..84100b0 100644
              let Some(data) = Mapping::from_cp(&choice.data) else { return };
              frames.decoder = Decoder::new(data);
              frames.levels = levels_for(&choice.data, route);
-@@ -2786,6 +2888,46 @@ impl Modem {
+@@ -2786,6 +2910,46 @@ impl Modem {
              self.rx.set_slicer(slicer);
              return;
          }
@@ -1573,10 +1599,32 @@ index 63912b7..84100b0 100644
              if let Some(Found::Mp(mp)) = frames.finder.feed(bit) {
                  if !frames.told_mps.contains(&mp) {
 diff --git a/crates/datapump/src/v90/digital.rs b/crates/datapump/src/v90/digital.rs
-index 93fd619..859395a 100644
+index 93fd619..3572948 100644
 --- a/crates/datapump/src/v90/digital.rs
 +++ b/crates/datapump/src/v90/digital.rs
-@@ -122,6 +122,9 @@ pub struct Settings {
+@@ -89,15 +89,19 @@ pub struct Habits {
+     pub trn1d: f64,
+     /// Whether 9.3.1.5's wait for S has the round trip added to it.
+     pub s_wait_counts_round_trip: bool,
++    /// Whether V.92's CPt is heard at all: a server that offers PCM upstream
++    /// and then never answers CPt, so its DIL goes on and on, is one to test
++    /// the analogue modem's way out against.
++    pub hears_v92_cpt: bool,
+ }
+ 
+ impl Habits {
+     /// Short TRN1d, and the Recommendation's wait for S.
+-    pub const PROMPT: Self = Self { trn1d: 0.3, s_wait_counts_round_trip: true };
++    pub const PROMPT: Self = Self { trn1d: 0.3, s_wait_counts_round_trip: true, hears_v92_cpt: true };
+ 
+     /// What a live server did: four seconds of TRN1d, and a wait for S that
+     /// did not allow for a second-long round trip.
+-    pub const LIVE_SERVER: Self = Self { trn1d: 4.05, s_wait_counts_round_trip: false };
++    pub const LIVE_SERVER: Self = Self { trn1d: 4.05, s_wait_counts_round_trip: false, hears_v92_cpt: true };
+ }
+ 
+ impl Default for Habits {
+@@ -122,6 +126,9 @@ pub struct Settings {
      /// top rates need.
      pub wide: bool,
      pub habits: Habits,
@@ -1586,7 +1634,7 @@ index 93fd619..859395a 100644
  }
  
  impl Settings {
-@@ -139,6 +142,7 @@ impl Settings {
+@@ -139,6 +146,7 @@ impl Settings {
              jd: Jd { rates: Jd::ALL_RATES, sixteen_in_training: false, sixteen_in_renegotiation: false, lookahead: 1 },
              wide,
              habits: Habits::default(),
@@ -1594,7 +1642,7 @@ index 93fd619..859395a 100644
          }
      }
  }
-@@ -201,6 +205,19 @@ struct Source {
+@@ -201,6 +209,19 @@ struct Source {
      r_codes: [u8; INTERVALS],
      data: VecDeque<bool>,
      trn1d_symbols: usize,
@@ -1614,7 +1662,7 @@ index 93fd619..859395a 100644
  }
  
  impl Source {
-@@ -231,6 +248,7 @@ impl Source {
+@@ -231,6 +252,7 @@ impl Source {
              mps_sent: 0,
              r_codes: [0; INTERVALS],
              data: VecDeque::new(),
@@ -1622,7 +1670,7 @@ index 93fd619..859395a 100644
          }
      }
  
-@@ -417,7 +435,21 @@ impl Source {
+@@ -417,7 +439,21 @@ impl Source {
                      }
                  }
                  let next = self.pending.take();
@@ -1645,7 +1693,7 @@ index 93fd619..859395a 100644
                      // A whole MP, or MP' once the far end's CP has come.
                      let mp = self.mp.unwrap_or_default();
                      let mp = if self.mp_ack { mp.acknowledged() } else { mp };
-@@ -535,6 +567,13 @@ pub struct Modem {
+@@ -535,6 +571,13 @@ pub struct Modem {
      /// The upstream no faster than this, as a multiple of 2400, from a
      /// renegotiation this end began.
      upstream_cap: Option<u8>,
@@ -1659,7 +1707,7 @@ index 93fd619..859395a 100644
  }
  
  impl Modem {
-@@ -579,7 +618,15 @@ impl Modem {
+@@ -579,7 +622,15 @@ impl Modem {
              clearing: false,
              renegotiations: 0,
              upstream_cap: None,
@@ -1675,7 +1723,7 @@ index 93fd619..859395a 100644
          // 9.4.1: B1 "within 15 s plus 5 round-trip delays after receiving
          // INFO1a".
          modem.deadline = Some((modem.samples(15.0 + 5.0 * settings.round_trip), "no B1 from the analogue modem"));
-@@ -736,6 +783,9 @@ impl Modem {
+@@ -736,6 +787,9 @@ impl Modem {
      /// One network sample in, one out.
      pub fn step(&mut self, input: f64) -> f64 {
          self.now += 1;
@@ -1685,7 +1733,7 @@ index 93fd619..859395a 100644
          self.rx.feed(input);
          match self.watching() {
              Some(learn) => {
-@@ -778,6 +828,137 @@ impl Modem {
+@@ -778,6 +832,138 @@ impl Modem {
          self.source.next()
      }
  
@@ -1747,6 +1795,7 @@ index 93fd619..859395a 100644
 +            // 9.5.1.1.9: the current Jp, then Jp' and the DIL.
 +            Event::SuTurnedAgain => self.s_heard = true,
 +            // 9.5.1.1.12: CPt, so Ri once the DIL is at a segment's end.
++            Event::Cpt(_) if !self.settings.habits.hears_v92_cpt => {}
 +            Event::Cpt(cpt) => {
 +                if self.cpt.is_none() {
 +                    let Some(training) = Mapping::from_cp(&cpt) else {
@@ -1823,7 +1872,7 @@ index 93fd619..859395a 100644
      /// From data mode to Rd (9.6.1.1.1, 9.6.1.2.2), and phase 4 after it.
      ///
      /// The answering end starts on S rather than on S turning into S-bar,
-@@ -869,7 +1050,7 @@ impl Modem {
+@@ -869,7 +1055,7 @@ impl Modem {
              }
              Stage::Phase4Cp => {
                  // 9.4.1.4: an MP' sent, and CP' or E heard.
@@ -1832,7 +1881,7 @@ index 93fd619..859395a 100644
                  if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
                      self.source.change(Out::Ed);
                  }
-@@ -879,7 +1060,7 @@ impl Modem {
+@@ -879,7 +1065,7 @@ impl Modem {
                      && !self.renegotiating
                      && self.source.out == Out::Data
                      && self.b1_left == 0
@@ -1949,7 +1998,7 @@ index af7d8a0..1461480 100644
  }
  
 diff --git a/crates/datapump/src/v90/startup.rs b/crates/datapump/src/v90/startup.rs
-index a31b259..765f659 100644
+index a31b259..0f93cac 100644
 --- a/crates/datapump/src/v90/startup.rs
 +++ b/crates/datapump/src/v90/startup.rs
 @@ -12,7 +12,8 @@
@@ -1962,18 +2011,29 @@ index a31b259..765f659 100644
  use crate::v34::startup as v34;
  
  use super::ucode::Law;
-@@ -22,6 +23,10 @@ use super::{analogue, digital};
+@@ -22,6 +23,12 @@ use super::{analogue, digital};
  /// asks for V.34 instead.
  const V90_RETRAINS: u32 = 2;
  
 +/// Start-ups with V.92's PCM upstream that may fail before the upstream is
-+/// V.34's instead.
-+const PCM_UP_TRIES: u32 = 2;
++/// V.34's instead: one. A digital modem that did not take it once is not
++/// likely to the second time, and V.34's upstream is the start-up V.90
++/// already knows works with it.
++const PCM_UP_TRIES: u32 = 1;
 +
  /// How the start-up is going.
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  pub enum Status {
-@@ -54,6 +59,9 @@ pub struct Analogue {
+@@ -44,6 +51,8 @@ pub struct Analogue {
+     v90: Option<analogue::Modem>,
+     /// V.90 start-ups that have failed in a row.
+     failed_starts: u32,
++    /// Whether V.92's PCM upstream was asked for and then given up on.
++    pcm_up_dropped: bool,
+     connected_once: bool,
+     last_failure: Option<&'static str>,
+     /// Renegotiations in V.90 data modes a retrain has since replaced.
+@@ -54,6 +63,9 @@ pub struct Analogue {
      /// The rate every V.90 start-up on this call asks for, as its drn, or
      /// None for the DIL's own choice (see [`analogue::Settings::pinned`]).
      pinned: Option<u8>,
@@ -1983,7 +2043,14 @@ index a31b259..765f659 100644
  }
  
  impl Analogue {
-@@ -70,9 +78,51 @@ impl Analogue {
+@@ -64,15 +76,64 @@ impl Analogue {
+             v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Analogue, fs), fs),
+             v90: None,
+             failed_starts: 0,
++            pcm_up_dropped: false,
+             connected_once: false,
+             last_failure: None,
+             renegotiations: 0,
              holes: 0,
              notes: Vec::new(),
              pinned: None,
@@ -1996,6 +2063,12 @@ index a31b259..765f659 100644
 +    pub fn with_pcm_upstream(mut self) -> Self {
 +        self.v34.phase2_mut().set_wants_pcm_up(true);
 +        self
++    }
++
++    /// Whether this call asked for V.92's PCM upstream and gave up on it
++    /// after a start-up that did not come up with it.
++    pub fn pcm_upstream_dropped(&self) -> bool {
++        self.pcm_up_dropped
 +    }
 +
 +    /// Whether the upstream is V.92's PCM.
@@ -2035,7 +2108,7 @@ index a31b259..765f659 100644
      /// The rate V.90 start-ups are to ask for, as its drn, or None for the
      /// DIL's own choice: from the window, before the call. This start-up's
      /// too, if its DIL has not yet been read.
-@@ -283,9 +333,18 @@ impl Analogue {
+@@ -283,9 +344,20 @@ impl Analogue {
                  analogue::Status::Failed(why) => {
                      // 9.5.2.1: back to V.90's phase 2.
                      let hopeless = m.route().is_some() && m.choice().is_none();
@@ -2044,17 +2117,19 @@ index a31b259..765f659 100644
                      self.failed_starts += 1;
                      self.back_to_phase2();
 +                    if pcm_up && self.failed_starts >= PCM_UP_TRIES {
-+                        // V.92's PCM upstream asks more of the line and the
-+                        // clocks than V.34's: after this many start-ups that
-+                        // did not come up with it, V.34's upstream under
-+                        // V.90's downstream (Table 18/V.92: not asking).
++                        // V.92's PCM upstream asks more of the line, the
++                        // clocks and the digital modem than V.34's: after a
++                        // start-up that did not come up with it, V.34's
++                        // upstream under V.90's downstream (Table 18/V.92:
++                        // not asking).
 +                        self.notes.push("V.34 upstream next time round, not V.92's PCM upstream".into());
 +                        self.v34.phase2_mut().set_wants_pcm_up(false);
++                        self.pcm_up_dropped = true;
 +                    }
                      if hopeless || self.failed_starts > V90_RETRAINS {
                          // 9.2.2.1.9: this time, V.34's INFO1a.
                          self.notes.push("V.34 next time round, not V.90".into());
-@@ -301,12 +360,31 @@ impl Analogue {
+@@ -301,12 +373,31 @@ impl Analogue {
              self.connected_once = true;
          }
          let p2 = self.v34.phase2();
@@ -2088,7 +2163,7 @@ index a31b259..765f659 100644
              settings.v34_receive = p2.v34_receive_rate().unwrap_or(0);
              settings.pinned = self.pinned;
              // The call's first phase 2's, which every retrain's phase 2 is
-@@ -345,7 +423,7 @@ impl Digital {
+@@ -345,7 +436,7 @@ impl Digital {
          let phase2_gain = 10f64.powf((info0d.nominal_dbm0() - 3.17) / 20.0);
          Self {
              law,
@@ -2097,7 +2172,7 @@ index a31b259..765f659 100644
              v90: None,
              phase2_gain,
              failed_starts: 0,
-@@ -355,7 +433,18 @@ impl Digital {
+@@ -355,7 +446,18 @@ impl Digital {
          }
      }
  
@@ -2117,7 +2192,7 @@ index a31b259..765f659 100644
      pub fn with_habits(mut self, habits: digital::Habits) -> Self {
          self.habits = habits;
          self
-@@ -534,9 +623,17 @@ impl Digital {
+@@ -534,9 +636,17 @@ impl Digital {
              self.connected_once = true;
          }
          let p2 = self.v34.phase2();
@@ -2138,10 +2213,10 @@ index a31b259..765f659 100644
              let mut settings = digital::Settings::new(self.law, &info1d, &asked, p2.round_trip().unwrap_or(0.0), wide);
 diff --git a/crates/datapump/src/v92/finder.rs b/crates/datapump/src/v92/finder.rs
 new file mode 100644
-index 0000000..37432b2
+index 0000000..bfc701e
 --- /dev/null
 +++ b/crates/datapump/src/v92/finder.rs
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,131 @@
 +//! Finding V.92's framed sequences in a stream of descrambled bits.
 +//!
 +//! Every one begins with seventeen ones and a start bit of 0 (8.5 to 8.8/
@@ -2211,7 +2286,9 @@ index 0000000..37432b2
 +    }
 +
 +    pub fn feed(&mut self, bit: bool) -> Option<Found> {
-+        if !bit && self.ones == SYNC_ONES {
++        // Seventeen ones or more: a sequence may follow ones of its own, as
++        // the first CPt follows its 24 (8.5.1), and its sync is the last 17.
++        if !bit && self.ones >= SYNC_ONES {
 +            self.starts.push(self.bits.len() - SYNC_ONES);
 +        }
 +        self.ones = if bit { self.ones + 1 } else { 0 };
@@ -5058,10 +5135,10 @@ index 0000000..d471048
 +}
 diff --git a/crates/datapump/src/v92/up.rs b/crates/datapump/src/v92/up.rs
 new file mode 100644
-index 0000000..f695371
+index 0000000..ef52901
 --- /dev/null
 +++ b/crates/datapump/src/v92/up.rs
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,552 @@
 +//! What the analogue modem sends upstream when PCM upstream was asked for:
 +//! V.92's phase 3, phase 4 and data mode, one symbol at a time (9.5.2,
 +//! 9.6.2/V.92).
@@ -5375,7 +5452,13 @@ index 0000000..f695371
 +                self.signs.restart();
 +                self.since_trn1u = Some(0);
 +            }
-+            Up::Cpt => self.began = Some("sent CPt".into()),
++            Up::Cpt => {
++                // "24 differentially encoded binary ones shall be transmitted
++                // prior to transmitting the first CPt in a series" (8.5.1):
++                // what tells the digital modem TRN1u is over.
++                self.queue.extend([true; 24]);
++                self.began = Some("sent CPt".into());
++            }
 +            Up::E1u => {
 +                // A data frame of scrambled, differentially encoded zeros.
 +                self.queue.extend([false; FRAME]);
@@ -5632,10 +5715,10 @@ index 36d0d26..af609df 100644
          digital::Settings::new(Law::Mu, &info1d, &asked, 0.02, true),
 diff --git a/crates/datapump/tests/v92_quick.rs b/crates/datapump/tests/v92_quick.rs
 new file mode 100644
-index 0000000..2265533
+index 0000000..2d7314c
 --- /dev/null
 +++ b/crates/datapump/tests/v92_quick.rs
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,217 @@
 +//! V.92's short Phase 2 (9.4/V.92) between the two modems here: a full
 +//! start-up with a V.92 server first, which is what the analogue modem
 +//! learns the upstream from, then a start-up asking for the short Phase 2
@@ -5831,6 +5914,28 @@ index 0000000..2265533
 +        pcm_upstream_call(line().with_clock(ppm), 15.0);
 +    }
 +}
++
++/// A server that offers PCM upstream and then never answers CPt, so that its
++/// DIL goes on and on: the analogue modem gives up on Ri in a few seconds,
++/// says why, and the retrain comes up with V.34's upstream under V.90's
++/// downstream.
++#[test]
++fn a_server_that_never_answers_cpt_gets_v34_upstream_next() {
++    use datapump::v90::digital::Habits;
++    let mut analogue = Analogue::new(FS).with_pcm_upstream();
++    let mut digital = Digital::new(v92_server()).with_habits(Habits { hears_v92_cpt: false, ..Habits::PROMPT });
++    let seconds = run(&mut analogue, &mut digital, line(), 40.0);
++    let notes = analogue.take_notes();
++    println!("notes: {notes:?}");
++    let seconds = seconds.expect("did not connect");
++    assert!(notes.iter().any(|n| n.contains("no Ri")), "{notes:?}");
++    assert!(notes.iter().any(|n| n.contains("V.34 upstream next time")), "{notes:?}");
++    assert!(!analogue.pcm_upstream(), "still PCM upstream");
++    assert!(analogue.pcm_upstream_dropped());
++    let Status::Connected { transmit, receive } = analogue.status() else { unreachable!() };
++    println!("connected in {seconds:.2} s: {receive} down, {transmit} up");
++    assert!(receive >= 48_000 && seconds < 20.0, "{receive} down in {seconds:.2} s");
++}
 diff --git a/crates/gui/src/app.rs b/crates/gui/src/app.rs
 index 32d9319..d60725d 100644
 --- a/crates/gui/src/app.rs
@@ -5900,7 +6005,7 @@ index c196b0c..1396a0a 100644
                  if role == Role::Answerer {
                      self.call.set_v8_capable(false);
 diff --git a/crates/modem/src/lib.rs b/crates/modem/src/lib.rs
-index a0ef49a..cdd8c3b 100644
+index a0ef49a..9861149 100644
 --- a/crates/modem/src/lib.rs
 +++ b/crates/modem/src/lib.rs
 @@ -30,6 +30,7 @@ use datapump::v32;
@@ -6011,7 +6116,7 @@ index a0ef49a..cdd8c3b 100644
              // 8.1.1: a far end that sent the plain answering tone of V.25 does
              // not speak V.8, and the call goes on "in accordance with Annex
              // A/V.32 bis, ITU-T T.30, or other appropriate Recommendations" --
-@@ -2463,13 +2507,19 @@ impl Modem {
+@@ -2463,13 +2507,27 @@ impl Modem {
              // whose far end answered with a plain ANS on to V.32bis's own
              // start-up, and so does a V.8 that was turned off.
              _ => match self.at.modulation.carrier.as_str() {
@@ -6024,16 +6129,24 @@ index a0ef49a..cdd8c3b 100644
              "V90" => {
 -                let mut analogue = v90::startup::Analogue::new(self.fs);
 +                // V.92 says so in phase 2's INFO0a; plain V.90 does not.
-+                // V.92 asks for its PCM upstream too, in phase 2's INFO1a.
++                // V.92 asks for its PCM upstream too, in phase 2's INFO1a --
++                // unless it lately did not come up with this number's server.
 +                let mut analogue = if self.at.modulation.carrier == "V92" {
-+                    v90::startup::Analogue::new(self.fs).with_pcm_upstream()
++                    let memory = self.quick_memory.get_or_insert_with(quick::Memory::load);
++                    let skip = self.dialled.as_deref().is_some_and(|n| memory.skip_pcm_upstream(n));
++                    if skip {
++                        self.line_notes.push("V.92: V.34 upstream, not PCM upstream, which did not come up with this number lately".into());
++                        v90::startup::Analogue::new(self.fs)
++                    } else {
++                        v90::startup::Analogue::new(self.fs).with_pcm_upstream()
++                    }
 +                } else {
 +                    v90::startup::Analogue::v90_only(self.fs)
 +                };
                  analogue.set_pinned(self.pinned_rate);
                  Pump::V90(Box::new(analogue))
              }
-@@ -2556,7 +2606,43 @@ impl Modem {
+@@ -2556,7 +2614,52 @@ impl Modem {
      }
  
      /// End the call, leaving what the terminal is told to whoever asked.
@@ -6047,8 +6160,17 @@ index a0ef49a..cdd8c3b 100644
 +                self.line_notes.push("V.92 Quick Connect: short phase 2 done".into());
 +            }
 +        }
-+        let (Some(learned), Some(number)) = (m.learned(), self.dialled.clone()) else { return };
-+        self.quick_memory.get_or_insert_with(quick::Memory::load).remember(&number, learned);
++        let Some(number) = self.dialled.clone() else { return };
++        let memory = self.quick_memory.get_or_insert_with(quick::Memory::load);
++        // PCM upstream given up on during this call: the next few calls to
++        // the number go without it, and lose no time trying.
++        if m.pcm_upstream_dropped() {
++            memory.pcm_upstream_failed(&number);
++        } else if m.pcm_upstream() {
++            memory.pcm_upstream_worked(&number);
++        }
++        let Some(learned) = m.learned() else { return };
++        memory.remember(&number, learned);
 +    }
 +
 +    /// Whether V.92's Quick Connect is offered on calls to servers it has
@@ -6077,7 +6199,7 @@ index a0ef49a..cdd8c3b 100644
          // A fax call is a call too, and putting the line down has to stop it
          // -- otherwise the only way out of a fax that has gone wrong is to
          // close the program. What it learned is kept for the window.
-@@ -2589,6 +2675,10 @@ impl Modem {
+@@ -2589,6 +2692,10 @@ impl Modem {
  /// The level is not information. A real line delivers whatever it delivers,
  /// which is why a receiver has gain control at all, so scaling a recording to
  /// fit loses nothing that was in it.
@@ -6090,10 +6212,10 @@ index a0ef49a..cdd8c3b 100644
      if peak <= 0.0 {
 diff --git a/crates/modem/src/quick.rs b/crates/modem/src/quick.rs
 new file mode 100644
-index 0000000..70f85c1
+index 0000000..cc6c993
 --- /dev/null
 +++ b/crates/modem/src/quick.rs
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,191 @@
 +//! What V.92's Quick Connect needs to remember between calls (9.2, 9.4/V.92).
 +//!
 +//! A short Phase 2 has no line probe, so the upstream the analogue modem asks
@@ -6134,8 +6256,15 @@ index 0000000..70f85c1
 +#[derive(Debug, Default, Clone)]
 +pub struct Memory {
 +    numbers: BTreeMap<String, Recall>,
++    /// Numbers whose server did not come up with V.92's PCM upstream, and
++    /// how many more calls to each go without asking for it.
++    no_pcm_up: BTreeMap<String, u32>,
 +    file: Option<PathBuf>,
 +}
++
++/// Calls to a number that go with V.34's upstream after one where PCM
++/// upstream had to be given up, before it is tried again.
++pub const PCM_UP_SKIPS: u32 = 5;
 +
 +impl Memory {
 +    /// Whatever the file holds. A missing or unreadable file is an empty
@@ -6149,6 +6278,13 @@ index 0000000..70f85c1
 +        let mut memory = Self { file, ..Self::default() };
 +        let Some(text) = memory.file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) else { return memory };
 +        for line in text.lines() {
++            if let Some(rest) = line.strip_prefix("no-pcm-upstream ") {
++                let mut f = rest.split_whitespace();
++                if let (Some(number), Some(Ok(left))) = (f.next(), f.next().map(str::parse::<u32>)) {
++                    memory.no_pcm_up.insert(number.to_owned(), left);
++                }
++                continue;
++            }
 +            if let Some((number, recall)) = parse(line) {
 +                memory.numbers.insert(number, recall);
 +            }
@@ -6161,7 +6297,10 @@ index 0000000..70f85c1
 +        if let Some(dir) = path.parent() {
 +            let _ = std::fs::create_dir_all(dir);
 +        }
-+        let text: String = self.numbers.iter().map(|(n, r)| format!("{}\n", show(n, r))).collect();
++        let mut text: String = self.numbers.iter().map(|(n, r)| format!("{}\n", show(n, r))).collect();
++        for (number, left) in &self.no_pcm_up {
++            text.push_str(&format!("no-pcm-upstream {number} {left}\n"));
++        }
 +        let _ = std::fs::write(path, text);
 +    }
 +
@@ -6171,6 +6310,32 @@ index 0000000..70f85c1
 +
 +    pub fn remember(&mut self, number: &str, recall: Recall) {
 +        if self.numbers.insert(key(number), recall) != Some(recall) {
++            self.save();
++        }
++    }
++
++    /// Whether a call to `number` should go without PCM upstream, counting
++    /// the call: after PCM_UP_SKIPS of them it is tried again.
++    pub fn skip_pcm_upstream(&mut self, number: &str) -> bool {
++        let key = key(number);
++        let Some(left) = self.no_pcm_up.get_mut(&key) else { return false };
++        *left = left.saturating_sub(1);
++        if *left == 0 {
++            self.no_pcm_up.remove(&key);
++        }
++        self.save();
++        true
++    }
++
++    /// The server at `number` did not come up with PCM upstream.
++    pub fn pcm_upstream_failed(&mut self, number: &str) {
++        self.no_pcm_up.insert(key(number), PCM_UP_SKIPS);
++        self.save();
++    }
++
++    /// The server at `number` came up with PCM upstream.
++    pub fn pcm_upstream_worked(&mut self, number: &str) {
++        if self.no_pcm_up.remove(&key(number)).is_some() {
 +            self.save();
 +        }
 +    }
@@ -6229,6 +6394,18 @@ index 0000000..70f85c1
 +        assert_eq!(key("1 616-555 1234"), "16165551234");
 +        assert_eq!(parse("garbage"), None);
 +    }
++
++    #[test]
++    fn a_failed_pcm_upstream_is_skipped_five_times_and_kept_in_the_file() {
++        let file = std::env::temp_dir().join(format!("binmodem-quick-test-{}", std::process::id()));
++        let _ = std::fs::remove_file(&file);
++        let mut memory = Memory::at(Some(file.clone()));
++        memory.pcm_upstream_failed("555 1234");
++        let mut again = Memory::at(Some(file.clone()));
++        let skipped: Vec<bool> = (0..7).map(|_| again.skip_pcm_upstream("5551234")).collect();
++        assert_eq!(skipped, [true, true, true, true, true, false, false]);
++        let _ = std::fs::remove_file(&file);
++    }
 +}
 diff --git a/crates/modem/tests/v90_call.rs b/crates/modem/tests/v90_call.rs
 index b309ee5..b4db667 100644
@@ -6245,10 +6422,10 @@ index b309ee5..b4db667 100644
  
 diff --git a/crates/modem/tests/v92_quick.rs b/crates/modem/tests/v92_quick.rs
 new file mode 100644
-index 0000000..ed101e3
+index 0000000..49d114a
 --- /dev/null
 +++ b/crates/modem/tests/v92_quick.rs
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,274 @@
 +//! V.92's Quick Connect from the terminal: dial a V.92 server once, which
 +//! is a full start-up and teaches the modem the server; dial it again, and
 +//! the call goes through V.92's short Phase 1 and short Phase 2 and comes up
@@ -6275,6 +6452,8 @@ index 0000000..ed101e3
 +    received: Vec<u8>,
 +    ticks: u64,
 +    quick: bool,
++    /// Offer PCM upstream and then never answer CPt.
++    deaf_to_cpt: bool,
 +}
 +
 +impl Server {
@@ -6288,7 +6467,7 @@ index 0000000..ed101e3
 +        .offering_lapm()
 +        .offering_pcm_on(Pcm { digital: true, ..Pcm::default() }, Access { digital: true, ..Access::default() })
 +        .answering_quick_connect();
-+        Self { v8: Some(v8), startup: None, ec: None, received: Vec::new(), ticks: 0, quick: false }
++        Self { v8: Some(v8), startup: None, ec: None, received: Vec::new(), ticks: 0, quick: false, deaf_to_cpt: false }
 +    }
 +
 +    fn info0d() -> Info0d {
@@ -6312,7 +6491,8 @@ index 0000000..ed101e3
 +                v8line::Status::Negotiating => {}
 +                v8line::Status::Agreed(_) => {
 +                    self.v8 = None;
-+                    self.startup = Some(Digital::new(Self::info0d()));
++                    let habits = datapump::v90::digital::Habits { hears_v92_cpt: !self.deaf_to_cpt, ..Default::default() };
++                    self.startup = Some(Digital::new(Self::info0d()).with_habits(habits));
 +                }
 +                v8line::Status::QuickConnect { .. } => {
 +                    self.v8 = None;
@@ -6482,5 +6662,41 @@ index 0000000..ed101e3
 +        call.run_until_online(30.0).unwrap_or_else(|| panic!("call {call_number} never came up: {:?}", call.saw()));
 +        assert!(!call.server.quick, "call {call_number} quick connected on V.90");
 +    }
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// A server that offers PCM upstream and never answers CPt: the call gives up
++/// on PCM upstream in phase 3, comes up with V.34's upstream, and the next
++/// call to the number does not ask for it at all.
++#[test]
++fn pcm_upstream_that_never_comes_up_is_dropped_and_then_skipped() {
++    let dir = std::env::temp_dir().join(format!("binmodem-nopcm-{}", std::process::id()));
++    let _ = std::fs::create_dir_all(&dir);
++    let memory = dir.join("quick-connect");
++    let _ = std::fs::remove_file(&memory);
++
++    let mut first = Call::new(&memory);
++    first.server.deaf_to_cpt = true;
++    first.type_at("AT+MS=V92");
++    first.run(0.05);
++    first.type_at("ATD5551234");
++    let took = first.run_until_online(40.0).unwrap_or_else(|| panic!("the first call never came up: {:?}", first.saw()));
++    println!("first call online at {took:.2} s: {:?}", first.notes);
++    assert!(first.notes.iter().any(|n| n.contains("no Ri")), "{:?}", first.notes);
++    assert!(first.caller.rate().is_some_and(|r| r >= 48_000), "{:?}", first.caller.rate());
++    let kept = std::fs::read_to_string(&memory).unwrap_or_default();
++    assert!(kept.contains("no-pcm-upstream 5551234 5"), "{kept:?}");
++
++    let mut second = Call::new(&memory);
++    second.caller.set_quick_connect(false);
++    second.server.deaf_to_cpt = true;
++    second.type_at("AT+MS=V92");
++    second.run(0.05);
++    second.type_at("ATD5551234");
++    let quick = second.run_until_online(40.0).unwrap_or_else(|| panic!("the second call never came up: {:?}", second.saw()));
++    println!("second call online at {quick:.2} s against {took:.2} s");
++    assert!(second.notes.iter().any(|n| n.contains("not PCM upstream")), "{:?}", second.notes);
++    assert!(!second.notes.iter().any(|n| n.contains("no Ri")), "{:?}", second.notes);
++    assert!(quick < took - 3.0, "{quick:.2} s against {took:.2} s");
 +    let _ = std::fs::remove_dir_all(&dir);
 +}
