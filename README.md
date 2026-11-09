@@ -52,6 +52,16 @@ buffer slip works as before. It is the one change to the modem itself, kept
 as `android/patches/long-dil.patch` and applied to the submodule by
 `build-apk.sh` (the build stops if it is missing).
 
+The DIL is watched as it is read, V.90 or V.92. Once the two passes should
+long since have come (about 2.4 s), a reading with all but a few of its
+symbols read once goes on with that, as a one-pass DIL and a hardware modem
+do. One with less than that after about 6 s fails, and the start-up retrains
+at once instead of waiting for the 15 s B1d deadline. A reading that loses
+its place on the line looks for it again, as upstream's does. The Line notes
+say each of these: "reading the DIL", "lost the DIL's place ... looking for
+it", "found the DIL again", "the DIL read once over ... going on with that".
+This is in `android/patches/v92-quick-connect.patch` with the V.92 work.
+
 ### V.92: Quick Connect and PCM upstream
 
 Upstream BinModem has no V.92. This build adds V.92's PCM upstream and its

@@ -1229,10 +1229,21 @@ index 52e648b..d5f8c0d 100644
      fn negotiate_protocol(ours: bool, theirs: bool, seconds: f64) -> (bool, bool) {
          let mut calling = Modem::new(Role::Calling, CallFunction::Data, all(), FS);
 diff --git a/crates/datapump/src/v90/analogue.rs b/crates/datapump/src/v90/analogue.rs
-index 63912b7..78aca22 100644
+index 63912b7..8e5d71d 100644
 --- a/crates/datapump/src/v90/analogue.rs
 +++ b/crates/datapump/src/v90/analogue.rs
-@@ -509,6 +509,9 @@ pub struct Settings {
+@@ -90,6 +90,10 @@ const DIL_DELAY: usize = 96;
+ /// Android build: upstream reads one pass, 0.44 s.
+ const DIL_PASSES: usize = 2;
+ const DIL_SEARCH: usize = 128;
++/// Seconds past the passes asked for that the DIL may take before one pass
++/// will do, and before not even one gives the start-up up (see `dil_watch`).
++const DIL_GRACE: f64 = 1.5;
++const DIL_GIVE_UP: f64 = 5.0;
+ const DIL_MOST_MOVED: i64 = 400;
+ 
+ /// When to look for where the DIL went, and how often after that: a buffer
+@@ -509,6 +513,9 @@ pub struct Settings {
      /// first phase 2, if its reversal was heard: a retrain's tone B comes at
      /// the same (8.2), and a tone less than half as loud is not one.
      pub tone_b_level: Option<f64>,
@@ -1242,7 +1253,7 @@ index 63912b7..78aca22 100644
  }
  
  /// What the rate menu predicts of a downstream rate.
-@@ -567,6 +570,7 @@ impl Settings {
+@@ -567,6 +574,7 @@ impl Settings {
              v34_receive: 0,
              pinned: None,
              tone_b_level: None,
@@ -1250,7 +1261,7 @@ index 63912b7..78aca22 100644
          }
      }
  }
-@@ -1417,6 +1421,10 @@ struct Frames {
+@@ -1417,6 +1425,10 @@ struct Frames {
      /// Data from frames that looked like Rd, kept back until the next frame
      /// shows whether Rd is what they were.
      held: VecDeque<Vec<bool>>,
@@ -1261,7 +1272,7 @@ index 63912b7..78aca22 100644
  }
  
  impl Frames {
-@@ -1445,6 +1453,8 @@ impl Frames {
+@@ -1445,6 +1457,8 @@ impl Frames {
              impossible: VecDeque::with_capacity(PLACE_WINDOW),
              moved,
              held: VecDeque::new(),
@@ -1270,7 +1281,7 @@ index 63912b7..78aca22 100644
          }
      }
  
-@@ -1482,6 +1492,10 @@ enum Stage {
+@@ -1482,6 +1496,10 @@ enum Stage {
  pub struct Modem {
      settings: Settings,
      fs: f64,
@@ -1281,7 +1292,18 @@ index 63912b7..78aca22 100644
      now: u64,
      stage: Stage,
      status: Status,
-@@ -1597,7 +1611,13 @@ impl Modem {
+@@ -1511,6 +1529,10 @@ pub struct Modem {
+     dil_interval: usize,
+     dil_read: Vec<u8>,
+     dil_left: usize,
++    /// Symbols of the DIL not yet read even once, and when its reading
++    /// began: the watch on a DIL that is taking too long (see `dil_watch`).
++    dil_unread: usize,
++    dil_began: u64,
+     /// Symbols not yet counted, and since a slip was noticed, how many have
+     /// been gathered to find where the DIL went.
+     dil_recent: VecDeque<(u64, f64)>,
+@@ -1597,7 +1619,13 @@ impl Modem {
          // tone from phase 2 can still be arriving, and a tone near 1333 Hz
          // looks enough like Sd to set a hunt off.
          let rx = pcm::Receiver::new(settings.law, fs);
@@ -1295,7 +1317,16 @@ index 63912b7..78aca22 100644
              settings,
              fs,
              now: 0,
-@@ -1983,6 +2003,13 @@ impl Modem {
+@@ -1619,6 +1647,8 @@ impl Modem {
+             dil_interval: 0,
+             dil_read: Vec::new(),
+             dil_left: 0,
++            dil_unread: 0,
++            dil_began: 0,
+             dil_recent: VecDeque::new(),
+             dil_lost: None,
+             dil_moved: 0,
+@@ -1983,6 +2013,13 @@ impl Modem {
  
      /// Back from data mode to phase 4 (9.6.2.1.1, 9.6.2.2.1).
      fn begin_renegotiation(&mut self, initiating: bool) {
@@ -1309,7 +1340,7 @@ index 63912b7..78aca22 100644
          self.notes.push(
              if initiating { "rate renegotiation, begun by this end" } else { "rate renegotiation, begun by the digital modem's Rd" }.into(),
          );
-@@ -2080,15 +2107,33 @@ impl Modem {
+@@ -2080,15 +2117,33 @@ impl Modem {
      }
  
      pub fn send_bits(&mut self, bits: &[bool]) {
@@ -1343,12 +1374,13 @@ index 63912b7..78aca22 100644
      fn fail(&mut self, why: &'static str) {
          self.notes.push(format!("failed: {why}"));
          self.status = Status::Failed(why);
-@@ -2170,8 +2215,20 @@ impl Modem {
+@@ -2170,8 +2225,21 @@ impl Modem {
              }
          }
          self.stage_step();
 -        let source = &mut self.source;
 -        let out = self.tx.next_sample(|| source.next());
++        self.dil_watch();
 +        let out = if let Some(up) = self.up.as_mut() {
 +            // V.92's PCM upstream is clocked by the network: once the
 +            // downstream receiver has the network's clock, it times the
@@ -1366,7 +1398,7 @@ index 63912b7..78aca22 100644
          match self.source.began.take() {
              Some(Began::Cp(bits)) => {
                  if let Some(cp) = Cp::from_bits(&bits) {
-@@ -2184,9 +2241,17 @@ impl Modem {
+@@ -2184,9 +2252,17 @@ impl Modem {
          out
      }
  
@@ -1385,7 +1417,7 @@ index 63912b7..78aca22 100644
                  self.stage = Stage::AwaitSd;
                  self.rx.hunt(self.settings.uinfo);
                  // 9.3.2.4: S-bar-d within 1500 ms of the start of Ja.
-@@ -2202,12 +2267,16 @@ impl Modem {
+@@ -2202,12 +2278,16 @@ impl Modem {
                  // 9.4.2.4: a CP' sent, and MP' or Ed heard: E once the
                  // current CP' is whole.
                  let heard_back = !self.awaiting_turn && self.frames.as_ref().is_some_and(|f| f.far_acknowledged || f.ed);
@@ -1404,7 +1436,7 @@ index 63912b7..78aca22 100644
                      self.status = Status::Connected { downstream: self.downstream_rate, upstream: self.upstream_rate };
                      self.deadline = None;
                      self.margin_at = self.samples(MARGIN_SETTLE);
-@@ -2231,6 +2300,9 @@ impl Modem {
+@@ -2231,6 +2311,9 @@ impl Modem {
                  if self.stage == Stage::AwaitSd {
                      // 9.3.2.4: "terminate Ja and transmit silence".
                      self.source.change(Up::Silence);
@@ -1414,7 +1446,7 @@ index 63912b7..78aca22 100644
                      self.stage = Stage::Training;
                      self.deadline = Some((self.samples(4.5 + self.settings.round_trip), "no Jd from the digital modem"));
                  }
-@@ -2245,6 +2317,9 @@ impl Modem {
+@@ -2245,6 +2328,9 @@ impl Modem {
                  // and the hunt, while Sd can still come.
                  self.stage = Stage::AwaitSd;
                  self.source.change(Up::Ja);
@@ -1424,7 +1456,16 @@ index 63912b7..78aca22 100644
                  self.rx.hunt(self.settings.uinfo);
                  self.deadline = Some(self.sd_deadline);
              }
-@@ -2268,6 +2343,18 @@ impl Modem {
+@@ -2254,6 +2340,8 @@ impl Modem {
+                 // What arrived just before the loss was noticed is held with
+                 // the rest until it is known whether anything moved.
+                 self.dil_lost = Some(0);
++                let (read, of, _) = self.dil_progress();
++                self.notes.push(format!("lost the DIL's place at {read} of {of} read: looking for it"));
+             }
+             // A slip, or something like one: the receiver holds its loops,
+             // and where the frames went is worked out from what comes after.
+@@ -2268,6 +2356,18 @@ impl Modem {
          match self.stage {
              Stage::AwaitJd | Stage::AwaitJdPrime => {
                  let jd_prime = self.jd.feed(symbol.index, symbol.positive());
@@ -1443,7 +1484,7 @@ index 63912b7..78aca22 100644
                  let early = (JD_LATEST + S_AFTER_JD - self.settings.round_trip).max(0.0) * digital::FS;
                  if self.stage == Stage::AwaitJd && !self.sending_s && symbol.raw as f64 >= early {
                      self.send_s();
-@@ -2318,6 +2405,13 @@ impl Modem {
+@@ -2318,6 +2418,13 @@ impl Modem {
      /// S until J'd (9.3.2.7).
      fn send_s(&mut self) {
          self.sending_s = true;
@@ -1457,7 +1498,7 @@ index 63912b7..78aca22 100644
          self.source.s_length = None;
          self.source.change(Up::S);
      }
-@@ -2326,8 +2420,15 @@ impl Modem {
+@@ -2326,8 +2433,15 @@ impl Modem {
      /// the frames put where the DIL says they are, and the symbols in
      /// `already` read as its first.
      fn begin_dil(&mut self, first: u64, already: &[(u64, f64)]) {
@@ -1475,7 +1516,75 @@ index 63912b7..78aca22 100644
          self.stage = Stage::Dil;
          self.dil_base = first as i64;
          // J'd ends on a frame boundary -- Jd does, and J'd is two frames --
-@@ -2574,12 +2675,19 @@ impl Modem {
+@@ -2337,6 +2451,9 @@ impl Modem {
+         self.rx.set_frame_offset((INTERVALS as u64 - first % INTERVALS as u64) % INTERVALS as u64);
+         self.dil_read = vec![0; self.dil.len()];
+         self.dil_left = self.dil.len() * DIL_PASSES;
++        self.dil_unread = self.dil.len();
++        self.dil_began = self.now;
++        self.notes.push(format!("reading the DIL: {} symbols, {DIL_PASSES} times over", self.dil.len()));
+         self.dil_recent.clear();
+         self.dil_lost = None;
+         self.before_dil.clear();
+@@ -2439,6 +2556,39 @@ impl Modem {
+         self.dil_moved
+     }
+ 
++    /// The DIL is the line tested before data: while it is read, a pass goes
++    /// by every 0.4 s or so. A reading that has lost its place and cannot find
++    /// it, or that a broken line keeps from finishing, would otherwise wait
++    /// for the start-up's fifteen seconds and then retrain into the same.
++    /// So: once the passes asked for should long since have come, the DIL is
++    /// taken as read if every symbol, or all but a few, has been read once --
++    /// what upstream's
++    /// one pass, and a hardware modem, go on -- and if not even that, after
++    /// a few seconds more, the start-up fails and retrains at once.
++    fn dil_watch(&mut self) {
++        if self.stage != Stage::Dil {
++            return;
++        }
++        let pass = self.dil.len() as f64 / digital::FS;
++        let waited = (self.now - self.dil_began) as f64 / self.fs;
++        // Nearly all of it: a reading that lost its place at the end of a
++        // pass has the last of it held back unread, DIL_DELAY symbols' worth.
++        let once = self.dil_unread * 20 <= self.dil.len();
++        if once && waited > DIL_PASSES as f64 * pass + DIL_GRACE {
++            let (read, of, _) = self.dil_progress();
++            self.notes.push(format!("the DIL read once over, not {DIL_PASSES} times ({read} of {of}) in {waited:.1} s: going on with that"));
++            self.finish_dil();
++        } else if waited > DIL_PASSES as f64 * pass + DIL_GIVE_UP {
++            let (read, of, lost) = self.dil_progress();
++            self.notes.push(format!(
++                "the DIL not read once over in {waited:.1} s: {read} of {of}, {} unread{}",
++                self.dil_unread,
++                if lost { ", its place lost" } else { "" }
++            ));
++            self.fail("the DIL was not read");
++        }
++    }
++
+     /// How much of the DIL has been read, of how much there is, and whether
+     /// the reading is waiting to find where it went.
+     pub fn dil_progress(&self) -> (usize, usize, bool) {
+@@ -2475,6 +2625,9 @@ impl Modem {
+         if usize::from(self.dil_read[at]) >= DIL_PASSES {
+             return;
+         }
++        if self.dil_read[at] == 0 {
++            self.dil_unread -= 1;
++        }
+         self.dil_read[at] += 1;
+         self.dil_left -= 1;
+         let (u, positive) = self.dil[at];
+@@ -2519,6 +2672,7 @@ impl Modem {
+             return;
+         }
+         self.dil_lost = None;
++        self.notes.push(format!("found the DIL again, moved {moved} symbols"));
+         // Nothing moved: everything held is good. A move: only what it was
+         // found from is sure to be past the slip, and the next pass has the
+         // rest.
+@@ -2574,12 +2728,19 @@ impl Modem {
          self.finish_cp(&mut choice.data);
          self.finish_cp(&mut choice.training);
          self.downstream_rate = sequences::data_rate(choice.data.drn).unwrap_or(0);
@@ -1501,7 +1610,7 @@ index 63912b7..78aca22 100644
          self.route = Some(route);
          self.choice = Some(choice);
          // What comes down now is more DIL, and then R: nothing to learn from
-@@ -2631,15 +2739,27 @@ impl Modem {
+@@ -2631,15 +2792,27 @@ impl Modem {
              if let RSeen::Turned(from) = seen {
                  // 9.4.2.2: the current CPt whole, then CP.
                  self.trn2d_from = Some(from);
@@ -1531,7 +1640,7 @@ index 63912b7..78aca22 100644
              }
              return;
          }
-@@ -2768,7 +2888,8 @@ impl Modem {
+@@ -2768,7 +2941,8 @@ impl Modem {
          // that took this end into data mode on a dead line. Only frames the
          // far end's signal carried are Ed.
          let zeros = bits.iter().all(|b| !*b);
@@ -1541,7 +1650,7 @@ index 63912b7..78aca22 100644
          if frames.zero_frames == 2 {
              // Ed: B1d next, at data mode's constellation, with the coding
              // started afresh (8.6.1).
-@@ -2779,6 +2900,9 @@ impl Modem {
+@@ -2779,6 +2953,9 @@ impl Modem {
              self.least_gap = dil::least_gap(&choice.data, route);
              self.downstream_rate = sequences::data_rate(choice.data.drn).unwrap_or(0);
              self.notes.push(format!("found Ed: B1d next, down at {} bit/s", self.downstream_rate));
@@ -1551,7 +1660,7 @@ index 63912b7..78aca22 100644
              let Some(data) = Mapping::from_cp(&choice.data) else { return };
              frames.decoder = Decoder::new(data);
              frames.levels = levels_for(&choice.data, route);
-@@ -2786,6 +2910,46 @@ impl Modem {
+@@ -2786,6 +2963,46 @@ impl Modem {
              self.rx.set_slicer(slicer);
              return;
          }
@@ -1599,10 +1708,10 @@ index 63912b7..78aca22 100644
              if let Some(Found::Mp(mp)) = frames.finder.feed(bit) {
                  if !frames.told_mps.contains(&mp) {
 diff --git a/crates/datapump/src/v90/digital.rs b/crates/datapump/src/v90/digital.rs
-index 93fd619..3572948 100644
+index 93fd619..f5e293a 100644
 --- a/crates/datapump/src/v90/digital.rs
 +++ b/crates/datapump/src/v90/digital.rs
-@@ -89,15 +89,19 @@ pub struct Habits {
+@@ -89,15 +89,23 @@ pub struct Habits {
      pub trn1d: f64,
      /// Whether 9.3.1.5's wait for S has the round trip added to it.
      pub s_wait_counts_round_trip: bool,
@@ -1610,21 +1719,25 @@ index 93fd619..3572948 100644
 +    /// and then never answers CPt, so its DIL goes on and on, is one to test
 +    /// the analogue modem's way out against.
 +    pub hears_v92_cpt: bool,
++    /// Passes of the DIL sent before the line goes quiet in its place, or
++    /// None to repeat it until answered as 9.3.1.6 has it: a DIL the
++    /// analogue modem cannot finish reading as often as it would like.
++    pub dil_passes: Option<usize>,
  }
  
  impl Habits {
      /// Short TRN1d, and the Recommendation's wait for S.
 -    pub const PROMPT: Self = Self { trn1d: 0.3, s_wait_counts_round_trip: true };
-+    pub const PROMPT: Self = Self { trn1d: 0.3, s_wait_counts_round_trip: true, hears_v92_cpt: true };
++    pub const PROMPT: Self = Self { trn1d: 0.3, s_wait_counts_round_trip: true, hears_v92_cpt: true, dil_passes: None };
  
      /// What a live server did: four seconds of TRN1d, and a wait for S that
      /// did not allow for a second-long round trip.
 -    pub const LIVE_SERVER: Self = Self { trn1d: 4.05, s_wait_counts_round_trip: false };
-+    pub const LIVE_SERVER: Self = Self { trn1d: 4.05, s_wait_counts_round_trip: false, hears_v92_cpt: true };
++    pub const LIVE_SERVER: Self = Self { trn1d: 4.05, s_wait_counts_round_trip: false, hears_v92_cpt: true, dil_passes: None };
  }
  
  impl Default for Habits {
-@@ -122,6 +126,9 @@ pub struct Settings {
+@@ -122,6 +130,9 @@ pub struct Settings {
      /// top rates need.
      pub wide: bool,
      pub habits: Habits,
@@ -1634,7 +1747,7 @@ index 93fd619..3572948 100644
  }
  
  impl Settings {
-@@ -139,6 +146,7 @@ impl Settings {
+@@ -139,6 +150,7 @@ impl Settings {
              jd: Jd { rates: Jd::ALL_RATES, sixteen_in_training: false, sixteen_in_renegotiation: false, lookahead: 1 },
              wide,
              habits: Habits::default(),
@@ -1642,13 +1755,15 @@ index 93fd619..3572948 100644
          }
      }
  }
-@@ -201,6 +209,19 @@ struct Source {
+@@ -201,6 +213,21 @@ struct Source {
      r_codes: [u8; INTERVALS],
      data: VecDeque<bool>,
      trn1d_symbols: usize,
 +    /// V.92 with PCM upstream: phase 4 sends SUVd and CPd where V.90 sends
 +    /// MP (8.8/V.92).
 +    v92: Option<V92Down>,
++    /// See [`Habits::dil_passes`].
++    dil_passes: Option<usize>,
 +}
 +
 +/// What the digital modem's phase 4 sends with PCM upstream (9.6.1.1/V.92):
@@ -1662,15 +1777,26 @@ index 93fd619..3572948 100644
  }
  
  impl Source {
-@@ -231,6 +252,7 @@ impl Source {
+@@ -231,6 +258,8 @@ impl Source {
              mps_sent: 0,
              r_codes: [0; INTERVALS],
              data: VecDeque::new(),
 +            v92: None,
++            dil_passes: None,
          }
      }
  
-@@ -417,7 +439,21 @@ impl Source {
+@@ -351,6 +380,9 @@ impl Source {
+                         continue;
+                     }
+                     self.count += 1;
++                    if self.dil_passes.is_some_and(|n| self.count > n * self.dil.len()) {
++                        return 0.0;
++                    }
+                     let (u, positive) = self.dil[at];
+                     return self.level(u, positive);
+                 }
+@@ -417,7 +449,21 @@ impl Source {
                      }
                  }
                  let next = self.pending.take();
@@ -1693,7 +1819,7 @@ index 93fd619..3572948 100644
                      // A whole MP, or MP' once the far end's CP has come.
                      let mp = self.mp.unwrap_or_default();
                      let mp = if self.mp_ack { mp.acknowledged() } else { mp };
-@@ -535,6 +571,13 @@ pub struct Modem {
+@@ -535,6 +581,13 @@ pub struct Modem {
      /// The upstream no faster than this, as a multiple of 2400, from a
      /// renegotiation this end began.
      upstream_cap: Option<u8>,
@@ -1707,7 +1833,16 @@ index 93fd619..3572948 100644
  }
  
  impl Modem {
-@@ -579,7 +622,15 @@ impl Modem {
+@@ -548,7 +601,7 @@ impl Modem {
+             stage: Stage::AwaitS,
+             status: Status::Running,
+             deadline: None,
+-            source: Source::new(settings.law, settings.uinfo, settings.jd, settings.habits.trn1d),
++            source: Source { dil_passes: settings.habits.dil_passes, ..Source::new(settings.law, settings.uinfo, settings.jd, settings.habits.trn1d) },
+             rx,
+             reader: Reader::new(Mode::Answer),
+             in_trn: true,
+@@ -579,7 +632,15 @@ impl Modem {
              clearing: false,
              renegotiations: 0,
              upstream_cap: None,
@@ -1723,7 +1858,7 @@ index 93fd619..3572948 100644
          // 9.4.1: B1 "within 15 s plus 5 round-trip delays after receiving
          // INFO1a".
          modem.deadline = Some((modem.samples(15.0 + 5.0 * settings.round_trip), "no B1 from the analogue modem"));
-@@ -736,6 +787,9 @@ impl Modem {
+@@ -736,6 +797,9 @@ impl Modem {
      /// One network sample in, one out.
      pub fn step(&mut self, input: f64) -> f64 {
          self.now += 1;
@@ -1733,7 +1868,7 @@ index 93fd619..3572948 100644
          self.rx.feed(input);
          match self.watching() {
              Some(learn) => {
-@@ -778,6 +832,138 @@ impl Modem {
+@@ -778,6 +842,138 @@ impl Modem {
          self.source.next()
      }
  
@@ -1872,7 +2007,7 @@ index 93fd619..3572948 100644
      /// From data mode to Rd (9.6.1.1.1, 9.6.1.2.2), and phase 4 after it.
      ///
      /// The answering end starts on S rather than on S turning into S-bar,
-@@ -869,7 +1055,7 @@ impl Modem {
+@@ -869,7 +1065,7 @@ impl Modem {
              }
              Stage::Phase4Cp => {
                  // 9.4.1.4: an MP' sent, and CP' or E heard.
@@ -1881,7 +2016,7 @@ index 93fd619..3572948 100644
                  if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
                      self.source.change(Out::Ed);
                  }
-@@ -879,7 +1065,7 @@ impl Modem {
+@@ -879,7 +1075,7 @@ impl Modem {
                      && !self.renegotiating
                      && self.source.out == Out::Data
                      && self.b1_left == 0
@@ -5715,10 +5850,10 @@ index 36d0d26..af609df 100644
          digital::Settings::new(Law::Mu, &info1d, &asked, 0.02, true),
 diff --git a/crates/datapump/tests/v92_quick.rs b/crates/datapump/tests/v92_quick.rs
 new file mode 100644
-index 0000000..2d7314c
+index 0000000..e7dc2d7
 --- /dev/null
 +++ b/crates/datapump/tests/v92_quick.rs
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,239 @@
 +//! V.92's short Phase 2 (9.4/V.92) between the two modems here: a full
 +//! start-up with a V.92 server first, which is what the analogue modem
 +//! learns the upstream from, then a start-up asking for the short Phase 2
@@ -5935,6 +6070,28 @@ index 0000000..2d7314c
 +    let Status::Connected { transmit, receive } = analogue.status() else { unreachable!() };
 +    println!("connected in {seconds:.2} s: {receive} down, {transmit} up");
 +    assert!(receive >= 48_000 && seconds < 20.0, "{receive} down in {seconds:.2} s");
++}
++
++/// A digital modem that sends its DIL once and then goes quiet, so that the
++/// second reading this end asks for never comes: the DIL is taken as read
++/// once over after a second or two, and the call comes up -- rather than
++/// waiting out the start-up's fifteen seconds and retraining into the same.
++#[test]
++fn a_dil_sent_only_once_is_gone_on_with_after_one_pass() {
++    use datapump::v90::digital::Habits;
++    for pcm_up in [false, true] {
++        let mut analogue = if pcm_up { Analogue::new(FS).with_pcm_upstream() } else { Analogue::v90_only(FS) };
++        let mut digital = Digital::new(v92_server()).with_habits(Habits { dil_passes: Some(1), ..Habits::PROMPT });
++        let seconds = run(&mut analogue, &mut digital, line(), 40.0);
++        let notes = analogue.take_notes();
++        println!("PCM upstream {pcm_up}: notes {notes:?}");
++        let seconds = seconds.expect("did not connect");
++        assert!(notes.iter().any(|n| n.contains("the DIL read once over")), "{notes:?}");
++        assert!(!notes.iter().any(|n| n.contains("failed")), "{notes:?}");
++        let Status::Connected { transmit, receive } = analogue.status() else { unreachable!() };
++        println!("connected in {seconds:.2} s: {receive} down, {transmit} up");
++        assert!(receive >= 48_000 && seconds < 10.0, "{receive} down in {seconds:.2} s");
++    }
 +}
 diff --git a/crates/gui/src/app.rs b/crates/gui/src/app.rs
 index 32d9319..d60725d 100644
