@@ -8,7 +8,8 @@
 //! to a speaker go through the sound switch (mobile::muted), its recordings go
 //! to mobile::captures_dir, and app.rs gets one
 //! line added: `mod mobile;`, pointing at src/mobile.rs here. Upstream stays
-//! byte-for-byte as checked out.
+//! byte-for-byte as checked out: the modem itself, V.92 included, is
+//! upstream's, with no patches.
 
 use std::fs;
 use std::path::PathBuf;
@@ -19,25 +20,6 @@ fn main() {
     let mobile = here.join("src/mobile.rs").canonicalize().unwrap();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gui");
     fs::create_dir_all(&out).unwrap();
-
-    // The long DIL (android/patches/long-dil.patch) is a change to the modem
-    // crate, which build-apk.sh applies to the submodule. Refuse to build the
-    // app with the short one by accident.
-    let dil = here.join("../BinModem/crates/datapump/src/v90/analogue.rs");
-    println!("cargo:rerun-if-changed={}", dil.display());
-    assert!(
-        fs::read_to_string(&dil).unwrap().contains("const DIL_PASSES"),
-        "BinModem is missing android/patches/long-dil.patch: run ./build-apk.sh, or \
-         git -C BinModem apply ../android/patches/long-dil.patch"
-    );
-    // V.92's Quick Connect (android/patches/v92-quick-connect.patch), the
-    // same way.
-    let modem = here.join("../BinModem/crates/modem/src/lib.rs");
-    println!("cargo:rerun-if-changed={}", modem.display());
-    assert!(
-        fs::read_to_string(&modem).unwrap().contains("pub mod quick;"),
-        "BinModem is missing android/patches/v92-quick-connect.patch: run ./build-apk.sh"
-    );
 
     println!("cargo:rerun-if-changed={}", upstream.display());
     println!("cargo:rerun-if-changed={}", mobile.display());

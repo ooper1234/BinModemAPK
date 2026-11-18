@@ -330,18 +330,23 @@ impl ScopeApp {
                 });
                 ui.add_space(4.0);
                 ui.label(RichText::new("waterfall  (0 - 4000 Hz)").strong());
-                self.waterfall.paint(ui, 220.0, self.frame.modulation);
+                self.waterfall.paint(ui, 220.0, self.frame.modulation, self.row_secs);
                 ui.add_space(8.0);
 
                 ui.label(RichText::new("spectrum").strong());
+                let measured = scopes::measure(&self.frame.spectrum_db, self.frame.hz_per_bin);
                 scopes::spectrum(
                     ui,
-                    &self.frame.spectrum_db,
-                    self.frame.hz_per_bin,
                     170.0,
-                    self.waterfall.floor_db,
-                    self.waterfall.ceiling_db,
-                    self.frame.modulation,
+                    scopes::Trace {
+                        bins: &self.frame.spectrum_db,
+                        hold: &self.hold,
+                        hz_per_bin: self.frame.hz_per_bin,
+                        floor: self.waterfall.floor_db,
+                        ceiling: self.waterfall.ceiling_db,
+                        modulation: self.frame.modulation,
+                        measured,
+                    },
                 );
                 ui.add_space(8.0);
 
@@ -388,26 +393,10 @@ impl ScopeApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.label(RichText::new("call").strong());
-                if let Some(drn) = self.status(ui)
-                    && let Source::Live(session) = &self.source
-                {
-                    session.choose_rate(drn);
-                }
-
-                if let Source::Live(session) = &self.source {
-                    let connected = self.frame.state == telemetry::CallState::Connected;
-                    let v34 = self.frame.modulation == "V.34";
-                    ui.add_space(6.0);
-                    if ui
-                        .add_enabled(
-                            connected && v34,
-                            egui::Button::new("Retrain (V.34)").min_size(egui::vec2(0.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        session.retrain();
-                    }
-                }
+                // Upstream's call card: state, rates, and the PCM down and
+                // (V.92) PCM up rate menus with Retrain beside them.
+                let measured = scopes::measure(&self.frame.spectrum_db, self.frame.hz_per_bin);
+                self.call_card(ui, measured);
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -624,6 +613,11 @@ impl Combo {
         self
     }
 
+    pub fn close_behavior(mut self, behavior: egui::PopupCloseBehavior) -> Self {
+        self.inner = self.inner.close_behavior(behavior);
+        self
+    }
+
     pub fn show_ui<R>(
         self,
         ui: &mut egui::Ui,
@@ -666,6 +660,11 @@ impl<'a> Slider<'a> {
     pub fn suffix(mut self, suffix: &str) -> Self {
         self.suffix = suffix.to_owned();
         self.inner = self.inner.suffix(suffix);
+        self
+    }
+
+    pub fn show_value(mut self, on: bool) -> Self {
+        self.inner = self.inner.show_value(on);
         self
     }
 

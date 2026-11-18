@@ -1,6 +1,6 @@
 [package]
 name    = "binmodem-android"
-version = "2.0.0"
+version = "4.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -35,6 +35,8 @@ image  = { version = "0.25.10", default-features = false, features = ["png", "jp
 # The desktop file dialogs have no Android backend; this answers "cancelled".
 rfd    = { path = "rfd-stub", package = "rfd-stub" }
 log = "0.4"
+# PDFs to fax, as upstream renders them.
+hayro = "0.7.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.36.1", default-features = false, features = ["android-native-activity"] }
