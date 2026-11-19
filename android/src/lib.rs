@@ -156,6 +156,13 @@ impl eframe::App for Phone {
             requests.keyboard.or(Some(ctx.egui_wants_keyboard_input()))
         };
         self.last_page = page;
+        // A tap on the terminal or the Keyboard button always raises it, even
+        // if it was asked up before: Back puts the keyboard away without this
+        // side hearing of it, so the remembered "up" can be stale, and then
+        // every later tap was ignored and nothing could be typed.
+        if requests.keyboard == Some(true) {
+            self.keyboard = false;
+        }
         if let Some(want) = wanted {
             self.set_keyboard(want);
         }
