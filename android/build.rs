@@ -104,7 +104,12 @@ fn main() {
                 assert_eq!(patched.matches(from).count(), 1, "app.rs: `{from}` has changed upstream");
                 patched = patched.replace(from, to);
             }
-            patched
+            // The faceplate is a desktop's width (lamps beside a readout,
+            // 520 points at least); a phone shows the readout across the
+            // screen instead (mobile::phone_faceplate).
+            let from = "        self.faceplate(ui);\n";
+            assert_eq!(patched.matches(from).count(), 2, "app.rs: the faceplate calls have changed upstream");
+            patched.replace(from, "        self.phone_faceplate(ui);\n")
         } else {
             patched
         };

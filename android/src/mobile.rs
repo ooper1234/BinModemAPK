@@ -36,6 +36,9 @@ pub struct Mobile {
     /// The platform's answer: the picked file copied into the app's folder,
     /// or an empty string for cancelled.
     pub picked: Option<String>,
+    /// Points at the top and bottom covered by the system bars or the
+    /// keyboard, which the layout keeps clear of.
+    pub insets: (f32, f32),
 }
 
 /// A file dialog, drawn by the app: Android has none a native app can use
@@ -48,7 +51,7 @@ pub struct Picker {
 
 impl Default for Mobile {
     fn default() -> Self {
-        Self { page: Page::Line, fit_font: true, sound_started: false, picker: None, system_picker: false, waiting: None, picked: None }
+        Self { page: Page::Line, fit_font: true, sound_started: false, picker: None, system_picker: false, waiting: None, picked: None, insets: (0.0, 0.0) }
     }
 }
 
@@ -67,6 +70,8 @@ const DIM: Color32 = Color32::from_rgb(140, 150, 165);
 const BRIGHT: Color32 = Color32::from_rgb(220, 225, 235);
 const GREEN: Color32 = Color32::from_rgb(90, 220, 130);
 const AMBER: Color32 = Color32::from_rgb(245, 180, 70);
+/// The colour of a chosen tab.
+const ACCENT: Color32 = Color32::from_rgb(90, 170, 255);
 
 /// Height of a touch target, in points.
 const TOUCH_H: f32 = 44.0;
@@ -89,22 +94,50 @@ impl ScopeApp {
             }
         }
 
+        // Clear of the status and navigation bars, and of the keyboard: a
+        // phone with on-screen buttons draws them over the bottom of the app,
+        // which is where the tabs are.
+        let (top, bottom) = m.insets;
+        // With the keyboard up the room left is small, and what it is for
+        // is the terminal: no tabs, no lamps, and the extra keys in one row.
+        let typing = bottom > 150.0;
+        if top > 0.5 {
+            egui::Panel::top("m-inset-top")
+                .exact_size(top)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(ui.visuals().panel_fill))
+                .show(ui, |_| {});
+        }
+        if bottom > 0.5 {
+            egui::Panel::bottom("m-inset-bottom")
+                .exact_size(bottom)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(Color32::BLACK))
+                .show(ui, |_| {});
+        }
+
         egui::Panel::top("m-status").show(ui, |ui| {
             ui.add_space(4.0);
-            self.status_strip(ui);
+            self.status_strip(ui, !typing);
             ui.add_space(4.0);
         });
 
-        egui::Panel::bottom("m-tabs").show(ui, |ui| {
-            ui.add_space(4.0);
-            tab_bar(ui, &mut m.page);
-            ui.add_space(4.0);
-        });
+        if !typing {
+            egui::Panel::bottom("m-tabs").show(ui, |ui| {
+                ui.add_space(4.0);
+                tab_bar(ui, &mut m.page);
+                ui.add_space(4.0);
+            });
+        }
 
         if m.page == Page::Terminal {
             egui::Panel::bottom("m-keys").show(ui, |ui| {
                 ui.add_space(4.0);
-                self.extra_keys(ui, &mut requests);
+                if typing {
+                    self.extra_keys_compact(ui, &mut requests);
+                } else {
+                    self.extra_keys(ui, &mut requests);
+                }
                 ui.add_space(4.0);
             });
         }
@@ -169,7 +202,7 @@ impl ScopeApp {
     }
 
     /// One line of what the call is doing, always in view.
-    fn status_strip(&mut self, ui: &mut egui::Ui) {
+    fn status_strip(&mut self, ui: &mut egui::Ui, lamps: bool) {
         let f = &self.frame;
         let colour = match f.state {
             telemetry::CallState::Connected => GREEN,
@@ -203,7 +236,9 @@ impl ScopeApp {
             self.toggle_sound();
         }
         ui.add_space(2.0);
-        scopes::faceplate(ui, &self.frame.leds);
+        if lamps {
+            scopes::faceplate(ui, &self.frame.leds);
+        }
     }
 
     /// One switch for every sound, lit while it is on -- the same kind of
@@ -479,6 +514,15 @@ impl ScopeApp {
         }
     }
 
+    /// The faceplate on a phone: upstream's readout -- the rate, and what the
+    /// call is doing -- across the whole width. The lamps beside it on the
+    /// desktop are in the strip at the top here, and the receive level is
+    /// at the foot of the Line page.
+    pub fn phone_faceplate(&mut self, ui: &mut egui::Ui) {
+        let width = ui.available_width();
+        self.readout(ui, egui::vec2(width, 96.0));
+    }
+
     /// Upstream's Review tab, with the recordings Record made listed above
     /// it: its Open button is a file dialog, which Android does not have.
     fn page_review(&mut self, ui: &mut egui::Ui) {
@@ -536,6 +580,41 @@ impl ScopeApp {
                     ui.add_space(24.0);
                 });
             });
+    }
+
+    /// The extra keys in one row, for while the keyboard is up, with a key
+    /// that puts it away.
+    fn extra_keys_compact(&mut self, ui: &mut egui::Ui, requests: &mut Requests) {
+        const KEYS: [(&str, &[u8]); 8] = [
+            ("Esc", b"\x1b"),
+            ("Tab", b"\t"),
+            ("^C", b"\x03"),
+            ("\u{23F4}", b"\x1b[D"),
+            ("\u{23F6}", b"\x1b[A"),
+            ("\u{23F7}", b"\x1b[B"),
+            ("\u{23F5}", b"\x1b[C"),
+            ("+++", b"+++"),
+        ];
+        ui.spacing_mut().button_padding.x = 2.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let gap = ui.spacing().item_spacing.x;
+        let n = KEYS.len() as f32 + 1.0;
+        let key_w = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
+        let size = egui::vec2(key_w, 36.0);
+        ui.horizontal(|ui| {
+            for (label, bytes) in KEYS {
+                if ui.add(egui::Button::new(RichText::new(label).size(15.0)).min_size(size)).clicked() {
+                    self.source.send(bytes);
+                }
+            }
+            if ui
+                .add(egui::Button::new(RichText::new("\u{2328}").size(15.0)).min_size(size))
+                .on_hover_text("Hide the keyboard")
+                .clicked()
+            {
+                requests.keyboard = Some(false);
+            }
+        });
     }
 
     /// The keys a phone keyboard does not have, and a way to raise it.
@@ -817,23 +896,41 @@ fn sound_label(ui: &mut egui::Ui) -> bool {
         .clicked()
 }
 
-/// Four tabs across the bottom, each a quarter of the width.
+/// Four tabs across the bottom, each a quarter of the width: an icon over
+/// its name, the chosen one lit.
 fn tab_bar(ui: &mut egui::Ui, page: &mut Page) {
-    const TABS: [(Page, &str); 4] = [
-        (Page::Line, "Line"),
-        (Page::Terminal, "Terminal"),
-        (Page::Scopes, "Scopes"),
-        (Page::Status, "Status"),
+    const TABS: [(Page, &str, &str); 4] = [
+        (Page::Line, "\u{260E}", "Line"),
+        (Page::Terminal, "\u{2328}", "Terminal"),
+        (Page::Scopes, "\u{1F4C8}", "Scopes"),
+        (Page::Status, "\u{2139}", "Status"),
     ];
     let gap = ui.spacing().item_spacing.x;
     let w = ((ui.available_width() - gap * 3.0) / 4.0).floor();
     ui.horizontal(|ui| {
-        for (p, label) in TABS {
+        for (p, icon, label) in TABS {
             let selected = *page == p;
-            let text = RichText::new(label).size(17.0);
-            let text = if selected { text.strong() } else { text };
-            let button = egui::Button::selectable(selected, text).min_size(egui::vec2(w, TOUCH_H));
-            if ui.add(button).clicked() {
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 52.0), egui::Sense::click());
+            let colour = if selected { ACCENT } else if response.hovered() { BRIGHT } else { DIM };
+            let painter = ui.painter();
+            if selected {
+                painter.rect_filled(rect.shrink2(egui::vec2(6.0, 2.0)), 10.0, ACCENT.gamma_multiply(0.18));
+            }
+            painter.text(
+                rect.center_top() + egui::vec2(0.0, 6.0),
+                egui::Align2::CENTER_TOP,
+                icon,
+                egui::FontId::proportional(20.0),
+                colour,
+            );
+            painter.text(
+                rect.center_bottom() - egui::vec2(0.0, 5.0),
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                egui::FontId::proportional(13.0),
+                colour,
+            );
+            if response.clicked() {
                 *page = p;
             }
         }

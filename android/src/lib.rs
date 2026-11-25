@@ -150,6 +150,7 @@ impl eframe::App for Phone {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.fit(&ctx);
+        self.mobile.insets = self.insets(&ctx);
         let requests = self.inner.mobile_ui(ui, &mut self.mobile);
         if let Some(types) = &requests.system_pick
             && let Err(e) = system_pick(types)
@@ -221,6 +222,24 @@ impl Phone {
         let native = native.unwrap_or(2.0);
         let zoom = native.min(physical / MIN_W).max(0.75);
         ctx.set_pixels_per_point(zoom);
+    }
+
+    /// How much of the window the system bars and the keyboard cover, top
+    /// and bottom, in points: what Android says is left for the content,
+    /// against the whole window.
+    fn insets(&self, ctx: &egui::Context) -> (f32, f32) {
+        let r = self.android_app.content_rect();
+        if r.bottom <= r.top {
+            return (0.0, 0.0);
+        }
+        let ppp = ctx.pixels_per_point();
+        let window = ctx.content_rect().height() * ppp;
+        let top = (r.top as f32 / ppp).max(0.0);
+        let bottom = ((window - r.bottom as f32) / ppp).max(0.0);
+        // Never more than half the screen, whatever a rotation in progress
+        // says for a frame.
+        let half = window / ppp / 2.0;
+        (top.min(half), bottom.min(half))
     }
 
     fn set_keyboard(&mut self, want: bool) {
@@ -359,6 +378,14 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
     app::mobile::load_muted();
     let ppp: f32 = std::env::var("BINMODEM_PPP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let mut mobile = app::mobile::Mobile::default();
+    // BINMODEM_INSETS=top,bottom: draw as if the system bars or the keyboard
+    // covered that much, to look at the layout with the keyboard up.
+    if let Some((t, b)) = std::env::var("BINMODEM_INSETS").ok().and_then(|v| {
+        let (t, b) = v.split_once(',')?;
+        Some((t.parse().ok()?, b.parse().ok()?))
+    }) {
+        mobile.insets = (t, b);
+    }
     mobile.page = match std::env::var("BINMODEM_PAGE").as_deref() {
         Ok("terminal") => app::mobile::Page::Terminal,
         Ok("scopes") => app::mobile::Page::Scopes,

@@ -54,6 +54,14 @@ build applies no patches to it. On the phone:
   of calls). Review's Open is a file dialog, which Android lacks, so the
   recordings Record has made are listed above it to open with a tap.
 - The faceplate's Scopes and Fax keys go to the Scopes page and the fax tab.
+- The layout keeps clear of the status and navigation bars and of the
+  keyboard (Android's content rectangle). With the keyboard up, the tabs and
+  lamps step aside and the extra keys fit in one row, so the terminal stays
+  in view.
+- The faceplate is upstream's readout across the width: the desktop puts the
+  lamps beside it, which does not fit a phone, and the lamps are in the strip
+  at the top here anyway.
+- The tabs have icons.
 - Upstream's line controls also start fax calls, take received pages and
   show the incoming-call prompt. Only the Line page draws them, so on the
   other pages they run unseen; otherwise Send fax on the fax tab did nothing.
@@ -81,6 +89,7 @@ To look at the layout without a phone (Linux, needs ALSA and X11):
     cd android && BINMODEM_PAGE=terminal cargo run --example preview
 
 `BINMODEM_PAGE` is `line`, `terminal`, `scopes` or `status`;
+`BINMODEM_INSETS=0,330` draws as if the keyboard were up;
 `BINMODEM_OPEN=dial|network|advanced|files|fax|error` opens a window too
 (and `v90`, `sip` pick those, `long` draws a SIP call's long status row; several can be given, comma-separated).
 
