@@ -26,11 +26,21 @@ pub struct Mobile {
     pub fit_font: bool,
     /// Whether the monitor has been opened for the Sound switch yet.
     pub sound_started: bool,
+    /// The file browser standing in for a file dialog, while it is open.
+    pub picker: Option<Picker>,
+}
+
+/// A file dialog, drawn by the app: Android has none a native app can use
+/// without Java. Opened when the GUI asks the rfd stand-in for a file.
+#[derive(Debug)]
+pub struct Picker {
+    request: rfd::Request,
+    dir: std::path::PathBuf,
 }
 
 impl Default for Mobile {
     fn default() -> Self {
-        Self { page: Page::Line, fit_font: true, sound_started: false }
+        Self { page: Page::Line, fit_font: true, sound_started: false, picker: None }
     }
 }
 
@@ -39,6 +49,8 @@ impl Default for Mobile {
 pub struct Requests {
     /// Raise (`Some(true)`) or drop (`Some(false)`) the soft keyboard.
     pub keyboard: Option<bool>,
+    /// Ask for permission to read shared storage, for the file browser.
+    pub storage: bool,
 }
 
 const DIM: Color32 = Color32::from_rgb(140, 150, 165);
@@ -54,6 +66,7 @@ impl ScopeApp {
         let mut requests = Requests::default();
 
         self.poll();
+        self.note_last_call();
         self.remember();
         scopes::request_animation(ui.ctx());
 
@@ -91,11 +104,30 @@ impl ScopeApp {
         self.constellation_window(ui);
 
         let tab_was = self.tab;
-        egui::CentralPanel::default().show(ui, |ui| match m.page {
+        if let Some(request) = rfd::take_request() {
+            m.picker = Some(Picker { request, dir: picker_roots()[0].1.clone() });
+            requests.storage = true;
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Upstream's line controls do more than draw: they start a fax
+            // that Send fax or Wait for a fax asked for, take the pages that
+            // arrive, and put up the prompt for an incoming SIP call. On the
+            // desktop they are always on screen; here only the Line page
+            // draws them, so whenever it is not showing they run unseen --
+            // or a fax pressed on the Terminal page never started.
+            if m.picker.is_some() || m.page != Page::Line {
+                let mut hidden = ui.new_child(egui::UiBuilder::new().invisible());
+                self.controls(&mut hidden);
+            }
+            if m.picker.is_some() {
+                return self.picker(ui, m);
+            }
+            match m.page {
             Page::Line => self.page_line(ui),
             Page::Terminal => self.page_terminal(ui, m, &mut requests),
             Page::Scopes => self.page_scopes(ui),
             Page::Status => self.page_status(ui),
+            }
         });
         // The faceplate's Scopes and Fax keys pick a desktop tab; here they
         // go to the page that shows it.
@@ -299,6 +331,129 @@ impl ScopeApp {
                     self.source.send(&typed);
                 }
             });
+    }
+
+    /// The file browser: places to start from, the folder's folders and the
+    /// files the request allows, and the chosen one handed to whatever asked.
+    fn picker(&mut self, ui: &mut egui::Ui, m: &mut Mobile) {
+        let Some(picker) = m.picker.as_mut() else { return };
+        let folder = picker.request.folder;
+        let mut exts = picker.request.extensions();
+        exts.sort();
+        exts.dedup();
+        let mut chosen = None;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(if folder { "choose a folder" } else { "choose a file" }).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        crate::app::mobile::wrapped(ui, |ui| {
+            for (name, dir) in picker_roots() {
+                if ui.selectable_label(picker.dir == dir, name).clicked() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    picker.dir = dir;
+                }
+            }
+        });
+        ui.label(RichText::new(picker.dir.display().to_string()).monospace().small().color(DIM));
+        if !exts.is_empty() {
+            ui.label(RichText::new(format!("showing {}", exts.join(", "))).small().color(DIM));
+        }
+        ui.separator();
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let listing = std::fs::read_dir(&picker.dir);
+        match listing {
+            Ok(entries) => {
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        dirs.push((name, path));
+                    } else if !folder
+                        && (exts.is_empty()
+                            || path.extension().is_some_and(|x| exts.contains(&x.to_string_lossy().to_ascii_lowercase())))
+                    {
+                        files.push((name, path));
+                    }
+                }
+            }
+            Err(e) => {
+                ui.label(RichText::new(format!("cannot read this folder: {e}")).color(AMBER));
+            }
+        }
+        dirs.sort_by_key(|(n, _)| n.to_lowercase());
+        files.sort_by_key(|(n, _)| n.to_lowercase());
+        if folder && ui.button("Use this folder").clicked() {
+            chosen = Some(picker.dir.clone());
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if let Some(parent) = picker.dir.parent()
+                && ui.add(egui::Button::new(RichText::new("..  up").monospace()).min_size(egui::vec2(ui.available_width(), 36.0))).clicked()
+            {
+                picker.dir = parent.to_path_buf();
+            }
+            for (name, path) in dirs {
+                let b = egui::Button::new(RichText::new(format!("{name}/")).monospace().color(BRIGHT))
+                    .min_size(egui::vec2(ui.available_width(), 36.0));
+                if ui.add(b).clicked() {
+                    picker.dir = path;
+                }
+            }
+            for (name, path) in files {
+                let b = egui::Button::new(RichText::new(name).monospace().color(GREEN))
+                    .min_size(egui::vec2(ui.available_width(), 36.0));
+                if ui.add(b).clicked() {
+                    chosen = Some(path);
+                }
+            }
+            if files_hint_needed(&picker.dir) {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Android shows other apps' PDFs and documents only to the system file \
+                         picker. Copy them to \"app files/fax\" (Android/data/io.github.binmodem/\
+                         files/fax, reachable over USB) to send them.",
+                    )
+                    .small()
+                    .color(DIM),
+                );
+            }
+        });
+        if let Some(path) = chosen {
+            let request = m.picker.take().map(|p| p.request);
+            if let Some(request) = request {
+                self.deliver(&request, &path);
+            }
+        } else if close {
+            m.picker = None;
+        }
+    }
+
+    /// The chosen file to whichever dialog asked, known by its filters.
+    fn deliver(&mut self, request: &rfd::Request, path: &std::path::Path) {
+        if request.folder {
+            // ZMODEM's folder for received files: the only folder asked for.
+            self.receive_dir = path.display().to_string();
+            return;
+        }
+        match request.first_filter() {
+            Some("recordings") => self.review.open(path),
+            Some(_) => {
+                // The fax document: pictures and PDFs.
+                self.fax.load(path);
+                self.fax.view = crate::faxwin::View::Sending;
+            }
+            // No filter: a file for ZMODEM to send.
+            None => self.send_path = path.display().to_string(),
+        }
     }
 
     /// Upstream's Review tab, with the recordings Record made listed above
@@ -911,4 +1066,33 @@ pub fn wrapped<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> eg
     );
     let response = ui.allocate_rect(kept, egui::Sense::hover());
     egui::InnerResponse::new(inner, response)
+}
+
+/// Where the file browser starts: the app's own folder (which needs no
+/// permission and can be reached over USB), then shared storage.
+fn picker_roots() -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut roots = Vec::new();
+    let captures = captures_dir();
+    if let Some(app) = captures.parent().filter(|p| !p.as_os_str().is_empty()) {
+        roots.push(("app files/fax", app.join("fax")));
+        roots.push(("app files", app.to_path_buf()));
+    } else {
+        roots.push(("app files/fax", std::path::PathBuf::from("fax")));
+    }
+    let shared = std::path::PathBuf::from("/storage/emulated/0");
+    if shared.is_dir() {
+        roots.push(("Download", shared.join("Download")));
+        roots.push(("Pictures", shared.join("Pictures")));
+        roots.push(("DCIM", shared.join("DCIM")));
+        roots.push(("phone", shared));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        roots.push(("home", home.into()));
+    }
+    roots
+}
+
+/// Whether the browser is in shared storage, where Android hides other apps'
+/// non-media files.
+fn files_hint_needed(dir: &std::path::Path) -> bool {
+    dir.starts_with("/storage/emulated/0") && !dir.starts_with("/storage/emulated/0/Android")
 }

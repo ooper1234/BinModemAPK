@@ -54,6 +54,9 @@ build applies no patches to it. On the phone:
   of calls). Review's Open is a file dialog, which Android lacks, so the
   recordings Record has made are listed above it to open with a tap.
 - The faceplate's Scopes and Fax keys go to the Scopes page and the fax tab.
+- Upstream's line controls also start fax calls, take received pages and
+  show the incoming-call prompt. Only the Line page draws them, so on the
+  other pages they run unseen; otherwise Send fax on the fax tab did nothing.
 
 `android/patches/long-dil.patch` (read the DIL twice) still applies but is not
 applied by `build-apk.sh`.
@@ -83,9 +86,12 @@ To look at the layout without a phone (Linux, needs ALSA and X11):
 
 ## Limits
 
-- File dialogs (`Browse…` for ZMODEM and fax pictures) are stubbed out; type a
-  path into the box beside them instead (e.g. under `/sdcard/Download`,
-  which may need the app's storage access granted in Android settings).
+- Android has no file dialog a native app can use, so `Browse` opens the
+  app's own file browser. Android only shows another app's PDFs and documents
+  to the system picker, so put documents to fax in the app's
+  `Android/data/io.github.binmodem/files/fax` folder (over USB, for example).
+  Pictures in Download, Pictures and DCIM can be picked once storage access is
+  allowed. Fax `Save` needs no dialog: files go to `files/saved`.
 - arm64-v8a only, Android 8.0 (API 26) or newer (AAudio).
 
 ## Building

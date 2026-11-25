@@ -57,10 +57,14 @@ fn android_main(android_app: AndroidApp) {
     }
     if let Some(outside) = android_app.external_data_path() {
         app::mobile::set_captures_dir(outside.join("captures"));
+        // Faxes saved go here, and documents to fax are looked for first in
+        // files/fax: both reachable over USB.
+        rfd::set_save_dir(outside.join("saved"));
+        let _ = std::fs::create_dir_all(outside.join("fax"));
     }
     app::mobile::load_muted();
 
-    if let Err(e) = request_microphone() {
+    if let Err(e) = request_permissions(&["android.permission.RECORD_AUDIO"]) {
         log::warn!("could not ask for the microphone: {e}");
     }
 
@@ -100,6 +104,7 @@ fn run(android_app: AndroidApp) -> Result<(), Box<dyn std::error::Error>> {
                 mobile: app::mobile::Mobile::default(),
                 android_app,
                 keyboard: false,
+                asked_storage: false,
                 fitted_for: 0.0,
                 last_page: app::mobile::Page::default(),
             }))
@@ -132,6 +137,8 @@ struct Phone {
     android_app: AndroidApp,
     /// Whether the soft keyboard was last asked up.
     keyboard: bool,
+    /// Whether shared storage has been asked for this run.
+    asked_storage: bool,
     /// The physical width the zoom was last chosen for.
     fitted_for: f32,
     last_page: app::mobile::Page,
@@ -143,6 +150,17 @@ impl eframe::App for Phone {
         let ctx = ui.ctx().clone();
         self.fit(&ctx);
         let requests = self.inner.mobile_ui(ui, &mut self.mobile);
+        if requests.storage && !self.asked_storage {
+            self.asked_storage = true;
+            // Images and, up to Android 12, everything else in shared
+            // storage; the app's own folder needs neither.
+            if let Err(e) = request_permissions(&[
+                "android.permission.READ_MEDIA_IMAGES",
+                "android.permission.READ_EXTERNAL_STORAGE",
+            ]) {
+                log::warn!("could not ask for storage: {e}");
+            }
+        }
 
 
         // The terminal asks for the keyboard itself; anywhere else it follows
@@ -212,32 +230,37 @@ fn log_panics() {
     }));
 }
 
-/// Ask for RECORD_AUDIO, which a sound-card modem cannot hear without.
+/// Ask for permissions not yet given: RECORD_AUDIO at start, which a
+/// sound-card modem cannot hear without, and shared storage when the file
+/// browser first opens.
 ///
 /// `Activity.requestPermissions` through JNI; the answer comes back to the
-/// activity, and the line simply opens once it has been given.
+/// activity, and what needed it simply works once it has been given.
 #[cfg(target_os = "android")]
-fn request_microphone() -> Result<(), Box<dyn std::error::Error>> {
-    const PERMISSION: &str = "android.permission.RECORD_AUDIO";
+fn request_permissions(permissions: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = ndk_context::android_context();
     // SAFETY: both pointers come from the running activity via ndk-context.
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
     let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
     let mut env = vm.attach_current_thread()?;
 
-    let name = env.new_string(PERMISSION)?;
-    let granted = env
-        .call_method(
-            &activity,
-            "checkSelfPermission",
-            "(Ljava/lang/String;)I",
-            &[(&name).into()],
-        )?
-        .i()?;
-    if granted == 0 {
+    let mut missing = Vec::new();
+    for permission in permissions {
+        let name = env.new_string(permission)?;
+        let granted = env
+            .call_method(&activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[(&name).into()])?
+            .i()?;
+        if granted != 0 {
+            missing.push(name);
+        }
+    }
+    if missing.is_empty() {
         return Ok(());
     }
-    let array = env.new_object_array(1, "java/lang/String", &name)?;
+    let array = env.new_object_array(missing.len() as i32, "java/lang/String", &missing[0])?;
+    for (i, name) in missing.iter().enumerate() {
+        env.set_object_array_element(&array, i as i32, name)?;
+    }
     env.call_method(
         &activity,
         "requestPermissions",
