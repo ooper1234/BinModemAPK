@@ -1,0 +1,1678 @@
+diff --git a/crates/at/src/lib.rs b/crates/at/src/lib.rs
+index 4bc6319..6358424 100644
+--- a/crates/at/src/lib.rs
++++ b/crates/at/src/lib.rs
+@@ -407,10 +407,13 @@ impl Interpreter {
+             // HST96 is the first of them, the 1986 Courier HST: 9600 one
+             // way and 300 back, and nothing else.
+             //
++            // X2 is USRobotics' 56k before V.90: calling, a client that
++            // reads the server's octets on a SIP line; answering, a server.
++            //
+             // The last three are no Recommendation's: V.ARC, this modem's
+             // own mode for a sound card wired to another one, as its
+             // multicarrier, QAM and baseband modulations.
+-            modulations: ["V92", "V90", "V34", "V32B", "V32", "V22B", "V21", "B103", "B212", "B202", "HST", "HST96", "VARC", "VARCQ", "VARCP", "VARC2W", "VARCQ2W", "VARCP2W"]
++            modulations: ["V92", "V90", "V34", "V32B", "V32", "V22B", "V21", "B103", "B212", "B202", "HST", "HST96", "X2", "VARC", "VARCQ", "VARCP", "VARC2W", "VARCQ2W", "VARCP2W"]
+                 .iter()
+                 .map(|s| (*s).to_owned())
+                 .collect(),
+diff --git a/crates/datapump/src/v34/phase2.rs b/crates/datapump/src/v34/phase2.rs
+index 2286991..d1a7266 100644
+--- a/crates/datapump/src/v34/phase2.rs
++++ b/crates/datapump/src/v34/phase2.rs
+@@ -652,6 +652,17 @@ impl Modem {
+         self.x2_marker
+     }
+ 
++    /// The far end's INFO0, once it has been read: an x2 caller looks in it
++    /// for the server's offer (`x2::dialout`).
++    pub fn far_info0(&self) -> Option<Info0> {
++        self.far
++    }
++
++    /// Stay silent for `lead_in` of V.8's handover silence first.
++    pub fn set_lead_in(&mut self, lead_in: f64) {
++        self.silent_until = (lead_in * self.fs).round() as u64;
++    }
++
+     /// V.90's phase 2 from its start (9.2.1.1.1, 9.2.2.1.1).
+     pub fn v90(pcm: Pcm, fs: f64, lead_in: f64) -> Self {
+         let mut modem = Self::blank(pcm.role(), fs);
+@@ -1682,7 +1693,11 @@ impl Modem {
+             Stage::AnswerSendProbe => {
+                 let Speaking::Probe { l1_until } = self.speaking else { return };
+                 if self.x2 && self.x2_until.is_none() {
+-                    self.x2_until = Some(l1_until + self.ms(X2_MARKER_WAIT));
++                    // Plus the round trip ranging measured: the client sends
++                    // its marker after hearing L1, so on a long line -- a SIP
++                    // call's two jitter buffers came to 700 ms -- it arrives
++                    // that much later than on D-Modem's short one.
++                    self.x2_until = Some(l1_until + self.ms(X2_MARKER_WAIT) + self.rtd());
+                 }
+                 if self.deadline.is_none() {
+                     self.deadline = Some(l1_until + self.ms(0.600 + TONE_AFTER_PROBE_SLACK) + self.rtd());
+diff --git a/crates/datapump/src/x2/client.rs b/crates/datapump/src/x2/client.rs
+index 51c8fe1..ad0a685 100644
+--- a/crates/datapump/src/x2/client.rs
++++ b/crates/datapump/src/x2/client.rs
+@@ -1,5 +1,6 @@
+-//! A simulated x2 client, from the end of phase 2: what the tests call the
+-//! server with.
++//! An x2 client, from the end of phase 2: what the tests call the server
++//! with, and what [`super::dialout`] dials out as on a line that carries
++//! G.711 itself (a SIP call).
+ //!
+ //! Written from the same facts as the server (libv90modem's
+ //! `docs/history/x2-facts.md`), so it shows that the pieces fit together and
+@@ -44,6 +45,21 @@ const J_OVER_PREAMBLE: usize = 1200;
+ /// Upstream data rates the client offers: to 28 800.
+ const UPSTREAM_MASK: u16 = 0x0ffe;
+ 
++/// The preamble's first octets, which start the count: anything else that
++/// is not silence -- comfort noise, a stray octet -- does not.
++const PREAMBLE_HEAD: [u8; 4] = [0xab, 0xbd, 0xab, 0x2b];
++/// The alignment segment's frame, turned a place left each frame.
++const ALIGNMENT: [u8; FRAME] = [0x9e, 0x28, 0xa1, 0x21, 0xa8, 0x1e];
++/// Octets of the ones segment's magnitude in a row that say it has begun.
++const ONES_RUN: usize = 16;
++/// Frames that will not read, in a row, before the frame boundary is looked
++/// for again: a lost or repeated packet moves it.
++const BAD_RUN: usize = 3;
++/// Frames that must read, one after another, at a boundary found again.
++const HUNT_FRAMES: usize = 4;
++/// Octets of silence in a row in data mode that mean the server has gone.
++const QUIET_OCTETS: usize = 8000;
++
+ /// The server's segment lengths, in octets, from the preamble's first.
+ const PRE: usize = 363;
+ const TRN: usize = 20004;
+@@ -252,6 +268,23 @@ pub struct Client {
+     pub records_heard: usize,
+     /// Frames the client could not read in the levels it expected.
+     pub bad_frames: usize,
++    /// Times the frame boundary was found again after it was lost.
++    pub resyncs: usize,
++    /// The last few octets of the script, for the preamble and alignment.
++    recent: VecDeque<u8>,
++    /// Octets of the ones segment's magnitude in a row.
++    ones_run: usize,
++    /// The ones segment has begun: phase 4 is under way.
++    ones: bool,
++    /// Alignment frames read in a row, and the turn the last had.
++    aligned: usize,
++    align_turn: usize,
++    /// Frames in a row that would not read.
++    bad_run: usize,
++    /// Looking for the frame boundary again: the octets since it was lost.
++    hunt: Option<Vec<u8>>,
++    /// Octets of silence in a row since the script began.
++    quiet_run: usize,
+ }
+ 
+ impl Client {
+@@ -287,9 +320,57 @@ impl Client {
+             received: Vec::new(),
+             records_heard: 0,
+             bad_frames: 0,
++            resyncs: 0,
++            recent: VecDeque::new(),
++            ones_run: 0,
++            ones: false,
++            aligned: 0,
++            align_turn: 0,
++            bad_run: 0,
++            hunt: None,
++            quiet_run: 0,
+         }
+     }
+ 
++    /// Just after its marker and the quiet that follows: phase 3 begins at
++    /// once. For a caller that ran phase 2 itself ([`super::dialout`]).
++    pub fn after_marker() -> Self {
++        // `new` is already sending S.
++        Self::new()
++    }
++
++    /// Whether the server has fallen silent for a second since its script
++    /// began: it has hung up, or the call has.
++    pub fn far_end_quiet(&self) -> bool {
++        self.quiet_run >= QUIET_OCTETS
++    }
++
++    /// How many bits the upstream wants queued to be going on with: two
++    /// mapping frames. Its encoder takes a whole mapping frame's bits at
++    /// once (72 at 28800) and fills any it is short of with ones; a caller
++    /// that kept only 64 queued had a burst of ones put into the middle of
++    /// its data every frame, and an HDLC frame never arrived whole.
++    pub fn fill_bits(&self) -> usize {
++        let b = Framing::new(SymbolRate::S3200, upstream_rate(), false, true).map_or(72, |f| f.b);
++        2 * b
++    }
++
++    /// Data bits queued upstream and not yet sent.
++    pub fn pending_bits(&self) -> usize {
++        self.upstream.data.len()
++    }
++
++    /// The upstream data rate, in bit/s.
++    pub fn upstream_rate(&self) -> u32 {
++        upstream_rate()
++    }
++
++    /// The rate index the client asks for (its MP), and has once the server
++    /// follows.
++    pub fn index(&self) -> u8 {
++        self.upstream.index
++    }
++
+     /// From the start of phase 2: V.34's call modem until the server's L1,
+     /// then the marker (`4d`), then phase 3.
+     pub fn from_phase2() -> Self {
+@@ -381,12 +462,30 @@ impl Client {
+     }
+ 
+     fn octet(&mut self, o: u8) {
++        if self.down != Down::Quiet {
++            if o & 0x7f == 0x7f {
++                self.quiet_run += 1;
++            } else {
++                self.quiet_run = 0;
++            }
++        }
++        if let Some(hunt) = self.hunt.as_mut() {
++            hunt.push(o);
++            self.hunt_step();
++            return;
++        }
+         match self.down {
+             Down::Quiet => {
+-                // The lead is 7f too; the preamble's first is ab.
+-                if o != 0x7f && o != 0xff {
+-                    self.down = Down::Script(0);
+-                    self.octet(o);
++                // The lead is 7f too; the preamble begins ab bd ab 2b. Its
++                // first octets, not merely anything but silence: on a SIP
++                // line a softphone's comfort noise is not the server.
++                self.recent.push_back(o);
++                while self.recent.len() > PREAMBLE_HEAD.len() {
++                    self.recent.pop_front();
++                }
++                if self.recent.iter().eq(PREAMBLE_HEAD.iter()) {
++                    self.recent.clear();
++                    self.down = Down::Script(PREAMBLE_HEAD.len());
+                 }
+             }
+             Down::Script(n) => self.script_octet(n, o),
+@@ -408,23 +507,121 @@ impl Client {
+             // Quiet until the server's J words.
+             self.upstream.start(Up::Silence);
+         }
+-        if (PRE..PRE + TRN + JW + ONES).contains(&n) {
+-            // One scrambled bit an octet: negative for a 1.
++        if n >= PRE && self.aligned == 0 && (!self.ones || o & 0x7f == 0x41) {
++            // One scrambled bit an octet: negative for a 1. GPC is
++            // self-synchronising, so an octet more or less on the way -- a
++            // packet lost or repeated -- costs a few bits and nothing after.
+             self.descrambler.descramble(o & 0x80 == 0);
+         }
+-        if n + 1 == PRE + TRN + JW {
+-            // Phase 4, on the J words.
+-            self.upstream.then(&[
+-                Up::S,
+-                Up::SBar,
+-                Up::Trn(PHASE4_TRN4, Size::Four),
+-                Up::Trn(PHASE4_TRN16, Size::Sixteen),
+-                Up::Records(Size::Sixteen),
+-            ]);
++        // Phase 4 begins as the server's ones do, which is found by their
++        // level (c1 / 41 against TRN's and the J words' b1 / 31) rather than
++        // by counting: the count is out by a packet's worth for every packet
++        // the network lost or played twice.
++        if !self.ones && n > PRE + TRN / 2 {
++            self.ones_run = if o & 0x7f == 0x41 { self.ones_run + 1 } else { 0 };
++            // The count as a last resort, well past where they should be.
++            if self.ones_run == ONES_RUN || n == PRE + TRN + JW + ONES / 2 {
++                self.ones = true;
++                self.upstream.then(&[
++                    Up::S,
++                    Up::SBar,
++                    Up::Trn(PHASE4_TRN4, Size::Four),
++                    Up::Trn(PHASE4_TRN16, Size::Sixteen),
++                    Up::Records(Size::Sixteen),
++                ]);
++            }
++            return;
++        }
++        if !self.ones {
++            return;
+         }
+-        if n + 1 == PRE + TRN + JW + ONES + ALIGN {
++        // The alignment: every frame the same six octets turned one place
++        // further. Six that are a turn of them end a frame (the six octets
++        // are all different, so a window across two frames never is one),
++        // and the first frame after them that is not is the sync's first,
++        // in levels A.
++        if self.aligned > 0 {
++            self.octets[self.at] = o;
++            self.at += 1;
++            if self.at < FRAME {
++                return;
++            }
++            self.at = 0;
++            let turn = (self.align_turn + 1) % FRAME;
++            if (0..FRAME).all(|k| self.octets[k] == ALIGNMENT[(k + turn) % FRAME]) {
++                self.align_turn = turn;
++                self.aligned += 1;
++            } else {
++                self.down = Down::LevelsA;
++                let f = self.octets;
++                self.frame(f);
++            }
++            return;
++        }
++        self.recent.push_back(o);
++        while self.recent.len() > FRAME {
++            self.recent.pop_front();
++        }
++        if self.recent.len() == FRAME
++            && let Some(turn) = (0..FRAME).find(|&t| (0..FRAME).all(|k| self.recent[k] == ALIGNMENT[(k + t) % FRAME]))
++        {
++            self.aligned = 1;
++            self.align_turn = turn;
++            self.at = 0;
++            self.recent.clear();
++            return;
++        }
++        // Never seen: go on as if it had ended where the count says, and let
++        // the frame hunt find the boundary.
++        if n == PRE + TRN + JW + ONES + ALIGN + 4 * FRAME {
+             self.down = Down::LevelsA;
+             self.at = 0;
++            self.bad_run = BAD_RUN;
++            self.hunt = Some(Vec::new());
++        }
++    }
++
++    /// A frame that would not read. A few in a row and the boundary is
++    /// looked for again (see [`Self::hunt_step`]).
++    fn missed(&mut self) {
++        self.bad_frames += 1;
++        self.bad_run += 1;
++        if self.bad_run >= BAD_RUN {
++            self.hunt = Some(Vec::new());
++        }
++    }
++
++    /// Look for the frame boundary in the octets since it was lost: the
++    /// offset at which [`HUNT_FRAMES`] frames in a row read in the levels in
++    /// use. A misplaced boundary reads as a frame hardly ever -- every one of
++    /// its six octets would have to be a level of its position -- and on a
++    /// line that carries the octets themselves a placed one always does.
++    fn hunt_step(&mut self) {
++        let Some(hunt) = self.hunt.as_ref() else { return };
++        let need = HUNT_FRAMES * FRAME;
++        if hunt.len() < need + FRAME {
++            return;
++        }
++        let found = (0..FRAME).find(|&offset| {
++            let mut mapper = self.mapper.clone();
++            (0..HUNT_FRAMES).all(|k| {
++                let mut f = [0u8; FRAME];
++                f.copy_from_slice(&hunt[offset + k * FRAME..offset + (k + 1) * FRAME]);
++                mapper.unframe(&f).is_some() || self.is_marker(&f)
++            })
++        });
++        let Some(offset) = found else {
++            // Not yet: keep a little under the frames to look at.
++            let hunt = self.hunt.as_mut().unwrap();
++            hunt.drain(..FRAME);
++            return;
++        };
++        let octets = self.hunt.take().unwrap();
++        self.resyncs += 1;
++        self.bad_run = 0;
++        self.at = 0;
++        for &o in &octets[offset..] {
++            self.octet(o);
+         }
+     }
+ 
+@@ -439,8 +636,10 @@ impl Client {
+                     self.mapper.switch_to(self.bank);
+                     self.data_frame(0, f);
+                 } else {
+-                    self.bad_frames += 1;
++                    self.missed();
++                    return;
+                 }
++                self.bad_run = 0;
+             }
+             Down::Data(n) => {
+                 if self.is_marker(&f) {
+@@ -479,9 +678,10 @@ impl Client {
+     fn data_frame(&mut self, n: usize, f: [u8; FRAME]) {
+         self.down = Down::Data(n + 1);
+         let Some(bits) = self.mapper.unframe(&f) else {
+-            self.bad_frames += 1;
++            self.missed();
+             return;
+         };
++        self.bad_run = 0;
+         let bits: Vec<bool> = bits.into_iter().map(|b| self.descrambler.descramble(b)).collect();
+         if n >= START {
+             self.received.extend(bits);
+diff --git a/crates/datapump/src/x2/dialout.rs b/crates/datapump/src/x2/dialout.rs
+new file mode 100644
+index 0000000..5a5ca00
+--- /dev/null
++++ b/crates/datapump/src/x2/dialout.rs
+@@ -0,0 +1,378 @@
++//! U.S. Robotics x2, the calling side: a client that dials out to an x2
++//! server, at the line's rate.
++//!
++//! Phase 2 is V.34's call modem's own, up to the server's INFO0a. A server
++//! that offers x2 there -- bit 23 or bit 24 (x2-facts, "Phase 2 marker"; see
++//! `phase2::Modem::answering_x2`) -- gets the client's marker 190 ms after
++//! its L1 begins and no L1, L2 or INFO1c of the client's own; then the x2
++//! client ([`super::client::Client`]) takes the call from phase 3. A server
++//! that does not offer it gets a V.34 caller to the end: the call is V.34's.
++//!
++//! The x2 downstream is G.711 octets that the client reads as octets. On a
++//! line that carries G.711 itself (a SIP call in PCMU) they arrive as they
++//! were sent, and [`Modem::give_exact`] hands them over; anywhere else they
++//! have been through a codec and a sound card, and only an analogue
++//! receiver -- equaliser, timing, levels learnt from the line -- could read
++//! them, which this is not. So x2 here is for SIP lines.
++
++use std::collections::VecDeque;
++
++use dsp::Resampler;
++
++use super::client::{Client, FS};
++use crate::v34::dpsk;
++use crate::v34::info::{Info0, X2Marker};
++use crate::v34::phase2::Role;
++use crate::v34::startup;
++use crate::v90::startup::Status;
++
++/// The server's L1 lasts 160 ms; the marker follows 10 to 100 ms after it
++/// (x2-facts), and the simulated client's 190 ms from L1's start is in that.
++const MARKER_AFTER_PROBE: f64 = 0.190;
++/// The quiet after the marker before phase 3.
++const QUIET_AFTER_MARKER: f64 = 0.075;
++/// From the marker to data mode: the script alone is some 6 s, and the
++/// server waits for the client's MP and E.
++const X2_DEADLINE: f64 = 30.0;
++/// Clean data mode at the first rate before asking for the fastest.
++const SETTLE: f64 = 2.0;
++/// The rate index a call starts at (32000, as a Courier's does) and the one
++/// it moves to on a line that carries octets exactly: 15, 56000.
++const FIRST_INDEX: u8 = 1;
++const FAST_INDEX: u8 = 15;
++/// Frames that would not read, in a second, that send the rate down.
++const TOO_MANY_BAD: usize = 40;
++
++#[derive(Debug, Clone)]
++enum Stage {
++    /// V.34's call modem, until INFO0a says whether the server offers x2.
++    Front,
++    /// The server offers x2: quiet from its L1 until the marker is due.
++    Quiet { probe_at: u64 },
++    /// The marker, then a moment's quiet.
++    Marker { tx: Box<dpsk::Transmitter>, quiet: u64 },
++    /// The x2 client, at the network's 8000 Hz.
++    X2,
++    /// No x2 on offer: V.34 to the end.
++    V34,
++    Failed(&'static str),
++}
++
++/// The x2 caller, one line sample at a time.
++#[derive(Debug, Clone)]
++pub struct Modem {
++    fs: f64,
++    now: u64,
++    stage: Stage,
++    v34: startup::Modem,
++    client: Client,
++    x2_since: u64,
++    /// Line rate to and from the network's.
++    down: Resampler,
++    up: Resampler,
++    arrived: Vec<f64>,
++    made: Vec<f64>,
++    out: VecDeque<f64>,
++    exact_in: VecDeque<f64>,
++    /// Whether exact levels have been given lately (a SIP line).
++    exact_seen: u64,
++    /// Data mode's own bookkeeping: since when, bad frames counted at the
++    /// last look, and when that was.
++    data_since: Option<u64>,
++    bad_at_look: usize,
++    look_at: u64,
++    asked_fast: bool,
++    /// Data mode has been reached: out of it again is a rate change.
++    reached_data: bool,
++    notes: Vec<String>,
++}
++
++/// Whether an INFO0a offers x2: an x2 server sends bit 23 alone of bits 21
++/// to 23 (`asymmetry` 4) and bit 24, CME (x2-facts, "Phase 2 marker"). A
++/// Courier takes either bit, but bit 23 is set in an ordinary V.34 answer
++/// modem's asymmetry of 5 as well, and the marker sent to one of those is
++/// a call lost; so here bit 23 counts only alone.
++pub fn offers_x2(info0: &Info0) -> bool {
++    info0.cme || info0.asymmetry == 4
++}
++
++impl Modem {
++    /// From the end of V.8, with `lead_in` of its handover silence to run.
++    pub fn new(fs: f64, lead_in: f64) -> Self {
++        let mut phase2 = crate::v34::phase2::Modem::new(Role::Call, fs);
++        phase2.set_lead_in(lead_in);
++        Self {
++            fs,
++            now: 0,
++            stage: Stage::Front,
++            v34: startup::Modem::with_phase2(phase2, fs),
++            client: Client::after_marker(),
++            x2_since: 0,
++            down: Resampler::new(fs, FS),
++            up: Resampler::new(FS, fs),
++            arrived: Vec::with_capacity(4),
++            made: Vec::with_capacity(8),
++            out: VecDeque::new(),
++            exact_in: VecDeque::new(),
++            exact_seen: 0,
++            data_since: None,
++            bad_at_look: 0,
++            look_at: 0,
++            asked_fast: false,
++            reached_data: false,
++            notes: Vec::new(),
++        }
++    }
++
++    /// What the network delivered, one level for every 8000 Hz sample, for
++    /// the samples [`Modem::step`] is about to be given: the server's octets
++    /// as they were sent. See `v90::server::Line::give_exact`.
++    pub fn give_exact(&mut self, levels: &[f64]) {
++        self.exact_in.extend(levels.iter().copied());
++        self.exact_seen = self.now;
++        while self.exact_in.len() > 4096 {
++            self.exact_in.pop_front();
++        }
++    }
++
++    /// What the start-up has to say, a line each, not yet taken.
++    pub fn take_notes(&mut self) -> Vec<String> {
++        std::mem::take(&mut self.notes)
++    }
++
++    pub fn is_x2(&self) -> bool {
++        matches!(self.stage, Stage::Marker { .. } | Stage::X2)
++    }
++
++    /// The V.34 start-up: the call's, before x2 takes it or when it does not.
++    pub fn v34(&self) -> &startup::Modem {
++        &self.v34
++    }
++
++    pub fn client(&self) -> &Client {
++        &self.client
++    }
++
++    fn secs(&self, s: f64) -> u64 {
++        (s * self.fs).round() as u64
++    }
++
++    /// One line sample in, one out.
++    pub fn step(&mut self, line: f64) -> f64 {
++        self.now += 1;
++        match &mut self.stage {
++            Stage::Front => {
++                let out = self.v34.step(line);
++                if let Some(info0) = self.v34.phase2().far_info0() {
++                    if offers_x2(&info0) {
++                        self.notes.push("x2: the server offers it".to_owned());
++                        self.stage = Stage::Quiet { probe_at: 0 };
++                    } else {
++                        self.notes.push("x2: the far end does not offer it; going on as V.34".to_owned());
++                        self.stage = Stage::V34;
++                    }
++                }
++                out
++            }
++            Stage::Quiet { probe_at } => {
++                // V.34 still listens, to hear the L1 begin, but says nothing:
++                // no L1, L2 or tone of its own.
++                let out = self.v34.step(line);
++                if *probe_at == 0 && self.v34.phase() == "V.34 reading the probe" {
++                    *probe_at = self.now;
++                }
++                if *probe_at == 0 {
++                    // Up to the server's L1 the caller is V.34's, INFO0a and
++                    // tone B included.
++                    return out;
++                }
++                if self.now >= *probe_at + (MARKER_AFTER_PROBE * self.fs) as u64 {
++                    let mut tx = dpsk::Transmitter::new(dpsk::Side::Call, self.fs);
++                    let mut bits = vec![true, true];
++                    // 4d: the PCM direction, the high carrier at 3200 baud,
++                    // as a Courier's.
++                    bits.extend(X2Marker::from_body(0x4d).to_bits());
++                    tx.send(&bits);
++                    tx.silence();
++                    self.notes.push("x2: sent the marker".to_owned());
++                    self.stage = Stage::Marker { tx: Box::new(tx), quiet: 0 };
++                }
++                0.0
++            }
++            Stage::Marker { tx, quiet } => {
++                if tx.is_sending() {
++                    return tx.next_sample();
++                }
++                *quiet += 1;
++                if (*quiet as f64) < QUIET_AFTER_MARKER * self.fs {
++                    return 0.0;
++                }
++                self.stage = Stage::X2;
++                self.x2_since = self.now;
++                self.out = VecDeque::from(vec![0.0; 4]);
++                0.0
++            }
++            Stage::X2 => self.x2_step(line),
++            Stage::V34 => self.v34.step(line),
++            Stage::Failed(_) => 0.0,
++        }
++    }
++
++    fn x2_step(&mut self, line: f64) -> f64 {
++        self.arrived.clear();
++        self.down.process(line, &mut self.arrived);
++        for i in 0..self.arrived.len() {
++            let level = self.exact_in.pop_front().unwrap_or(self.arrived[i]);
++            let sent = self.client.step(level);
++            self.made.clear();
++            self.up.process(sent, &mut self.made);
++            self.out.extend(self.made.iter().copied());
++        }
++        while self.out.len() > 64 {
++            self.out.pop_front();
++        }
++        self.watch();
++        self.out.pop_front().unwrap_or(0.0)
++    }
++
++    /// Deadlines, the far end going away, and the rate.
++    fn watch(&mut self) {
++        let in_data = self.client.in_data();
++        if !in_data && self.data_since.is_none() && self.now > self.x2_since + self.secs(X2_DEADLINE) {
++            let why = if self.now > self.exact_seen + self.secs(1.0) {
++                "x2: no data mode -- x2 needs a SIP line in PCMU, where the server's octets arrive as sent"
++            } else {
++                "x2: no data mode within 30 s of the marker"
++            };
++            self.notes.push(why.to_owned());
++            self.stage = Stage::Failed(why);
++            return;
++        }
++        if self.client.far_end_quiet() {
++            self.notes.push("x2: the server has gone quiet".to_owned());
++            self.stage = Stage::Failed("x2: the server has gone quiet");
++            return;
++        }
++        if !in_data {
++            return;
++        }
++        self.reached_data = true;
++        let since = *self.data_since.get_or_insert(self.now);
++        if since == self.now {
++            self.notes.push(format!(
++                "x2: data mode, {} down, {} up",
++                self.client.bank().rate(),
++                self.client.upstream_rate()
++            ));
++            self.look_at = self.now;
++            self.bad_at_look = self.client.bad_frames;
++        }
++        // Once a second: too many frames lost to the network sends the rate
++        // down a step at a time; a clean start sends it up to the top.
++        if self.now >= self.look_at + self.secs(1.0) {
++            let bad = self.client.bad_frames - self.bad_at_look;
++            self.look_at = self.now;
++            self.bad_at_look = self.client.bad_frames;
++            let index = self.client.index();
++            if bad > TOO_MANY_BAD && index > FIRST_INDEX {
++                let lower = index.saturating_sub(2).max(FIRST_INDEX);
++                self.notes.push(format!("x2: {bad} frames lost in a second; asking for index {lower}"));
++                self.change_rate(lower);
++            } else if !self.asked_fast && bad == 0 && self.now >= since + self.secs(SETTLE) {
++                self.asked_fast = true;
++                self.notes.push(format!("x2: the line is clean; asking for index {FAST_INDEX}"));
++                self.change_rate(FAST_INDEX);
++            }
++        }
++    }
++
++    fn change_rate(&mut self, index: u8) {
++        self.client.change_rate(index);
++        self.data_since = None;
++    }
++
++    pub fn status(&self) -> Status {
++        match &self.stage {
++            Stage::V34 => match self.v34.status() {
++                startup::Status::Running => Status::Running,
++                startup::Status::Connected { receive, transmit } => Status::Connected { receive, transmit },
++                startup::Status::Retraining => Status::Retraining,
++                startup::Status::ClearedDown | startup::Status::Done => Status::ClearedDown,
++                startup::Status::Failed(why) => Status::Failed(why),
++            },
++            Stage::Failed(why) => Status::Failed(why),
++            Stage::X2 if self.client.in_data() => Status::Connected {
++                receive: self.client.bank().rate(),
++                transmit: self.client.upstream_rate(),
++            },
++            // A rate change after data mode: as a retrain is.
++            Stage::X2 if self.reached_data => Status::Retraining,
++            _ => match self.v34.status() {
++                startup::Status::Failed(why) => Status::Failed(why),
++                _ => Status::Running,
++            },
++        }
++    }
++
++    pub fn phase(&self) -> &'static str {
++        match &self.stage {
++            Stage::Front => self.v34.phase(),
++            Stage::Quiet { .. } => "x2 waiting for the server's probe",
++            Stage::Marker { .. } => "x2 marker",
++            Stage::X2 if self.client.in_data() => "x2 data",
++            Stage::X2 => "x2 training",
++            Stage::V34 => self.v34.phase(),
++            Stage::Failed(_) => "x2 failed",
++        }
++    }
++
++    pub fn carrier(&self) -> bool {
++        match &self.stage {
++            Stage::X2 => !self.client.far_end_quiet(),
++            Stage::V34 | Stage::Front => self.v34.carrier(),
++            _ => true,
++        }
++    }
++
++    pub fn take_bits(&mut self) -> Vec<bool> {
++        match &self.stage {
++            Stage::X2 => self.client.take_bits(),
++            Stage::V34 => self.v34.take_bits(),
++            _ => Vec::new(),
++        }
++    }
++
++    pub fn send_bits(&mut self, bits: &[bool]) {
++        match &self.stage {
++            Stage::V34 => self.v34.send_bits(bits),
++            _ => self.client.send_bits(bits),
++        }
++    }
++
++    pub fn accepts_bits(&self) -> bool {
++        match &self.stage {
++            Stage::V34 => self.v34.accepts_bits(),
++            Stage::X2 => self.client.in_data(),
++            _ => false,
++        }
++    }
++
++    /// How many bits it wants queued (see [`Client::fill_bits`]).
++    pub fn fill_bits(&self) -> usize {
++        match &self.stage {
++            Stage::V34 => 64,
++            _ => self.client.fill_bits(),
++        }
++    }
++
++    pub fn pending_bits(&self) -> usize {
++        match &self.stage {
++            Stage::V34 => self.v34.pending_bits(),
++            _ => self.client.pending_bits(),
++        }
++    }
++
++    pub fn round_trip(&self) -> Option<f64> {
++        self.v34.phase2().round_trip()
++    }
++}
+diff --git a/crates/datapump/src/x2/mod.rs b/crates/datapump/src/x2/mod.rs
+index 149423c..1313a53 100644
+--- a/crates/datapump/src/x2/mod.rs
++++ b/crates/datapump/src/x2/mod.rs
+@@ -16,6 +16,7 @@
+ 
+ pub mod bank;
+ pub mod client;
++pub mod dialout;
+ mod banks;
+ pub mod map;
+ pub mod record;
+diff --git a/crates/datapump/tests/x2_dialout.rs b/crates/datapump/tests/x2_dialout.rs
+new file mode 100644
+index 0000000..3c23521
+--- /dev/null
++++ b/crates/datapump/tests/x2_dialout.rs
+@@ -0,0 +1,295 @@
++//! The x2 caller (`x2::dialout`) against the x2 server, from phase 2, on a
++//! line that carries G.711 itself: the server's octets reach the caller as
++//! they were sent, as on a SIP call in PCMU -- and, in one test, with
++//! packets lost on the way, as on a real one.
++//!
++//! Both ends are written from the same facts (libv90modem's x2-facts), so
++//! this shows the caller and the server agree, not that either is x2.
++
++use std::collections::VecDeque;
++
++use datapump::v90::server::Line as ServerLine;
++use datapump::v90::startup::{Digital, Status};
++use datapump::x2::dialout::Modem as Caller;
++
++/// Each way's delay at 8000 Hz: 10 ms.
++const DELAY: usize = 80;
++/// A SIP packet: 20 ms of PCMU.
++const PACKET: usize = 160;
++
++/// The two ends at the network's rate. `lose(n)` drops the downstream
++/// octet the server made at sample `n`, as a network that lost its packet
++/// does (the receiving end's jitter buffer closes the gap).
++struct Call {
++    server: Digital,
++    caller: Caller,
++    to_server: VecDeque<f64>,
++    to_caller: VecDeque<f64>,
++    now: usize,
++}
++
++impl Call {
++    fn new(server: Digital) -> Self {
++        Self {
++            server,
++            caller: Caller::new(8000.0, 0.0),
++            to_server: vec![0.0; DELAY].into(),
++            to_caller: vec![0.0; DELAY].into(),
++            now: 0,
++        }
++    }
++
++    fn run(&mut self, seconds: f64, lose: &impl Fn(usize) -> bool, until: impl Fn(&Self) -> bool) {
++        for _ in 0..(seconds * 8000.0) as usize {
++            let s = self.server.step(self.to_server.pop_front().unwrap());
++            if !lose(self.now) {
++                self.to_caller.push_back(s);
++            }
++            // A jitter buffer plays something while it waits: the last
++            // packet's silence, as an underrun does.
++            let level = self.to_caller.pop_front().unwrap_or(0.0);
++            self.caller.give_exact(&[level]);
++            let c = self.caller.step(level);
++            self.to_server.push_back(c);
++            self.now += 1;
++            if until(self) {
++                return;
++            }
++        }
++    }
++
++    fn connected(&self) -> bool {
++        matches!(self.server.status(), Status::Connected { .. }) && matches!(self.caller.status(), Status::Connected { .. })
++    }
++
++    /// Data both ways: what each end sends the other reads.
++    fn carries_data(&mut self, n: usize, lose: &impl Fn(usize) -> bool) {
++        let down: Vec<bool> = (0..n).map(|k| (k * 7919) % 11 < 5).collect();
++        let up: Vec<bool> = (0..n).map(|k| (k * 104_729) % 13 < 6).collect();
++        self.server.take_bits();
++        self.caller.take_bits();
++        self.server.send_bits(&down);
++        self.caller.send_bits(&up);
++        let (mut got_down, mut got_up) = (Vec::new(), Vec::new());
++        for _ in 0..400 {
++            self.run(0.01, lose, |_| false);
++            got_down.extend(self.caller.take_bits());
++            got_up.extend(self.server.take_bits());
++        }
++        let find = |got: &[bool], sent: &[bool]| got.windows(sent.len()).any(|w| w == sent);
++        assert!(find(&got_down, &down), "downstream data did not arrive ({} bits read)", got_down.len());
++        assert!(find(&got_up, &up), "upstream data did not arrive ({} bits read)", got_up.len());
++    }
++
++    fn notes(&mut self) -> String {
++        self.caller.take_notes().join("; ")
++    }
++}
++
++#[test]
++fn an_x2_call_dialled_out_reaches_data_and_moves_up_to_56000() {
++    let never = |_: usize| false;
++    let mut call = Call::new(Digital::x2(0.0));
++    call.run(40.0, &never, Call::connected);
++    assert!(call.server.is_x2(), "server not x2: {} / {}", call.server.phase(), call.caller.phase());
++    assert!(call.caller.is_x2());
++    assert_eq!(call.caller.status(), Status::Connected { receive: 32_000, transmit: 28_800 }, "{}", call.notes());
++    // Clean: the caller asks for the top rate, and gets it.
++    call.run(15.0, &never, |c| c.connected() && matches!(c.caller.status(), Status::Connected { receive: 56_000, .. }));
++    assert_eq!(call.caller.status(), Status::Connected { receive: 56_000, transmit: 28_800 }, "{}", call.notes());
++    assert_eq!(call.server.status(), Status::Connected { transmit: 56_000, receive: 28_800 }, "{}", call.server.phase());
++    assert_eq!(call.caller.client().bad_frames, 0);
++    call.carries_data(8000, &never);
++}
++
++#[test]
++fn packets_lost_on_the_way_down_do_not_stop_the_call() {
++    // A 20 ms packet lost in the TRN, one in the ones, and one every
++    // 1.5 s from data mode on (once it is reached at some 9 s).
++    let lose = |n: usize| {
++        let packet = n / PACKET;
++        packet == 400 || packet == 520 || (n > 12 * 8000 && packet % 75 == 0)
++    };
++    let mut call = Call::new(Digital::x2(0.0));
++    call.run(45.0, &lose, |c| c.connected() && matches!(c.caller.status(), Status::Connected { receive: 56_000, .. }));
++    assert!(call.connected(), "{:?} / {:?} at {}: {}", call.server.status(), call.caller.status(), call.caller.phase(), call.notes());
++    assert!(call.caller.client().resyncs > 0, "no packet loss was seen");
++    call.carries_data(4000, &lose);
++}
++
++#[test]
++fn a_far_end_that_offers_no_x2_gets_a_v34_call() {
++    // V.34's answer modem, which is what V.8 gives a caller offering V.34
++    // and no PCM when the far end has no x2: its INFO0a says nothing of it.
++    use datapump::v34::phase2::Role;
++    use datapump::v34::startup::{Modem as V34, Status as V34Status};
++    let mut answerer = V34::new(Role::Answer, 8000.0);
++    let mut caller = Caller::new(8000.0, 0.0);
++    let mut to_answerer: VecDeque<f64> = vec![0.0; DELAY].into();
++    let mut to_caller: VecDeque<f64> = vec![0.0; DELAY].into();
++    for _ in 0..(30.0 * 8000.0) as usize {
++        let a = answerer.step(to_answerer.pop_front().unwrap());
++        to_caller.push_back(a);
++        let c = caller.step(to_caller.pop_front().unwrap());
++        to_answerer.push_back(c);
++        if matches!(answerer.status(), V34Status::Connected { .. }) && matches!(caller.status(), Status::Connected { .. }) {
++            break;
++        }
++    }
++    assert!(!caller.is_x2());
++    assert!(matches!(caller.status(), Status::Connected { .. }), "{:?}: {}", caller.status(), caller.take_notes().join("; "));
++}
++
++/// At a line rate of 16000 Hz, through the rate conversions both ends do on
++/// a sound-card-rate line, with the octets handed across exactly as a SIP
++/// line does.
++#[test]
++fn at_the_line_rate_with_the_octets_handed_across() {
++    let fs = 16_000.0;
++    let mut server = ServerLine::x2(fs, 0.0);
++    let mut caller = Caller::new(fs, 0.0);
++    let mut to_caller: VecDeque<f64> = vec![0.0; 2 * DELAY].into();
++    let mut to_server: VecDeque<f64> = vec![0.0; 2 * DELAY].into();
++    let mut levels = Vec::new();
++    let mut connected = false;
++    for _ in 0..(40.0 * fs) as usize {
++        let s = server.step(to_server.pop_front().unwrap());
++        levels.clear();
++        server.take_exact(&mut levels);
++        caller.give_exact(&levels);
++        to_caller.push_back(s);
++        // At the window's drive for a modem that is not sending levels.
++        let c = caller.step(to_caller.pop_front().unwrap()) * 0.1;
++        to_server.push_back(c);
++        if matches!(server.status(), Status::Connected { .. }) && matches!(caller.status(), Status::Connected { .. }) {
++            connected = true;
++            break;
++        }
++    }
++    assert!(connected, "{:?} / {:?} at {}: {}", server.status(), caller.status(), caller.phase(), caller.take_notes().join("; "));
++    assert!(caller.is_x2());
++    // And data both ways, through the rate change to 56000 and after.
++    let n = 6000;
++    let down: Vec<bool> = (0..n).map(|k| (k * 7919) % 11 < 5).collect();
++    let up: Vec<bool> = (0..n).map(|k| (k * 104_729) % 13 < 6).collect();
++    let (mut got_down, mut got_up) = (Vec::new(), Vec::new());
++    let mut sent = false;
++    for k in 0..(10.0 * fs) as usize {
++        if !sent && k > (5.0 * fs) as usize {
++            server.modem_mut().take_bits();
++            caller.take_bits();
++            got_down.clear();
++            got_up.clear();
++            server.modem_mut().send_bits(&down);
++            caller.send_bits(&up);
++            sent = true;
++        }
++        let s = server.step(to_server.pop_front().unwrap());
++        levels.clear();
++        server.take_exact(&mut levels);
++        caller.give_exact(&levels);
++        to_caller.push_back(s);
++        let c = caller.step(to_caller.pop_front().unwrap()) * 0.1;
++        to_server.push_back(c);
++        got_down.extend(caller.take_bits());
++        got_up.extend(server.modem_mut().take_bits());
++    }
++    let find = |got: &[bool], sent: &[bool]| got.windows(sent.len()).any(|w| w == sent);
++    assert!(matches!(caller.status(), Status::Connected { receive: 56_000, .. }), "{:?}: {}", caller.status(), caller.take_notes().join("; "));
++    assert!(find(&got_down, &down), "downstream data did not arrive ({} bits read)", got_down.len());
++    assert!(find(&got_up, &up), "upstream data did not arrive ({} bits read)", got_up.len());
++}
++
++
++/// Every upstream bit, at the line rate, from data mode to the rate change:
++/// the client's encoder takes a mapping frame of bits at a time, and a
++/// caller that kept fewer queued got ones in the middle of its data.
++#[test]
++fn the_upstream_arrives_bit_for_bit() {
++    let fs = 16_000.0;
++    let mut server = ServerLine::x2(fs, 0.0);
++    let mut caller = Caller::new(fs, 0.0);
++    let mut to_caller: VecDeque<f64> = vec![0.0; 2 * DELAY].into();
++    let mut to_server: VecDeque<f64> = vec![0.0; 2 * DELAY].into();
++    let mut levels = Vec::new();
++    let mut state = 99u32;
++    let mut sent: Vec<bool> = Vec::new();
++    let mut got: Vec<bool> = Vec::new();
++    let mut started = false;
++    for k in 0..(40.0 * fs) as usize {
++        let s = server.step(to_server.pop_front().unwrap());
++        levels.clear();
++        server.take_exact(&mut levels);
++        caller.give_exact(&levels);
++        to_caller.push_back(s);
++        let c = caller.step(to_caller.pop_front().unwrap()) * 0.1;
++        to_server.push_back(c);
++        if matches!(caller.status(), Status::Connected { .. }) && !started && k % 1000 == 0 {
++            started = true;
++            server.modem_mut().take_bits();
++        }
++        if started {
++            // Keep 64 queued, as the modem does.
++            while caller.pending_bits() < caller.fill_bits() {
++                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++                let b = state >> 31 == 1;
++                sent.push(b);
++                caller.send_bits(&[b]);
++            }
++            got.extend(server.modem_mut().take_bits());
++        }
++    }
++    // Find where `sent` begins in `got`.
++    let probe = &sent[..64];
++    let at = got.windows(64).position(|w| w == probe).expect("start not found");
++    let got = &got[at..];
++    let n = got.len().min(sent.len());
++    let errors: Vec<usize> = (0..n).filter(|&i| got[i] != sent[i]).collect();
++    // Up to the rate change, two seconds in: what is in flight at the
++    // change is lost, as across a retrain, and V.42 sends it again.
++    let clean = 50_000.min(n);
++    assert!(clean == 50_000, "only {n} bits arrived");
++    assert_eq!(errors.iter().filter(|&&i| i < clean).count(), 0, "first wrong bits at {:?}", errors.iter().take(10).collect::<Vec<_>>());
++    // And after it, the stream again, whole.
++    let w = &got[n - 2000..n - 1000];
++    assert!(sent.windows(1000).any(|x| x == w), "the upstream after the rate change is not what was sent");
++}
++
++/// The same through upstream's own client, from phase 2, at the network's
++/// rate.
++#[test]
++fn the_simulated_clients_upstream_arrives_bit_for_bit() {
++    use datapump::x2::client::Client;
++    let mut server = Digital::x2(0.0);
++    let mut client = Client::from_phase2();
++    let mut to_server: VecDeque<f64> = vec![0.0; DELAY].into();
++    let mut to_client: VecDeque<f64> = vec![0.0; DELAY].into();
++    let mut state = 99u32;
++    let (mut sent, mut got) = (Vec::new(), Vec::new());
++    let mut started = false;
++    for k in 0..(30.0 * 8000.0) as usize {
++        let s = server.step(to_server.pop_front().unwrap());
++        let c = client.step(to_client.pop_front().unwrap());
++        to_client.push_back(s);
++        to_server.push_back(c);
++        if client.in_data() && !started && k % 1000 == 0 {
++            started = true;
++            server.take_bits();
++        }
++        if started {
++            while client.pending_bits() < client.fill_bits() {
++                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++                let b = state >> 31 == 1;
++                sent.push(b);
++                client.send_bits(&[b]);
++            }
++            got.extend(server.take_bits());
++        }
++    }
++    let at = got.windows(64).position(|w| w == &sent[..64]).expect("start not found");
++    let got = &got[at..];
++    let n = got.len().min(sent.len());
++    let errors = (0..n).filter(|&i| got[i] != sent[i]).count();
++    assert!(n > 500_000, "{n} bits");
++    assert_eq!(errors, 0, "{errors} of {n} bits wrong");
++}
+diff --git a/crates/gui/src/app.rs b/crates/gui/src/app.rs
+index 59470e7..802faed 100644
+--- a/crates/gui/src/app.rs
++++ b/crates/gui/src/app.rs
+@@ -973,7 +973,7 @@ impl ScopeApp {
+     ///
+     /// Positions are what the rate lists, the ceilings and the default go by,
+     /// so a new one goes on the end rather than where it might read best.
+-    const CARRIERS: [(&'static str, &'static str); 18] = [
++    const CARRIERS: [(&'static str, &'static str); 19] = [
+         ("B103", "Bell 103 - 300 bit/s"),
+         ("V22B", "V.22bis - 1200 or 2400"),
+         ("V32", "V.32 - 4800 or 9600"),
+@@ -1022,6 +1022,10 @@ impl ScopeApp {
+             "HST96",
+             "HST 9600 - the first Courier HST, of 1986: 9600 one way and 300 the other, with the channels swapping as the traffic does. Only another HST modem answers it",
+         ),
++        (
++            "X2",
++            "x2 - U.S. Robotics' 56k from before V.90. Dialling, an x2 client: 32000 to 56000 down and V.34 up, from a server that offers x2, and V.34 from one that does not. It reads the server's G.711 octets as octets, so it needs a SIP line in PCMU. Answering, an x2 server",
++        ),
+     ];
+ 
+     /// Boards to start from, because a text box on its own is a box nobody
+@@ -4970,7 +4974,7 @@ impl ScopeApp {
+     /// A modulation and nothing else. The rate is the modem's to find: every
+     /// one of these settles on the fastest the line will carry, and a ceiling
+     /// set on purpose is in the Advanced window with the rest of AT+MS.
+-    const MODES: [(usize, &'static str); 18] = [
++    const MODES: [(usize, &'static str); 19] = [
+         (7, "V.92"),
+         (5, "V.90"),
+         (4, "V.34"),
+@@ -4984,6 +4988,8 @@ impl ScopeApp {
+         // Not a Recommendation's, and only for another of its kind.
+         (16, "HST"),
+         (17, "HST 9600"),
++        // U.S. Robotics' 56k before V.90: a client calling, a server answering.
++        (18, "x2"),
+         // Not slower than the rest: not for the same kind of line at all.
+         (8, "V.ARC"),
+         (9, "V.ARC/QAM"),
+@@ -6869,8 +6875,9 @@ mod modulation_tests {
+         assert_eq!(Modulation::rates(14), &[300, 1200]);
+         assert_eq!(ScopeApp::CARRIERS[15].0, "B202");
+         assert_eq!(Modulation::rates(15), &[1200]);
+-        assert_eq!(ScopeApp::CARRIERS.len(), 18);
++        assert_eq!(ScopeApp::CARRIERS.len(), 19);
+         assert_eq!(ScopeApp::CARRIERS[17].0, "HST96");
++        assert_eq!(ScopeApp::CARRIERS[18].0, "X2");
+         assert_eq!(Modulation::rates(17), &[9600]);
+     }
+ 
+diff --git a/crates/modem/src/lib.rs b/crates/modem/src/lib.rs
+index fa2f5f0..e9fb653 100644
+--- a/crates/modem/src/lib.rs
++++ b/crates/modem/src/lib.rs
+@@ -33,6 +33,7 @@ use datapump::v22bis;
+ use datapump::v32;
+ use datapump::v34;
+ use datapump::v90;
++use datapump::x2;
+ pub use datapump::v92::memo::Recognized;
+ pub mod bbs;
+ mod automode;
+@@ -222,6 +223,10 @@ enum Pump {
+     /// V.90's digital modem, answering: codewords downstream at exactly the
+     /// levels the far end's encoder turns back into them, and V.34 upstream.
+     V90Server(Box<v90::server::Line>),
++    /// U.S. Robotics x2, calling: V.34's call modem through phase 2, then
++    /// x2's client if the server offers it (or V.34 if it does not). For a
++    /// line that carries G.711 itself: see `x2::dialout`.
++    X2(Box<x2::dialout::Modem>),
+ }
+ 
+ impl Pump {
+@@ -258,6 +263,7 @@ impl Pump {
+             Self::V34(m) => m.step(line),
+             Self::V90(m) => m.step(line),
+             Self::V90Server(m) => m.step(line),
++            Self::X2(m) => m.step(line),
+         }
+     }
+ 
+@@ -319,6 +325,12 @@ impl Pump {
+                 v90::startup::Status::Retraining => Progress::Retraining,
+                 v90::startup::Status::ClearedDown | v90::startup::Status::Failed(_) => Progress::Failed,
+             },
++            Self::X2(m) => match m.status() {
++                v90::startup::Status::Running => Progress::Negotiating,
++                v90::startup::Status::Connected { receive, transmit } => Progress::Connected { receive, transmit },
++                v90::startup::Status::Retraining => Progress::Retraining,
++                v90::startup::Status::ClearedDown | v90::startup::Status::Failed(_) => Progress::Failed,
++            },
+         }
+     }
+ 
+@@ -333,6 +345,7 @@ impl Pump {
+             Self::V34(m) => m.phase2().round_trip().map(|s| (s * 1000.0).round() as u32),
+             Self::V90(m) => m.round_trip().map(|s| (s * 1000.0).round() as u32),
+             Self::V90Server(m) => m.modem().round_trip().map(|s| (s * 1000.0).round() as u32),
++            Self::X2(m) => m.round_trip().map(|s| (s * 1000.0).round() as u32),
+             Self::V22bis(_) | Self::Bell103(_) | Self::Bell212(_) | Self::Bell202(_) => None,
+         }
+     }
+@@ -353,6 +366,7 @@ impl Pump {
+             Self::V34(m) => m.carrier(),
+             Self::V90(m) => m.carrier(),
+             Self::V90Server(m) => m.modem().carrier(),
++            Self::X2(m) => m.carrier(),
+         }
+     }
+ 
+@@ -366,6 +380,7 @@ impl Pump {
+             Self::V34(m) => m.take_bits(),
+             Self::V90(m) => m.take_bits(),
+             Self::V90Server(m) => m.modem_mut().take_bits(),
++            Self::X2(m) => m.take_bits(),
+         }
+     }
+ 
+@@ -379,6 +394,7 @@ impl Pump {
+             Self::V34(m) => m.send_bits(bits),
+             Self::V90(m) => m.send_bits(bits),
+             Self::V90Server(m) => m.modem_mut().send_bits(bits),
++            Self::X2(m) => m.send_bits(bits),
+         }
+     }
+ 
+@@ -393,6 +409,7 @@ impl Pump {
+             Self::V34(m) => m.accepts_bits(),
+             Self::V90(m) => m.accepts_bits(),
+             Self::V90Server(m) => m.modem().accepts_bits(),
++            Self::X2(m) => m.accepts_bits(),
+             Self::V22bis(_) | Self::V32(_) | Self::Bell103(_) | Self::Bell212(_) | Self::Bell202(_) => true,
+         }
+     }
+@@ -418,6 +435,9 @@ impl Pump {
+             // And V.92's upstream the same way: one data frame's K bits at a
+             // time (6.4.1), more than 64 at the faster rates.
+             Self::V90(m) => m.fill_bits().max(REFILL_BITS),
++            // And x2's client, whose V.34 encoder takes a mapping frame at a
++            // time.
++            Self::X2(m) => m.fill_bits().max(REFILL_BITS),
+             _ => REFILL_BITS,
+         }
+     }
+@@ -432,6 +452,7 @@ impl Pump {
+             Self::V34(m) => m.pending_bits(),
+             Self::V90(m) => m.pending_bits(),
+             Self::V90Server(m) => m.modem().pending_bits(),
++            Self::X2(m) => m.pending_bits(),
+         }
+     }
+ 
+@@ -451,6 +472,8 @@ impl Pump {
+             Self::V90(m) => m.v34().constellation_point(),
+             // Upstream is V.34's, and that is what this end reads.
+             Self::V90Server(m) => m.modem().constellation_point(),
++            Self::X2(m) if !m.is_x2() => m.v34().constellation_point(),
++            Self::X2(_) => None,
+             Self::Bell212(m) => m.constellation_point(),
+             Self::Bell103(_) | Self::Bell202(_) => None,
+         }
+@@ -500,7 +523,7 @@ impl Pump {
+             // V.34 keeps its error as a power in decibels; as a distance it
+             // is the root of that.
+             Self::V34(m) => m.snr_db().map(|db| 10f64.powf(-db / 20.0)),
+-            Self::Bell103(_) | Self::Bell202(_) | Self::V90(_) | Self::V90Server(_) => None,
++            Self::Bell103(_) | Self::Bell202(_) | Self::V90(_) | Self::V90Server(_) | Self::X2(_) => None,
+         }
+     }
+ 
+@@ -523,7 +546,8 @@ impl Pump {
+             | Self::Bell202(_)
+             | Self::V34(_)
+             | Self::V90(_)
+-            | Self::V90Server(_) => None,
++            | Self::V90Server(_)
++            | Self::X2(_) => None,
+         }
+     }
+ 
+@@ -552,6 +576,7 @@ impl Pump {
+             Self::V90(m) if m.is_v90() => m.points(),
+             Self::V90(m) => m.v34().constellation_size().unwrap_or(2),
+             Self::V90Server(m) => m.modem().constellation_size().unwrap_or(2),
++            Self::X2(m) => m.v34().constellation_size().unwrap_or(2),
+         }
+     }
+ 
+@@ -598,6 +623,13 @@ impl Pump {
+                 Some(_) => "QAM",
+                 None => "DPSK",
+             },
++            Self::X2(m) if m.is_x2() => "PCM",
++            Self::X2(m) => match m.v34().constellation_size() {
++                Some(4) => "4PSK",
++                Some(16) => "16QAM",
++                Some(_) => "QAM",
++                None => "DPSK",
++            },
+         }
+     }
+ 
+@@ -626,6 +658,8 @@ impl Pump {
+             Self::V90Server(m) if m.modem().is_v92() => "V.92",
+             Self::V90Server(m) if m.modem().is_v90() || m.modem().v34().training().is_none() => "V.90",
+             Self::V90Server(_) => "V.34",
++            Self::X2(m) if m.is_x2() => "x2",
++            Self::X2(_) => "V.34",
+         }
+     }
+ 
+@@ -641,6 +675,7 @@ impl Pump {
+             Self::V34(m) => m.phase(),
+             Self::V90(m) => m.phase(),
+             Self::V90Server(m) => m.phase(),
++            Self::X2(m) => m.phase(),
+         }
+     }
+ 
+@@ -662,6 +697,7 @@ impl Pump {
+             Self::V34(m) => Some(m),
+             Self::V90(m) => Some(m.v34()),
+             Self::V90Server(m) => Some(m.modem().v34()),
++            Self::X2(m) => Some(m.v34()),
+             _ => None,
+         }
+     }
+@@ -2214,11 +2250,12 @@ impl Modem {
+     /// Whether this end offers U.S. Robotics x2: S70 set, answering as a
+     /// V.90 or V.92 server, on a mu-law line (x2 has no A-law).
+     fn serves_x2(&self) -> bool {
+-        self.at.regs.get(X2_REGISTER) == Ok(1)
+-            && self.role == Role::Answering
+-            && self.pcm_end == Role::Answering
+-            && matches!(self.at.modulation.carrier.as_str(), "V90" | "V92")
+-            && !self.network_a_law
++        let carrier = self.at.modulation.carrier.as_str();
++        // AT+MS=X2 answering is an x2 server whatever S70 says: the same
++        // carrier calling is an x2 client (`x2::dialout`).
++        let asked = carrier == "X2"
++            || (self.at.regs.get(X2_REGISTER) == Ok(1) && self.pcm_end == Role::Answering && matches!(carrier, "V90" | "V92"));
++        asked && self.role == Role::Answering && !self.network_a_law
+     }
+ 
+     /// Offer x2 from the next call on, or not: S70 (see [`Self::serves_x2`]).
+@@ -2263,8 +2300,11 @@ impl Modem {
+     }
+ 
+     pub fn give_network_levels(&mut self, levels: &[f64]) {
+-        if let Some(Pump::V90Server(m)) = self.pump.as_mut() {
+-            m.give_exact(levels);
++        match self.pump.as_mut() {
++            Some(Pump::V90Server(m)) => m.give_exact(levels),
++            // The x2 caller reads the server's octets as octets.
++            Some(Pump::X2(m)) => m.give_exact(levels),
++            _ => {}
+         }
+     }
+ 
+@@ -2328,6 +2368,9 @@ impl Modem {
+                 return out;
+             }
+         }
++        if let Pump::X2(m) = pump {
++            self.line_notes.extend(m.take_notes());
++        }
+         if let Pump::V90Server(m) = pump {
+             // The server's V.92 Phases 3 and 4 tell their steps the same way.
+             self.line_notes.extend(m.modem_mut().take_notes());
+@@ -3720,7 +3763,10 @@ impl Modem {
+             // without V.34 picks one of those, and the call goes ahead on it.
+             // V.90 rides on V.34's bit, with the PCM category beside it, and
+             // V.92 on V.90's: there is no separate V.8 code for it.
+-            "V34" | "V90" | "V92" => Some(Modulation::V34Duplex),
++            // x2 too: its client offers V.34 and no PCM, as a Courier does,
++            // and its server answers that as V.34's answer modem with x2 on
++            // offer.
++            "V34" | "V90" | "V92" | "X2" => Some(Modulation::V34Duplex),
+             // V.8 does have a bit for V.21 (Table 4). But this modem's V.21
+             // answers with V.25's tone, as a V.21 modem does, rather than
+             // ANSam, and nothing after V.8 has been taught to skip it.
+@@ -3832,10 +3878,10 @@ impl Modem {
+             transparent: true,
+             v42: self.want_error_control,
+             v42bis: self.want_error_control && self.at.compression.wanted(),
+-            v34: at_least(&["V34", "V90", "V92"]),
+-            v32bis: at_least(&["V32B", "V34", "V90", "V92"]),
+-            v32: at_least(&["V32", "V32B", "V34", "V90", "V92"]),
+-            v22bis: at_least(&["V22B", "V32", "V32B", "V34", "V90", "V92"]),
++            v34: at_least(&["V34", "V90", "V92", "X2"]),
++            v32bis: at_least(&["V32B", "V34", "V90", "V92", "X2"]),
++            v32: at_least(&["V32", "V32B", "V34", "V90", "V92", "X2"]),
++            v22bis: at_least(&["V22B", "V32", "V32B", "V34", "V90", "V92", "X2"]),
+             v90_analogue: pcm("V90") && !server,
+             v90_digital: pcm("V90") && server,
+             v92_analogue: pcm("V92") && !server,
+@@ -4092,6 +4138,8 @@ impl Modem {
+             // A caller that offered V.34 and no PCM to a server offering x2:
+             // V.34's answer modem, which an x2 client's marker turns into x2.
+             Some(Modulation::V34Duplex) if self.serves_x2() => "X2S".to_owned(),
++            // AT+MS=X2, calling: an x2 client.
++            Some(Modulation::V34Duplex) if self.at.modulation.carrier == "X2" && role == Role::Calling => "X2C".to_owned(),
+             Some(Modulation::V34Duplex) => "V34".to_owned(),
+             // V.8 cannot tell the two apart, so what it agreed does not
+             // change which of them was asked for. Anything else -- a far end
+@@ -4107,7 +4155,7 @@ impl Modem {
+             // whose far end answered with a plain ANS on to V.32bis's own
+             // start-up, and so does a V.8 that was turned off.
+             _ => match self.at.modulation.carrier.as_str() {
+-                "V34" | "V90" | "V92" => "V32B".to_owned(),
++                "V34" | "V90" | "V92" | "X2" => "V32B".to_owned(),
+                 other => other.to_owned(),
+             },
+         } };
+@@ -4120,6 +4168,12 @@ impl Modem {
+             }
+             "V90S" => Pump::V90Server(Box::new(v90::server::Line::new(self.fs, self.server_info0d(), lead_in))),
+             "X2S" => Pump::V90Server(Box::new(v90::server::Line::x2(self.fs, lead_in))),
++            "X2C" => {
++                if self.network_a_law {
++                    self.line_notes.push("x2: the line is A-law, and x2 is mu-law only".to_owned());
++                }
++                Pump::X2(Box::new(x2::dialout::Modem::new(self.fs, lead_in)))
++            }
+             "V92S" => {
+                 let pcm_upstream = self.pcm_upstream;
+                 // The short phase 2 is asked for along with the short phase
+diff --git a/crates/modem/tests/x2_pair.rs b/crates/modem/tests/x2_pair.rs
+new file mode 100644
+index 0000000..6f9fdda
+--- /dev/null
++++ b/crates/modem/tests/x2_pair.rs
+@@ -0,0 +1,63 @@
++//! Two of these with `AT+MS=X2`, one dialling and one answering, wired to
++//! each other at 16 kHz with the host's G.711 levels handed to the caller,
++//! as a SIP line does: V.8, phase 2 with the x2 marker, x2's training and
++//! data, the move to 56000, and both ends online with V.42 over it.
++
++use std::collections::VecDeque;
++
++use modem::{Modem, State};
++
++const FS: f64 = 16_000.0;
++
++fn type_at(modem: &mut Modem, line: &str) {
++    for b in line.bytes() {
++        modem.feed_dte(b);
++    }
++    modem.feed_dte(b'\r');
++}
++
++#[test]
++fn two_of_these_connect_on_x2_with_error_control() {
++    let mut caller = Modem::new(FS);
++    let mut host = Modem::new(FS);
++    let mut to_host: VecDeque<f64> = vec![0.0; 320].into();
++    let mut to_caller: VecDeque<f64> = vec![0.0; 320].into();
++    let mut levels_to_caller: VecDeque<f64> = vec![0.0; 160].into();
++    let (mut caller_said, mut host_said) = (Vec::new(), Vec::new());
++    type_at(&mut host, "AT+MS=X2;A");
++    type_at(&mut caller, "AT+MS=X2;D5551234");
++    let mut log = String::new();
++    let mut up = false;
++    for second in 0..60 {
++        for _ in 0..(FS as usize / 2) {
++            // Two line samples to one network level.
++            let mut levels = Vec::new();
++            for _ in 0..2 {
++                let heard = to_caller.pop_front().unwrap_or(0.0);
++                to_host.push_back(caller.step(heard));
++                let heard = to_host.pop_front().unwrap_or(0.0);
++                to_caller.push_back(host.step(heard));
++            }
++            if let Some(l) = host.take_network_levels() {
++                levels.extend(l);
++            }
++            levels_to_caller.extend(levels);
++            let give: Vec<f64> = (0..1).filter_map(|_| levels_to_caller.pop_front()).collect();
++            caller.give_network_levels(&give);
++            caller_said.extend(caller.take_dte());
++            host_said.extend(host.take_dte());
++        }
++        for (who, m) in [("caller", &mut caller), ("host", &mut host)] {
++            for n in m.take_line_notes() {
++                log.push_str(&format!("{who}: {n}\n"));
++            }
++        }
++        log.push_str(&format!("{:.1}s caller {:?} {} | host {:?} {}\n", second as f64 / 2.0, caller.state(), caller.line_phase(), host.state(), host.line_phase()));
++        if caller.state() == State::Data && host.state() == State::Data && caller.rate().is_some_and(|r| r > 32_000) {
++            up = true;
++            break;
++        }
++    }
++    assert!(up, "{log}");
++    assert_eq!(caller.standard(), "x2", "{log}");
++}
+diff --git a/crates/modem/tests/x2_sip.rs b/crates/modem/tests/x2_sip.rs
+new file mode 100644
+index 0000000..b2f615e
+--- /dev/null
++++ b/crates/modem/tests/x2_sip.rs
+@@ -0,0 +1,212 @@
++//! An x2 call between two of these over SIP media on this machine: the
++//! caller `AT+MS=X2` dialling out as an x2 client, the host `AT+MS=X2`
++//! answering as an x2 server, PCMU in 20 ms packets with 0-30 ms of jitter
++//! on the way down -- and, once both are online, a packet lost every two
++//! seconds, which moves the client's frames and has to be found again.
++//!
++//! Both ends are this program, written from the same facts (libv90modem's
++//! x2-facts), so it shows they agree with each other over a real media path,
++//! not that either is x2: only a U.S. Robotics modem can show that.
++//!
++//! ```text
++//! cargo test --release -p modem --test x2_sip
++//! ```
++
++use std::collections::VecDeque;
++use std::net::{SocketAddr, UdpSocket};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex};
++use std::thread;
++use std::time::{Duration, Instant};
++
++use modem::{Modem, State};
++use sip::g711::{self, Law};
++use sip::media::Media;
++
++const FS: f64 = 16_000.0;
++const DRIVE: f32 = 0.1;
++
++fn local(port: u16) -> SocketAddr {
++    SocketAddr::from(([127, 0, 0, 1], port))
++}
++
++#[derive(Default, Clone)]
++struct Seen {
++    online: bool,
++    standard: String,
++    rate: Option<u32>,
++}
++
++struct End {
++    terminal: Vec<u8>,
++    notes: Vec<String>,
++}
++
++/// A modem stepped the way the window steps one on a SIP line.
++fn run_modem(media: Media, commands: &'static str, typed: Arc<Mutex<VecDeque<u8>>>, seen: Arc<Mutex<Seen>>, stop: Arc<AtomicBool>) -> End {
++    let mut modem = Modem::new(FS);
++    for b in commands.bytes() {
++        modem.feed_dte(b);
++    }
++    modem.feed_dte(b'\r');
++    let mut end = End { terminal: Vec::new(), notes: Vec::new() };
++    let (mut from_line, mut from_network, mut to_line) = (Vec::new(), Vec::new(), Vec::new());
++    while !stop.load(Ordering::Relaxed) {
++        if let Ok(mut typed) = typed.lock() {
++            for b in typed.drain(..) {
++                modem.feed_dte(b);
++            }
++        }
++        from_line.clear();
++        from_network.clear();
++        media.receive_both(&mut from_line, Some(&mut from_network));
++        if from_line.is_empty() {
++            thread::sleep(Duration::from_millis(2));
++            continue;
++        }
++        let levels: Vec<f64> = from_network.iter().map(|l| f64::from(*l)).collect();
++        modem.give_network_levels(&levels);
++        to_line.clear();
++        for &s in &from_line {
++            let said = modem.step(f64::from(s)) as f32;
++            let drive = if modem.exact_levels() { 1.0 } else { DRIVE };
++            to_line.push(said * drive);
++        }
++        match modem.take_network_levels() {
++            Some(levels) => {
++                let levels: Vec<f32> = levels.iter().map(|l| *l as f32).collect();
++                media.transmit_exact(&levels);
++            }
++            None => media.transmit(&to_line),
++        }
++        end.terminal.extend(modem.take_dte());
++        end.notes.extend(modem.take_line_notes());
++        if let Ok(mut seen) = seen.lock() {
++            seen.online = modem.state() == State::Data;
++            seen.standard = modem.standard().to_owned();
++            seen.rate = modem.rate();
++        }
++    }
++    end
++}
++
++#[test]
++#[cfg_attr(debug_assertions, ignore = "two modems in real time: run it with --release")]
++fn an_x2_call_over_sip_media_comes_up_and_carries_text_through_lost_packets() {
++    let facing_caller = UdpSocket::bind("127.0.0.1:0").unwrap();
++    let facing_host = UdpSocket::bind("127.0.0.1:0").unwrap();
++    facing_caller.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
++    facing_host.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
++    let caller_media = Media::open(0, FS).unwrap();
++    let host_media = Media::open(0, FS).unwrap();
++    let (caller_port, host_port) = (caller_media.local_port(), host_media.local_port());
++    caller_media.connect(facing_caller.local_addr().unwrap(), Law::Mu, g711::PCMU, 20);
++    host_media.connect(facing_host.local_addr().unwrap(), Law::Mu, g711::PCMU, 20);
++
++    let stop = Arc::new(AtomicBool::new(false));
++    let lossy = Arc::new(AtomicBool::new(false));
++
++    let upstream = {
++        let (from, to, stop) = (facing_caller.try_clone().unwrap(), facing_host.try_clone().unwrap(), Arc::clone(&stop));
++        thread::spawn(move || {
++            let mut buffer = [0u8; 2048];
++            while !stop.load(Ordering::Relaxed) {
++                if let Ok(n) = from.recv(&mut buffer) {
++                    let _ = to.send_to(&buffer[..n], local(host_port));
++                }
++            }
++        })
++    };
++    // Host to caller: 0-30 ms of jitter, in order; once `lossy`, one packet
++    // in every hundred lost.
++    let downstream = {
++        let (from, to, stop, lossy) = (facing_host.try_clone().unwrap(), facing_caller.try_clone().unwrap(), Arc::clone(&stop), Arc::clone(&lossy));
++        thread::spawn(move || {
++            let mut held: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
++            let mut buffer = [0u8; 2048];
++            let mut state = 4_242u32;
++            let mut random = move || {
++                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++                state >> 8
++            };
++            let (mut count, mut lost) = (0u32, 0u32);
++            let mut last = Instant::now();
++            while !stop.load(Ordering::Relaxed) {
++                let now = Instant::now();
++                if let Ok(n) = from.recv(&mut buffer) {
++                    count += 1;
++                    if lossy.load(Ordering::Relaxed) && count % 100 == 0 {
++                        lost += 1;
++                    } else {
++                        let at = (now + Duration::from_millis(u64::from(random() % 31))).max(last);
++                        last = at;
++                        held.push_back((at, buffer[..n].to_vec()));
++                    }
++                }
++                while held.front().is_some_and(|h| h.0 <= now) {
++                    let (_, d) = held.pop_front().unwrap();
++                    let _ = to.send_to(&d, local(caller_port));
++                }
++            }
++            lost
++        })
++    };
++
++    let caller_typed = Arc::new(Mutex::new(VecDeque::new()));
++    let host_typed = Arc::new(Mutex::new(VecDeque::new()));
++    let (caller_seen, host_seen) = (Arc::new(Mutex::new(Seen::default())), Arc::new(Mutex::new(Seen::default())));
++    let host = {
++        let (stop, seen, typed) = (Arc::clone(&stop), Arc::clone(&host_seen), Arc::clone(&host_typed));
++        thread::spawn(move || run_modem(host_media, "AT+MS=X2;A", typed, seen, stop))
++    };
++    let caller = {
++        let (stop, seen, typed) = (Arc::clone(&stop), Arc::clone(&caller_seen), Arc::clone(&caller_typed));
++        thread::spawn(move || run_modem(caller_media, "AT+MS=X2;D5551234", typed, seen, stop))
++    };
++
++    // Online, then up to the fast rate.
++    let deadline = Instant::now() + Duration::from_secs(45);
++    let fast = || {
++        let c = caller_seen.lock().unwrap().clone();
++        c.online && host_seen.lock().unwrap().online && c.rate.is_some_and(|r| r > 32_000)
++    };
++    while !fast() && Instant::now() < deadline {
++        thread::sleep(Duration::from_millis(100));
++    }
++    let at_fast = caller_seen.lock().unwrap().clone();
++    let mut sent = (String::new(), String::new());
++    if fast() {
++        thread::sleep(Duration::from_secs(2));
++        lossy.store(true, Ordering::Relaxed);
++        for line in 0..60 {
++            let down = format!("down {line:03}: the quick brown fox jumps over the lazy dog\r\n");
++            let up = format!("up {line:03}: pack my box with five dozen liquor jugs\r\n");
++            host_typed.lock().unwrap().extend(down.bytes());
++            caller_typed.lock().unwrap().extend(up.bytes());
++            sent.0.push_str(&down);
++            sent.1.push_str(&up);
++            thread::sleep(Duration::from_millis(150));
++        }
++        thread::sleep(Duration::from_secs(5));
++    }
++    stop.store(true, Ordering::Relaxed);
++    let (caller, host) = (caller.join().unwrap(), host.join().unwrap());
++    upstream.join().unwrap();
++    let lost = downstream.join().unwrap();
++    let saw = |end: &End| String::from_utf8_lossy(&end.terminal).into_owned();
++    let notes = |end: &End| end.notes.join("\n");
++    assert!(
++        at_fast.online,
++        "the call never came up fast\ncaller: {:?}\n{}\nhost: {:?}\n{}",
++        saw(&caller),
++        notes(&caller),
++        saw(&host),
++        notes(&host)
++    );
++    assert_eq!(at_fast.standard, "x2", "{}", notes(&caller));
++    assert!(lost >= 5, "only {lost} packets were lost");
++    let (got_down, got_up) = (saw(&caller), saw(&host));
++    assert!(got_down.contains(&sent.0), "the caller did not get the host's text\n{got_down:?}\n{}", notes(&caller));
++    assert!(got_up.contains(&sent.1), "the host did not get the caller's text\n{got_up:?}\n{}", notes(&host));
++    eprintln!("x2 at {:?} bit/s down; {lost} packets lost on the way down\n{}", at_fast.rate, notes(&caller));
++}

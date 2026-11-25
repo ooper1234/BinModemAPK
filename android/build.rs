@@ -38,6 +38,17 @@ fn main() {
     let when = git(&["log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M"]).unwrap_or_default();
     println!("cargo:rustc-env=BINMODEM_BUILD={commit}{} {when}", if dirty { "+" } else { "" });
 
+    // x2 dialling out (android/patches/x2-dialout.patch) is a change to the
+    // modem crates, which build-apk.sh applies to the submodule. Refuse to
+    // build the app without it by accident.
+    let dialout = here.join("../BinModem/crates/datapump/src/x2/dialout.rs");
+    println!("cargo:rerun-if-changed={}", dialout.display());
+    assert!(
+        dialout.exists(),
+        "BinModem is missing android/patches/x2-dialout.patch: run ./build-apk.sh, or \
+         git -C BinModem apply ../android/patches/x2-dialout.patch"
+    );
+
     println!("cargo:rerun-if-changed={}", upstream.display());
     println!("cargo:rerun-if-changed={}", mobile.display());
 

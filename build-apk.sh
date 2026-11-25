@@ -18,10 +18,21 @@ tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
 [ -f "$here/BinModem/Cargo.toml" ] || git -C "$here" submodule update --init --recursive
 
-# The modem is upstream's as checked out, V.92 PCM upstream included: no
-# patches. android/patches/long-dil.patch is kept on file but not applied.
-if [ -n "$(git -C "$here/BinModem" status --porcelain --untracked-files=no)" ]; then
-    echo "warning: BinModem/ has local changes; they go into this build" >&2
+# Android-build changes to the modem (android/patches), applied to the
+# submodule's working tree; the submodule stays at its upstream commit. Only
+# the patches named here: long-dil.patch is kept on file but not applied.
+patches=("$here/android/patches/x2-dialout.patch")
+if [ -z "$(git -C "$here/BinModem" status --porcelain --untracked-files=no)" ]; then
+    for patch in "${patches[@]}"; do
+        git -C "$here/BinModem" apply "$patch" || { echo "$(basename "$patch") no longer applies to BinModem" >&2; exit 1; }
+        echo "applied $(basename "$patch")"
+    done
+else
+    for patch in "${patches[@]}"; do
+        git -C "$here/BinModem" apply --reverse --check "$patch" 2>/dev/null \
+            || { echo "BinModem/ has changes that are not $(basename "$patch"): start from a clean submodule" >&2; exit 1; }
+    done
+    echo "android/patches already applied"
 fi
 
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android$api-clang"

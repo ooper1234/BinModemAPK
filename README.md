@@ -69,6 +69,38 @@ build applies no patches to it. On the phone:
 `android/patches/long-dil.patch` (read the DIL twice) still applies but is not
 applied by `build-apk.sh`.
 
+### x2 dialling out (`android/patches/x2-dialout.patch`)
+
+Upstream serves U.S. Robotics x2 but cannot dial out with it. This build
+adds the calling side: **x2** in the mode box, or `AT+MS=X2`.
+
+- **Calling:** V.34's call modem through phase 2. If the server offers x2 in
+  its INFO0a, the client sends x2's marker after the server's probe and takes
+  the call from phase 3: 32000 down to start with, then 56000 once the line
+  has been clean for two seconds, and V.34 up. If the server doesn't offer
+  x2, the call simply carries on as V.34.
+- **Answering:** `AT+MS=X2` is an x2 server, whatever S70 says.
+- **SIP only:** the client reads the server's G.711 octets as octets, so it
+  needs a SIP line in PCMU. Over a sound card it will not reach data mode,
+  and says so in the Line notes.
+- **Lost packets:** the client finds the server's frames by the alignment
+  pattern, not by counting octets, and finds them again when a lost or
+  repeated packet moves them. A downstream that keeps losing frames asks for
+  a lower rate.
+
+Fixes to upstream's code that this needed:
+- the simulated x2 client's upstream encoder takes a whole mapping frame of
+  bits at once, so it now asks for two frames' worth to be queued; with 64,
+  ones went into the middle of every frame and V.42 never came up;
+- the x2 server waits for the client's marker 800 ms after its L1 *plus the
+  round trip*, which on a SIP call (two jitter buffers) can be 700 ms.
+
+Tested only in simulation: against upstream's x2 server (written from the
+same facts), in the datapump, as two modems wired together, and as two modems
+over SIP media on one machine with packets lost on the way down
+(`crates/modem/tests/x2_sip.rs`). It has not met a U.S. Robotics or 3Com x2
+server.
+
 ### How it is put together
 
 Upstream is not edited. `android/build.rs` copies the GUI files that need it
