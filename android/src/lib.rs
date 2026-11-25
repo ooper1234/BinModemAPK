@@ -101,7 +101,7 @@ fn run(android_app: AndroidApp) -> Result<(), Box<dyn std::error::Error>> {
             let inner = app::ScopeApp::new(rx, ui_control, sink, sample_rate, source);
             Ok(Box::new(Phone {
                 inner,
-                mobile: app::mobile::Mobile::default(),
+                mobile: app::mobile::Mobile { system_picker: true, ..Default::default() },
                 android_app,
                 keyboard: false,
                 asked_storage: false,
@@ -150,6 +150,22 @@ impl eframe::App for Phone {
         let ctx = ui.ctx().clone();
         self.fit(&ctx);
         let requests = self.inner.mobile_ui(ui, &mut self.mobile);
+        if let Some(types) = &requests.system_pick
+            && let Err(e) = system_pick(types)
+        {
+            log::warn!("could not open the file picker: {e}");
+            self.mobile.picked = Some(String::new());
+        }
+        if self.mobile.waiting.is_some() && self.mobile.picked.is_none() {
+            match take_picked() {
+                Ok(Some(path)) => self.mobile.picked = Some(path),
+                Ok(None) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+                Err(e) => {
+                    log::warn!("could not hear from the file picker: {e}");
+                    self.mobile.picked = Some(String::new());
+                }
+            }
+        }
         if requests.storage && !self.asked_storage {
             self.asked_storage = true;
             // Images and, up to Android 12, everything else in shared
@@ -274,6 +290,51 @@ fn request_permissions(permissions: &[&str]) -> Result<(), Box<dyn std::error::E
         Ok::<(), jni::errors::Error>(())
     })?;
     Ok(())
+}
+
+/// The activity (MainActivity.java) and a JNI env for this thread.
+#[cfg(target_os = "android")]
+fn with_activity<R>(
+    f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> jni::errors::Result<R>,
+) -> Result<R, Box<dyn std::error::Error>> {
+    let ctx = ndk_context::android_context();
+    // SAFETY: both pointers come from the running activity via ndk-context.
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
+    let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+    let mut env = vm.attach_current_thread()?;
+    let result = f(&mut *env, &activity);
+    if result.is_err() {
+        let _ = env.exception_clear();
+    }
+    Ok(result?)
+}
+
+/// Open Android's file picker: Google Photos, Drive, Downloads and the rest.
+#[cfg(target_os = "android")]
+fn system_pick(types: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    with_activity(|env, activity| {
+        let first = env.new_string(types.first().map_or("*/*", |t| t.as_str()))?;
+        let array = env.new_object_array(types.len() as i32, "java/lang/String", &first)?;
+        for (i, t) in types.iter().enumerate() {
+            let t = env.new_string(t)?;
+            env.set_object_array_element(&array, i as i32, &t)?;
+        }
+        env.call_method(activity, "pickFile", "([Ljava/lang/String;)V", &[(&array).into()])?;
+        Ok(())
+    })
+}
+
+/// The picker's answer, once it has one: a path, or "" for cancelled.
+#[cfg(target_os = "android")]
+fn take_picked() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    with_activity(|env, activity| {
+        let value = env.call_method(activity, "takePicked", "()Ljava/lang/String;", &[])?.l()?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let s: String = env.get_string(&jni::objects::JString::from(value))?.into();
+        Ok(Some(s))
+    })
 }
 
 /// The phone layout in a desktop window the size of a phone, for working on

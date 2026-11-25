@@ -41,6 +41,15 @@ cp "$here/android/target/aarch64-linux-android/release/libbinmodem.so" "$out/sta
 # Native libraries are compressed to keep the download small; Android extracts
 # them at install (extractNativeLibs="true" in the manifest).
 (cd "$out/staging" && zip -q -9 -r "$out/unaligned.apk" lib)
+
+# MainActivity.java: the NativeActivity plus Android's file picker, which
+# native code cannot get an answer from on its own.
+mkdir -p "$out/classes" "$out/dex"
+javac -source 8 -target 8 -Xlint:-options -bootclasspath "$platform/android.jar" \
+    -d "$out/classes" $(find "$here/android/java" -name '*.java')
+"$bt/d8" --release --min-api "$api" --lib "$platform/android.jar" --output "$out/dex" \
+    $(find "$out/classes" -name '*.class')
+(cd "$out/dex" && zip -q -9 "$out/unaligned.apk" classes.dex)
 "$bt/zipalign" -f -p 4 "$out/unaligned.apk" "$out/aligned.apk"
 
 keystore="${KEYSTORE:-$here/android/debug.keystore}"

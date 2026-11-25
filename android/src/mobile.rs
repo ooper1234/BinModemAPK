@@ -28,6 +28,14 @@ pub struct Mobile {
     pub sound_started: bool,
     /// The file browser standing in for a file dialog, while it is open.
     pub picker: Option<Picker>,
+    /// Files are picked with Android's own picker (Google Photos, Drive,
+    /// Downloads...) rather than the in-app browser. Set on a phone.
+    pub system_picker: bool,
+    /// What the system picker was opened for, while it is out.
+    pub waiting: Option<rfd::Request>,
+    /// The platform's answer: the picked file copied into the app's folder,
+    /// or an empty string for cancelled.
+    pub picked: Option<String>,
 }
 
 /// A file dialog, drawn by the app: Android has none a native app can use
@@ -40,7 +48,7 @@ pub struct Picker {
 
 impl Default for Mobile {
     fn default() -> Self {
-        Self { page: Page::Line, fit_font: true, sound_started: false, picker: None }
+        Self { page: Page::Line, fit_font: true, sound_started: false, picker: None, system_picker: false, waiting: None, picked: None }
     }
 }
 
@@ -51,6 +59,8 @@ pub struct Requests {
     pub keyboard: Option<bool>,
     /// Ask for permission to read shared storage, for the file browser.
     pub storage: bool,
+    /// Open the system file picker for these MIME types (empty: any).
+    pub system_pick: Option<Vec<String>>,
 }
 
 const DIM: Color32 = Color32::from_rgb(140, 150, 165);
@@ -104,9 +114,22 @@ impl ScopeApp {
         self.constellation_window(ui);
 
         let tab_was = self.tab;
+        if let Some(path) = m.picked.take()
+            && let Some(request) = m.waiting.take()
+            && !path.is_empty()
+        {
+            self.deliver(&request, std::path::Path::new(&path));
+        }
         if let Some(request) = rfd::take_request() {
-            m.picker = Some(Picker { request, dir: picker_roots()[0].1.clone() });
-            requests.storage = true;
+            if m.system_picker && !request.folder {
+                // Android's own picker; the answer comes back through
+                // `picked` a few frames later.
+                requests.system_pick = Some(mime_types(&request.extensions()));
+                m.waiting = Some(request);
+            } else {
+                m.picker = Some(Picker { request, dir: picker_roots()[0].1.clone() });
+                requests.storage = true;
+            }
         }
         egui::CentralPanel::default().show(ui, |ui| {
             // Upstream's line controls do more than draw: they start a fax
@@ -1095,4 +1118,26 @@ fn picker_roots() -> Vec<(&'static str, std::path::PathBuf)> {
 /// non-media files.
 fn files_hint_needed(dir: &std::path::Path) -> bool {
     dir.starts_with("/storage/emulated/0") && !dir.starts_with("/storage/emulated/0/Android")
+}
+
+/// MIME types for the system picker, from the extensions a dialog allows.
+fn mime_types(extensions: &[String]) -> Vec<String> {
+    let mut types: Vec<String> = Vec::new();
+    for e in extensions {
+        let t: &[&str] = match e.as_str() {
+            "png" => &["image/png"],
+            "jpg" | "jpeg" => &["image/jpeg"],
+            "bmp" => &["image/bmp", "image/x-ms-bmp"],
+            "gif" => &["image/gif"],
+            "pdf" => &["application/pdf"],
+            "wav" => &["audio/wav", "audio/x-wav", "audio/wave"],
+            _ => &[],
+        };
+        for t in t {
+            if !types.iter().any(|x| x == t) {
+                types.push((*t).to_owned());
+            }
+        }
+    }
+    types
 }

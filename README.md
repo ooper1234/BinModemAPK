@@ -86,12 +86,13 @@ To look at the layout without a phone (Linux, needs ALSA and X11):
 
 ## Limits
 
-- Android has no file dialog a native app can use, so `Browse` opens the
-  app's own file browser. Android only shows another app's PDFs and documents
-  to the system picker, so put documents to fax in the app's
-  `Android/data/io.github.binmodem/files/fax` folder (over USB, for example).
-  Pictures in Download, Pictures and DCIM can be picked once storage access is
-  allowed. Fax `Save` needs no dialog: files go to `files/saved`.
+- `Browse` opens Android's own file picker, so a document can come from
+  Google Photos, Drive, Downloads or any other app that offers files. The
+  chosen file is copied to `Android/data/io.github.binmodem/files/picked`.
+  This is `android/java/.../MainActivity.java`: the NativeActivity with the
+  picker added, compiled by `build-apk.sh`. Choosing a folder (ZMODEM's
+  receive folder) uses the app's own file browser. Fax `Save` needs no
+  dialog: files go to `files/saved`.
 - arm64-v8a only, Android 8.0 (API 26) or newer (AAudio).
 
 ## Building
