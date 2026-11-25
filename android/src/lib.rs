@@ -43,6 +43,7 @@ fn android_main(android_app: AndroidApp) {
             .with_tag("BinModem"),
     );
     log_panics();
+    ACTIVITY.store(android_app.activity_as_ptr(), std::sync::atomic::Ordering::Relaxed);
 
     if let Some(home) = android_app.internal_data_path() {
         let _ = std::fs::create_dir_all(&home);
@@ -254,43 +255,42 @@ fn log_panics() {
 /// activity, and what needed it simply works once it has been given.
 #[cfg(target_os = "android")]
 fn request_permissions(permissions: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = ndk_context::android_context();
-    // SAFETY: both pointers come from the running activity via ndk-context.
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
-    let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
-    let mut env = vm.attach_current_thread()?;
-
-    let mut missing = Vec::new();
-    for permission in permissions {
-        let name = env.new_string(permission)?;
-        let granted = env
-            .call_method(&activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[(&name).into()])?
-            .i()?;
-        if granted != 0 {
-            missing.push(name);
+    with_activity(|env, activity| {
+        let mut missing = Vec::new();
+        for permission in permissions {
+            let name = env.new_string(permission)?;
+            let granted = env
+                .call_method(activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[(&name).into()])?
+                .i()?;
+            if granted != 0 {
+                missing.push(name);
+            }
         }
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let array = env.new_object_array(missing.len() as i32, "java/lang/String", &missing[0])?;
-    for (i, name) in missing.iter().enumerate() {
-        env.set_object_array_element(&array, i as i32, name)?;
-    }
-    env.call_method(
-        &activity,
-        "requestPermissions",
-        "([Ljava/lang/String;I)V",
-        &[(&array).into(), jni::objects::JValue::Int(1)],
-    )
-    .map(|_| ())
-    .or_else(|_| {
-        // Missing (API < 23) means the permission was granted at install.
-        let _ = env.exception_clear();
-        Ok::<(), jni::errors::Error>(())
-    })?;
-    Ok(())
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let array = env.new_object_array(missing.len() as i32, "java/lang/String", &missing[0])?;
+        for (i, name) in missing.iter().enumerate() {
+            env.set_object_array_element(&array, i as i32, name)?;
+        }
+        env.call_method(
+            activity,
+            "requestPermissions",
+            "([Ljava/lang/String;I)V",
+            &[(&array).into(), jni::objects::JValue::Int(1)],
+        )?;
+        Ok(())
+    })
 }
+
+/// The running Activity (MainActivity), as android-activity has it.
+///
+/// Not ndk-context's context: that is the Application, which has neither
+/// `requestPermissions` nor `pickFile`, so every call made through it failed
+/// -- the permission requests and the file picker alike.
+#[cfg(target_os = "android")]
+static ACTIVITY: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// The activity (MainActivity.java) and a JNI env for this thread.
 #[cfg(target_os = "android")]
@@ -298,12 +298,20 @@ fn with_activity<R>(
     f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> jni::errors::Result<R>,
 ) -> Result<R, Box<dyn std::error::Error>> {
     let ctx = ndk_context::android_context();
-    // SAFETY: both pointers come from the running activity via ndk-context.
+    let raw = ACTIVITY.load(std::sync::atomic::Ordering::Relaxed);
+    if raw.is_null() {
+        return Err("no activity yet".into());
+    }
+    // SAFETY: the VM is the process's own, via ndk-context; the activity is
+    // android-activity's reference to the running Activity, borrowed, never
+    // deleted (a JObject does not delete on drop).
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
-    let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+    let activity = unsafe { jni::objects::JObject::from_raw(raw.cast()) };
     let mut env = vm.attach_current_thread()?;
     let result = f(&mut *env, &activity);
     if result.is_err() {
+        // The Java side's own account of what went wrong, to logcat.
+        let _ = env.exception_describe();
         let _ = env.exception_clear();
     }
     Ok(result?)
