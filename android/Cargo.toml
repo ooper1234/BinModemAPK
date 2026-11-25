@@ -1,6 +1,6 @@
 [package]
 name    = "binmodem-android"
-version = "4.2.0"
+version = "5.4.3"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -29,6 +29,7 @@ telnet    = { path = "../BinModem/crates/telnet" }
 transfer  = { path = "../BinModem/crates/transfer" }
 ppp       = { path = "../BinModem/crates/ppp" }
 proxy     = { path = "../BinModem/crates/proxy" }
+review    = { path = "../BinModem/crates/review" }
 sip       = { path = "../BinModem/crates/sip" }
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
 image  = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }

@@ -40,18 +40,23 @@ desktop window's own controls:
 Also: settings and SIP accounts kept in the app's private storage, and the
 microphone permission asked for on first launch.
 
-### The modem: upstream 4.2.0, unpatched
+### The modem: upstream 5.4.3, unpatched
 
-The submodule is at upstream's 4.2.0 (`c8f5af3`), which has V.92 of its own:
-PCM upstream (the **V.92** entry in the call box, `AT+MS=V92`), quick connect
-with its memo of the numbers dialled, and V.8 bis in front of V.8. The Status
-tab shows upstream's call card, with the PCM down and PCM up rate menus. The
-Android build applies no patches to it.
+The submodule follows upstream's main branch (`2a1bfcc`, after 5.4.3): V.92
+with PCM upstream (the **V.92** entry in the mode box, `AT+MS=V92`), quick
+connect, V.8 bis, HST, x2, and the rest of upstream's modulations. The Android
+build applies no patches to it. On the phone:
 
-The earlier Android-only V.92 work (`v92-quick-connect.patch`) is dropped in
-favour of upstream's. `android/patches/long-dil.patch` (read the DIL twice)
-still applies to 4.2.0 and is kept on file, but `build-apk.sh` does not
-apply it.
+- **Status** shows upstream's call card, with the PCM down and PCM up rate
+  menus.
+- **Terminal** has upstream's tabs beside the terminal: transcript, **fax**
+  (laid out in one column) and **review** (upstream's reader for recordings
+  of calls). Review's Open is a file dialog, which Android lacks, so the
+  recordings Record has made are listed above it to open with a tap.
+- The faceplate's Scopes and Fax keys go to the Scopes page and the fax tab.
+
+`android/patches/long-dil.patch` (read the DIL twice) still applies but is not
+applied by `build-apk.sh`.
 
 ### How it is put together
 

@@ -90,12 +90,25 @@ impl ScopeApp {
         // transfers and network windows are drawn by the line controls.
         self.constellation_window(ui);
 
+        let tab_was = self.tab;
         egui::CentralPanel::default().show(ui, |ui| match m.page {
             Page::Line => self.page_line(ui),
             Page::Terminal => self.page_terminal(ui, m, &mut requests),
             Page::Scopes => self.page_scopes(ui),
             Page::Status => self.page_status(ui),
         });
+        // The faceplate's Scopes and Fax keys pick a desktop tab; here they
+        // go to the page that shows it.
+        if self.tab != tab_was {
+            match self.tab {
+                Tab::Scopes => {
+                    m.page = Page::Scopes;
+                    self.tab = Tab::Terminal;
+                }
+                Tab::Fax if m.page == Page::Line => m.page = Page::Terminal,
+                _ => {}
+            }
+        }
 
         requests
     }
@@ -216,6 +229,10 @@ impl ScopeApp {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Terminal, "terminal");
             ui.selectable_value(&mut self.tab, Tab::Transcript, "transcript");
+            if self.source.is_live() {
+                ui.selectable_value(&mut self.tab, Tab::Fax, "fax");
+            }
+            ui.selectable_value(&mut self.tab, Tab::Review, "review");
             if self.tab == Tab::Terminal {
                 ui.separator();
                 if ui.button("reset").clicked() {
@@ -229,9 +246,14 @@ impl ScopeApp {
         });
         ui.separator();
 
-        if self.tab == Tab::Transcript {
-            self.transcript(ui);
-            return;
+        match self.tab {
+            Tab::Transcript => return self.transcript(ui),
+            // Upstream's Fax and Review tabs, as they are on the desktop.
+            Tab::Fax => return self.page_fax(ui),
+            Tab::Review => return self.page_review(ui),
+            // Scopes have a page of their own here.
+            Tab::Scopes => self.tab = Tab::Terminal,
+            Tab::Terminal => {}
         }
 
         if m.fit_font {
@@ -276,6 +298,65 @@ impl ScopeApp {
                 if !typed.is_empty() {
                     self.source.send(&typed);
                 }
+            });
+    }
+
+    /// Upstream's Review tab, with the recordings Record made listed above
+    /// it: its Open button is a file dialog, which Android does not have.
+    fn page_review(&mut self, ui: &mut egui::Ui) {
+        let dir = captures_dir();
+        let mut wavs: Vec<_> = std::fs::read_dir(&dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        wavs.sort();
+        wavs.reverse();
+        egui::CollapsingHeader::new(format!("recordings ({})", wavs.len()))
+            .id_salt("m-recordings")
+            .default_open(true)
+            .show(ui, |ui| {
+                if wavs.is_empty() {
+                    ui.label(RichText::new("None yet: Record on the Line page while a line is open.").small().color(DIM));
+                }
+                egui::ScrollArea::vertical().id_salt("m-wavs").max_height(140.0).show(ui, |ui| {
+                    for path in &wavs {
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.button(RichText::new(name).monospace().size(12.0)).clicked() {
+                            self.review.open(path);
+                        }
+                    }
+                });
+            });
+        ui.separator();
+        self.review.ui(ui);
+    }
+
+    /// Upstream's Fax tab in one column: what to send or receive, the page,
+    /// and what the far machine said. The desktop puts these side by side
+    /// with the call card, which the Status page has here.
+    fn page_fax(&mut self, ui: &mut egui::Ui) {
+        let on_hook = self.frame.state == telemetry::CallState::Idle;
+        egui::ScrollArea::vertical()
+            .id_salt("m-fax")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                within_screen(ui, |ui| {
+                    if let Some(start) = self.fax.side_panel(ui, on_hook, &mut self.dial_number) {
+                        self.fax_start = Some(start);
+                    }
+                    ui.add_space(8.0);
+                    let page = egui::vec2(ui.available_width(), ui.available_width() * 1.3);
+                    ui.allocate_ui(page, |ui| {
+                        ui.set_min_size(page);
+                        self.fax.page_panel(ui);
+                    });
+                    ui.add_space(8.0);
+                    self.fax.far_panel(ui);
+                    ui.add_space(24.0);
+                });
             });
     }
 
@@ -334,7 +415,7 @@ impl ScopeApp {
                 ui.add_space(8.0);
 
                 ui.label(RichText::new("spectrum").strong());
-                let measured = scopes::measure(&self.frame.spectrum_db, self.frame.hz_per_bin);
+                let measured = scopes::measure(&self.frame.spectrum_db, self.frame.hz_per_bin, self.frame.display_hz);
                 scopes::spectrum(
                     ui,
                     170.0,
@@ -342,6 +423,7 @@ impl ScopeApp {
                         bins: &self.frame.spectrum_db,
                         hold: &self.hold,
                         hz_per_bin: self.frame.hz_per_bin,
+                        span_hz: self.frame.display_hz,
                         floor: self.waterfall.floor_db,
                         ceiling: self.waterfall.ceiling_db,
                         modulation: self.frame.modulation,
@@ -360,7 +442,7 @@ impl ScopeApp {
                         points: &self.frame.constellation,
                         tones: self.frame.tones,
                         peak: self.frame.constellation_peak,
-                        pairs: self.frame.symbol_label == "PCM",
+                        pcm: (self.frame.symbol_label == "PCM").then_some(self.pcm_view),
                     },
                     &label,
                     self.frame.symbol_quality(),
@@ -395,7 +477,7 @@ impl ScopeApp {
                 ui.label(RichText::new("call").strong());
                 // Upstream's call card: state, rates, and the PCM down and
                 // (V.92) PCM up rate menus with Retrain beside them.
-                let measured = scopes::measure(&self.frame.spectrum_db, self.frame.hz_per_bin);
+                let measured = scopes::measure(&self.frame.spectrum_db, self.frame.hz_per_bin, self.frame.display_hz);
                 self.call_card(ui, measured);
 
                 ui.add_space(12.0);
@@ -715,6 +797,12 @@ impl<'open> Window<'open> {
         self
     }
 
+    /// The sheet is the whole screen whatever it is called, so a title that
+    /// changes needs no id of its own to stay the same sheet.
+    pub fn id(self, _id: egui::Id) -> Self {
+        self
+    }
+
     pub fn resizable(self, _resizable: bool) -> Self {
         self
     }
@@ -761,7 +849,7 @@ impl ScopeApp {
             "network" => self.network_open = true,
             "advanced" => self.advanced = true,
             "files" => self.transfer_open = true,
-            "fax" => self.fax.open = true,
+            "fax" => self.tab = Tab::Fax,
             "error" => self.protection_open = true,
             // Not windows: the long V.90 name in the call box, and SIP chosen.
             "v90" => self.carrier = 5,

@@ -21,6 +21,23 @@ fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gui");
     fs::create_dir_all(&out).unwrap();
 
+    // Which upstream build this is, for the masthead (upstream's gui/build.rs
+    // does the same for the desktop program): the submodule's commit.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(here.join("../BinModem"))
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    let commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    let when = git(&["log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M"]).unwrap_or_default();
+    println!("cargo:rustc-env=BINMODEM_BUILD={commit}{} {when}", if dirty { "+" } else { "" });
+
     println!("cargo:rerun-if-changed={}", upstream.display());
     println!("cargo:rerun-if-changed={}", mobile.display());
 
@@ -64,7 +81,30 @@ fn main() {
         }
 ";
             assert_eq!(patched.matches(from).count(), 1, "app.rs: the Listen button has changed upstream");
-            patched.replace(from, "        self.side_buttons(ui);\n")
+            let mut patched = patched.replace(from, "        self.side_buttons(ui);\n");
+            // Two rows of the faceplate that are fixed rows on the desktop
+            // wrap on a phone: the name with the build and the line's state,
+            // and the keys a call is made with.
+            for (from, to) in [
+                (
+                    "        ui.horizontal(|ui| {\n            ui.label(RichText::new(\"BINMODEM\")",
+                    "        crate::app::mobile::wrapped(ui, |ui| {\n            ui.label(RichText::new(\"BINMODEM\")",
+                ),
+                // The line's state and the Setup key on a row of their own,
+                // not squeezed to "..." beside the build.
+                (
+                    "            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {\n                let Some(state) = state else {",
+                    "            ui.end_row();\n            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {\n                let Some(state) = state else {",
+                ),
+                (
+                    "        // The keys a call is made with.\n        ui.horizontal(|ui| {",
+                    "        // The keys a call is made with.\n        crate::app::mobile::wrapped(ui, |ui| {",
+                ),
+            ] {
+                assert_eq!(patched.matches(from).count(), 1, "app.rs: `{from}` has changed upstream");
+                patched = patched.replace(from, to);
+            }
+            patched
         } else {
             patched
         };
