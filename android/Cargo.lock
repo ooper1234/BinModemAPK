@@ -167,7 +167,7 @@ checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
 name = "at"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "atomic-waker"
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "binmodem-android"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "android_logger",
  "at",
@@ -210,7 +210,7 @@ dependencies = [
  "dsp",
  "ec",
  "eframe",
- "fax 5.4.3",
+ "fax 5.5.0",
  "hayro",
  "image",
  "jni 0.21.1",
@@ -629,7 +629,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "datapump"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "dsp",
  "ec",
@@ -684,11 +684,11 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "dsp"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "ec"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "ecolor"
@@ -920,7 +920,7 @@ checksum = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
 
 [[package]]
 name = "fax"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "ec",
 ]
@@ -1412,7 +1412,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "http"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "image"
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "line"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "cpal",
  "dsp",
@@ -1683,7 +1683,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "login"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "ppp",
 ]
@@ -1749,12 +1749,12 @@ dependencies = [
 
 [[package]]
 name = "modem"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "at",
  "datapump",
  "ec",
- "fax 5.4.3",
+ "fax 5.5.0",
  "line",
  "sip",
  "transfer",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "ppp"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "ec",
 ]
@@ -2500,7 +2500,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "proxy"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "http",
  "tcp",
@@ -2649,7 +2649,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "review"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "datapump",
  "dsp",
@@ -2823,7 +2823,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sip"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "dsp",
 ]
@@ -2988,19 +2988,19 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tcp"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "telemetry"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "telnet"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "terminal"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "thiserror"
@@ -3135,7 +3135,7 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 
 [[package]]
 name = "transfer"
-version = "5.4.3"
+version = "5.5.0"
 
 [[package]]
 name = "type-map"
@@ -3178,14 +3178,14 @@ checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 
 [[package]]
 name = "v8"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "dsp",
 ]
 
 [[package]]
 name = "varc"
-version = "5.4.3"
+version = "5.5.0"
 dependencies = [
  "dsp",
  "ec",

@@ -52,9 +52,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: BinModem.apk
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v5.4.3-android.{0}', github.run_number) }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v5.5.0-android.{0}', github.run_number) }}
           target_commitish: ${{ github.sha }}
-          name: BinModem for Android ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v5.4.3-android.{0}', github.run_number) }}
+          name: BinModem for Android ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v5.5.0-android.{0}', github.run_number) }}
           make_latest: true
           body: |
             Unofficial Android build of [BinModem](https://github.com/CasualArclamp/BinModem) (upstream commit pinned by the `BinModem` submodule).

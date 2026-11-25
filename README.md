@@ -40,9 +40,9 @@ desktop window's own controls:
 Also: settings and SIP accounts kept in the app's private storage, and the
 microphone permission asked for on first launch.
 
-### The modem: upstream 5.4.3, unpatched
+### The modem: upstream 5.5.0, unpatched
 
-The submodule follows upstream's main branch (`2a1bfcc`, after 5.4.3): V.92
+The submodule is at upstream 5.5.0 (`69dd399`): V.92
 with PCM upstream (the **V.92** entry in the mode box, `AT+MS=V92`), quick
 connect, V.8 bis, HST, x2, and the rest of upstream's modulations. The Android
 build applies no patches to it. On the phone:
