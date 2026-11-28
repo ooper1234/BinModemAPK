@@ -60,6 +60,10 @@ impl Default for Mobile {
 pub struct Requests {
     /// Raise (`Some(true)`) or drop (`Some(false)`) the soft keyboard.
     pub keyboard: Option<bool>,
+    /// The terminal itself is on screen and takes the keys: it raises the
+    /// keyboard when tapped. Anywhere else -- the fax number, a SIP
+    /// password -- the keyboard follows whether a text box has the focus.
+    pub terminal: bool,
     /// Ask for permission to read shared storage, for the file browser.
     pub storage: bool,
     /// Open the system file picker for these MIME types (empty: any).
@@ -130,7 +134,9 @@ impl ScopeApp {
             });
         }
 
-        if m.page == Page::Terminal {
+        requests.terminal = m.page == Page::Terminal && self.tab == Tab::Terminal && m.picker.is_none();
+        // The extra keys type into the terminal, so only beside it.
+        if requests.terminal {
             egui::Panel::bottom("m-keys").show(ui, |ui| {
                 ui.add_space(4.0);
                 if typing {
@@ -165,6 +171,14 @@ impl ScopeApp {
             }
         }
         egui::CentralPanel::default().show(ui, |ui| {
+            // The page under an id of its own. The central panel's is made
+            // from a count of what was laid out before it, and the panels
+            // before it come and go -- the tabs step aside for the keyboard
+            // -- so every widget on the page was a different widget the
+            // moment the keyboard came up. A text box that had just been
+            // given the focus was gone, egui dropped the focus, and nothing
+            // could be typed into the fax number.
+            ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("m-page")), |ui| {
             // Upstream's line controls do more than draw: they start a fax
             // that Send fax or Wait for a fax asked for, take the pages that
             // arrive, and put up the prompt for an incoming SIP call. On the
@@ -184,6 +198,7 @@ impl ScopeApp {
             Page::Scopes => self.page_scopes(ui),
             Page::Status => self.page_status(ui),
             }
+            });
         });
         // The faceplate's Scopes and Fax keys pick a desktop tab; here they
         // go to the page that shows it.

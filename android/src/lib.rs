@@ -107,7 +107,10 @@ fn run(android_app: AndroidApp) -> Result<(), Box<dyn std::error::Error>> {
                 keyboard: false,
                 asked_storage: false,
                 fitted_for: 0.0,
-                last_page: app::mobile::Page::default(),
+                last_terminal: false,
+                text_focus: None,
+                text_focus_page: app::mobile::Page::default(),
+
             }))
         }),
     )?;
@@ -142,7 +145,11 @@ struct Phone {
     asked_storage: bool,
     /// The physical width the zoom was last chosen for.
     fitted_for: f32,
-    last_page: app::mobile::Page,
+    last_terminal: bool,
+    /// The text box that had the focus last frame, and on which page.
+    text_focus: Option<egui::Id>,
+    text_focus_page: app::mobile::Page,
+
 }
 
 #[cfg(target_os = "android")]
@@ -151,7 +158,38 @@ impl eframe::App for Phone {
         let ctx = ui.ctx().clone();
         self.fit(&ctx);
         self.mobile.insets = self.insets(&ctx);
+        self.keep_text_focus(&ctx);
         let requests = self.inner.mobile_ui(ui, &mut self.mobile);
+        // The text box that has the focus, for keep_text_focus next frame;
+        // one that lost it to a tap elsewhere, Back or Enter is let go.
+        let focused = text_box_focused(&ctx);
+        // The keyboard is this app's to raise and lower (set_keyboard). Left
+        // to it, egui-winit turned the IME off and on again around a text
+        // box's edits ("interrupt composition"), which on Android is
+        // hide_soft_input and show_soft_input: the hide won, and the
+        // keyboard went away after two or three digits of a fax number.
+        // Typed text arrives as key events either way, as the terminal's does.
+        ctx.output_mut(|o| o.ime = None);
+        let tapped = ctx.input(|i| i.pointer.any_pressed());
+        if focused.is_some() {
+            self.text_focus = focused;
+            self.text_focus_page = self.mobile.page;
+            // A tap on the box: the keyboard, even if Back put it away
+            // without this end hearing of it.
+            if tapped {
+                self.keyboard = false;
+            }
+        } else if ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Touch { .. } | egui::Event::Key { key: egui::Key::Escape | egui::Key::Enter, pressed: true, .. }
+                    )
+                })
+        }) {
+            self.text_focus = None;
+        }
         if let Some(types) = &requests.system_pick
             && let Err(e) = system_pick(types)
         {
@@ -183,15 +221,19 @@ impl eframe::App for Phone {
 
         // The terminal asks for the keyboard itself; anywhere else it follows
         // whether a text box has the focus. Leaving the terminal puts it away.
-        let page = self.mobile.page;
-        let wanted = if page == app::mobile::Page::Terminal {
+        // On the terminal the keyboard comes up when it is tapped; leaving it
+        // puts the keyboard away. Everywhere else -- the fax tab's number and
+        // TSI boxes included, though they are on the Terminal page -- it
+        // follows whether a text box has the focus.
+        let terminal = requests.terminal;
+        let wanted = if terminal {
             requests.keyboard
-        } else if self.last_page == app::mobile::Page::Terminal {
+        } else if self.last_terminal {
             Some(false)
         } else {
-            requests.keyboard.or(Some(ctx.egui_wants_keyboard_input()))
+            requests.keyboard.or(Some(text_box_focused(&ctx).is_some()))
         };
-        self.last_page = page;
+        self.last_terminal = terminal;
         // A tap on the terminal or the Keyboard button always raises it, even
         // if it was asked up before: Back puts the keyboard away without this
         // side hearing of it, so the remembered "up" can be stale, and then
@@ -224,6 +266,29 @@ impl Phone {
         ctx.set_pixels_per_point(zoom);
     }
 
+    /// Give a text box back the focus it lost to the keyboard coming up.
+    ///
+    /// The fax number box took the focus, the keyboard came up, and a frame
+    /// or two later the box had lost it again and the keyboard went away: as
+    /// the window is resized for the keyboard there is a pass in which the
+    /// box is not laid out, and egui drops the focus of a widget that is not
+    /// (its "dead-man's switch"). Nothing could be typed into it. So a box
+    /// that had the focus and lost it with no tap, no Back and no change of
+    /// page gets it back, and the keyboard is raised again.
+    fn keep_text_focus(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.text_focus else { return };
+        if ctx.memory(|m| m.focused()).is_some() {
+            return;
+        }
+        if self.mobile.page != self.text_focus_page {
+            self.text_focus = None;
+            return;
+        }
+        ctx.memory_mut(|m| m.request_focus(id));
+        // And the keyboard, which went with it.
+        self.keyboard = false;
+    }
+
     /// How much of the window the system bars and the keyboard cover, top
     /// and bottom, in points: what Android says is left for the content,
     /// against the whole window.
@@ -253,6 +318,17 @@ impl Phone {
             self.android_app.hide_soft_input(false);
         }
     }
+}
+
+/// The text box with the focus, if it is one.
+///
+/// Not `egui_wants_keyboard_input`, which is true whenever any widget has the
+/// focus -- and a button or a tab that was tapped has it. The keyboard came up
+/// for a tap on the fax tab, the page jumped up under it, and the next tap
+/// meant for the fax number landed below the box. A text box is the widget
+/// with a `TextEditState` under its id.
+fn text_box_focused(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.memory(|m| m.focused()).filter(|&id| egui::text_edit::TextEditState::load(ctx, id).is_some())
 }
 
 /// Send panics to logcat as well as wherever the upstream hook puts them.
@@ -396,6 +472,12 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
     struct Preview(app::ScopeApp, app::mobile::Mobile);
     impl eframe::App for Preview {
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            // BINMODEM_SOFT_KEYBOARD: a keyboard that comes up, as a phone's
+            // does, whenever a text box has the focus.
+            if std::env::var_os("BINMODEM_SOFT_KEYBOARD").is_some() {
+                let up = text_box_focused(ui.ctx()).is_some();
+                self.1.insets = (0.0, if up { 303.0 } else { 48.0 });
+            }
             let _ = self.0.mobile_ui(ui, &mut self.1);
         }
     }
@@ -405,7 +487,17 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
         "BinModem phone preview",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([412.0 * ppp, 915.0 * ppp])
+                .with_inner_size({
+                    // BINMODEM_SIZE=411x731: a phone of that many points.
+                    let (w, h) = std::env::var("BINMODEM_SIZE")
+                        .ok()
+                        .and_then(|v| {
+                            let (w, h) = v.split_once('x')?;
+                            Some((w.parse().ok()?, h.parse().ok()?))
+                        })
+                        .unwrap_or((412.0, 915.0));
+                    [w * ppp, h * ppp]
+                })
                 .with_decorations(false),
             ..Default::default()
         },
